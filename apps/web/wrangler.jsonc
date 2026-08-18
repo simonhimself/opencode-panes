@@ -1,0 +1,23 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "opencode-panes",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-08-17",
+  "compatibility_flags": ["nodejs_compat"],
+  // Optional production admission control. Configure with
+  // `wrangler secret put PANES_CREATE_API_KEY`; do not add its value here.
+  // It is intentionally not required so local/test and unconfigured deployments stay open.
+  "assets": {
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"],
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "opencode-panes-local",
+      // Local/test placeholder. Replace with the ID from `wrangler d1 create` before deployment.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "./migrations",
+    },
+  ],
+}

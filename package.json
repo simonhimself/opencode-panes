@@ -1,0 +1,35 @@
+{
+  "name": "opencode-panes",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "npm@11.14.1",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build:web && npm run build:plugin",
+    "build:plugin": "npm run build --workspace @opencode-panes/plugin",
+    "build:web": "npm run build --workspace @opencode-panes/web",
+    "deploy": "npm run build:web && npm run deploy:built",
+    "deploy:built": "npm run deploy --workspace @opencode-panes/web",
+    "deploy:dry-run": "npm run build:web && npm run deploy:dry-run:built",
+    "deploy:dry-run:built": "npm run deploy:dry-run --workspace @opencode-panes/web",
+    "format": "prettier --check .",
+    "format:write": "prettier --write .",
+    "pack:dry-run": "npm pack --workspace @opencode-panes/plugin --dry-run",
+    "smoke:plugin": "node scripts/smoke-plugin.mjs",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.6",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

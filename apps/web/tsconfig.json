@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "jsx": "react-jsx",
+    "types": [
+      "./worker-configuration.d.ts",
+      "@cloudflare/vitest-pool-workers/types",
+      "vite/client"
+    ]
+  },
+  "include": [
+    "src",
+    "test",
+    "worker",
+    "vite.config.ts",
+    "vitest.client.config.ts",
+    "vitest.config.ts",
+    "worker-configuration.d.ts"
+  ]
+}

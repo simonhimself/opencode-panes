@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Use repository npm version
+        run: npm install --global npm@11.14.1
+      - run: npm ci
+      - run: npm run format
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build:web
+      - run: npm run build:plugin
+      - run: npm run pack:dry-run
+      - run: npm run smoke:plugin
+      - name: Wrangler generated-config dry run
+        run: npm run deploy:dry-run:built

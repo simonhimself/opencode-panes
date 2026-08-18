@@ -1,0 +1,38 @@
+{
+  "name": "@opencode-panes/web",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "deploy": "wrangler deploy",
+    "deploy:dry-run": "wrangler deploy --dry-run",
+    "dev": "vite dev",
+    "preview": "vite preview",
+    "test": "vitest run --config vitest.config.ts test/api.test.ts && vitest run --config vitest.client.config.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-panes/contracts": "*",
+    "dompurify": "^3.4.13",
+    "esbuild-wasm": "^0.28.2",
+    "mermaid": "^11.16.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.52.1",
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
+    "@types/node": "^22.15.30",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "esbuild": "^0.28.1",
+    "jsdom": "^29.1.1",
+    "vite": "^8.2.1",
+    "wrangler": "^4.123.0"
+  }
+}
