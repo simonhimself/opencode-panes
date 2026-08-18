@@ -352,25 +352,25 @@ Exit criteria:
 - [x] Add public-share revocation tests
 - [ ] Add mobile and desktop browser tests
 - [x] Add structured Worker logging without source contents
-- [ ] Deploy a production instance on Cloudflare
+- [x] Deploy a production instance on Cloudflare
 
 Exit criteria:
 
 - Security tests cover each executable or sanitizable artifact type.
 - The hosted service is ready for external users.
 
-## Local MVP Release Status
+## MVP Release Status
 
 - [x] Local implementation, automated tests, builds, plugin pack dry-run, built-plugin smoke check, audit, and generated-config deploy dry-run pass
 - [x] MIT licensing, local release documentation, optional command template, and no-secret CI workflow are present
 - [ ] Publish the plugin to npm or otherwise complete package distribution
-- [ ] Create and migrate a production D1 database
-- [ ] Deploy the Worker and viewer to production
+- [x] Create and migrate a production D1 database
+- [x] Deploy the Worker and viewer to production
 - [ ] Run real cross-browser hostile-artifact and infinite-loop testing
 - [ ] Complete a real OpenCode conversation acceptance test across supported model providers
 - [ ] Validate the release with external users
 
-Local completion does not imply production readiness. Production resources, deployment, publication, real host/provider acceptance, and external-user validation remain intentionally out of scope for this pass.
+Deployment does not imply production readiness. Publication, rate limiting, real host/provider acceptance, cross-browser hostile testing, and external-user validation remain open.
 
 ## MVP Acceptance Test
 
@@ -434,3 +434,4 @@ Add short dated entries here when a milestone changes state or a material produc
 | --- | --- |
 | 2026-08-17 | Initial creator-first plan recorded. Scope reduced to an OpenCode plugin, browser renderer, Worker API, and D1 revision storage. |
 | 2026-08-18 | Completed the local-only MVP release pass: MIT licensing, CI, root build and generated-config deploy scripts, deployment instructions, safe lexical source highlighting, an optional `/artifact` command template, and a deterministic built-plugin registration smoke check. Local verification passed; npm publication, production D1 and deployment, cross-browser hostile-loop testing, real OpenCode/provider acceptance, and external-user release remain open. |
+| 2026-08-18 | Deployed the protected test service to `opencode-panes.simons.workers.dev` with a production D1 database and required creation secret. Verified create, private read, revision, publish, public read, revocation, response headers, and runtime logs. |

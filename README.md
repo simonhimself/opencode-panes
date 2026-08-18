@@ -1,6 +1,6 @@
 # OpenCode Panes
 
-OpenCode Panes is a locally implemented MVP for creating versioned browser artifacts from an OpenCode `artifact` tool. The workspace contains a React viewer and Cloudflare Worker API, shared contracts, and an OpenCode plugin. It is not deployed or published.
+OpenCode Panes is an MVP for creating versioned browser artifacts from an OpenCode `artifact` tool. The workspace contains a React viewer and Cloudflare Worker API, shared contracts, and an OpenCode plugin. The service is deployed for testing; the plugin is not published.
 
 ## Workspace
 
@@ -14,7 +14,7 @@ Requires Node.js 22.12 or newer and npm 11.
 
 ```sh
 npm install
-npx wrangler d1 migrations apply opencode-panes-local --local --config apps/web/wrangler.jsonc
+npx wrangler d1 migrations apply opencode-panes --local --config apps/web/wrangler.jsonc
 npm run dev --workspace @opencode-panes/web
 ```
 
@@ -37,6 +37,10 @@ OPENCODE_PANES_CREATE_API_KEY="your-key" opencode
 ```
 
 The plugin sends the key only when creating an artifact.
+
+## Live Test Service
+
+The test deployment is available at `https://opencode-panes.simons.workers.dev`. Configure the plugin with that URL and provide the matching creation key through `OPENCODE_PANES_CREATE_API_KEY`. The service rejects artifact creation without the key; existing creator and public URLs use their own scoped capability tokens.
 
 ## Optional Command
 
@@ -66,21 +70,19 @@ npm run deploy:dry-run
 
 ## Production Deployment
 
-These commands are instructions only. They have not been executed for this MVP.
+The current deployment uses Worker `opencode-panes` and D1 database `opencode-panes`. To apply future migrations or redeploy:
 
-1. From `apps/web`, run `npx wrangler d1 create opencode-panes`.
-2. Replace the placeholder `database_name` and `database_id` in `apps/web/wrangler.jsonc` with the returned values.
-3. Run `npx wrangler d1 migrations apply opencode-panes --remote` from `apps/web`.
-4. Run `npx wrangler secret put PANES_CREATE_API_KEY` from `apps/web` and enter a strong value at the prompt.
-5. From the repository root, run `npm run build:web`.
-6. Run `npm run deploy:dry-run:built`, then inspect the generated-config result.
-7. Run `npm run deploy:built` to deploy the exact Vite-generated Worker configuration.
+1. From `apps/web`, run `npx wrangler d1 migrations apply opencode-panes --remote`.
+2. To rotate admission credentials, run `npx wrangler secret put PANES_CREATE_API_KEY` and enter a strong value at the prompt.
+3. From the repository root, run `npm run build:web`.
+4. Run `npm run deploy:dry-run:built`, then inspect the generated-config result.
+5. Run `npm run deploy:built` to deploy the exact Vite-generated Worker configuration.
 
 The build writes the deployable configuration to `apps/web/dist/opencode_panes/wrangler.json` and Wrangler's redirect to `apps/web/.wrangler/deploy/config.json`. The `:built` scripts run from the web workspace so Wrangler uses that generated configuration.
 
 ## Known Limitations
 
-- No npm publication, production D1 database, Worker deployment, or external-user validation has occurred.
+- No npm publication or external-user validation has occurred.
 - The highlighter is a dependency-free lexical aid, not a complete parser for every language.
 - React artifacts use a fixed runtime and import allowlist. Arbitrary packages and server code are unsupported.
 - Browser sandboxing reduces risk but does not prove safety against every browser behavior, resource-exhaustion loop, or future API.

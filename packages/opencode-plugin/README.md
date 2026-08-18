@@ -42,6 +42,8 @@ For global installation, use the same entry in `~/.config/opencode/opencode.json
 
 Prefer `OPENCODE_PANES_CREATE_API_KEY` over a config value. An explicit `createApiKey` option takes precedence. The key is sent only to `POST /api/artifacts` and is not stored in artifact state or returned to the model.
 
+The current test service uses `https://opencode-panes.simons.workers.dev` and requires the separately provided creation key.
+
 Every upload requests `artifact_upload` permission for the exact API origin. Browser opening is disabled by default and uses a separate `artifact_open` permission. Owner tokens are stored atomically under `$XDG_STATE_HOME/opencode-panes`, or the platform state-directory fallback, and never appear in tool output. Titles and types remain immutable across revisions.
 
 ## Optional `/artifact` Command
@@ -70,4 +72,4 @@ The smoke script imports the built package and asserts the `artifact` definition
 
 ## Limits
 
-The package requires Node.js 22.12 or newer and OpenCode 1.18.18 or newer. Source is limited to 1 MiB of UTF-8 data. The package is not on npm, and no production Panes endpoint is provided yet.
+The package requires Node.js 22.12 or newer and OpenCode 1.18.18 or newer. Source is limited to 1 MiB of UTF-8 data. The package is not on npm; the current hosted endpoint is for testing rather than a supported public service.

@@ -3,6 +3,7 @@
 // Runtime types generated with workerd@1.20260811.1 2026-08-17 nodejs_compat
 interface __BaseEnv_Env {
 	DB: D1Database;
+	PANES_CREATE_API_KEY: string;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
