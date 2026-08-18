@@ -24,7 +24,7 @@ const DEFAULT_API_BASE_URL = "http://127.0.0.1:5173";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const STATE_DIRECTORY_NAME = "opencode-panes";
 
-const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description.`;
+const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description. After success, present viewerUrl exactly as returned, including its fragment; never shorten, sanitize, or rewrite that URL.`;
 
 export interface PanesPluginOptions {
   /** Panes API origin. Defaults to the local Vite/Workers development server. */

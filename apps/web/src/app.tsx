@@ -562,7 +562,7 @@ function ArtifactWorkspace({
               ? "Runtime stopped"
               : mode === "code"
                 ? "Source inspection"
-                : "Runtime active"}
+                : "Preview loaded"}
           </span>
           <span className="status-divider" />
           <span>v{selectedRevision.version}</span>

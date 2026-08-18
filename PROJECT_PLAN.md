@@ -336,7 +336,7 @@ Exit criteria:
 - [x] Document global installation
 - [ ] Package and publish the plugin
 - [ ] Test with multiple OpenCode-supported model providers
-- [ ] Refine tool guidance based on model behavior
+- [x] Refine tool guidance based on model behavior
 
 Exit criteria:
 
@@ -434,4 +434,5 @@ Add short dated entries here when a milestone changes state or a material produc
 | --- | --- |
 | 2026-08-17 | Initial creator-first plan recorded. Scope reduced to an OpenCode plugin, browser renderer, Worker API, and D1 revision storage. |
 | 2026-08-18 | Completed the local-only MVP release pass: MIT licensing, CI, root build and generated-config deploy scripts, deployment instructions, safe lexical source highlighting, an optional `/artifact` command template, and a deterministic built-plugin registration smoke check. Local verification passed; npm publication, production D1 and deployment, cross-browser hostile-loop testing, real OpenCode/provider acceptance, and external-user release remain open. |
-| 2026-08-18 | Deployed the protected test service to `opencode-panes.simons.workers.dev` with a production D1 database and required creation secret. Verified create, private read, revision, publish, public read, revocation, response headers, and runtime logs. |
+| 2026-08-18 | Deployed the protected test service to `opencode-panes.simons.workers.dev` with a production D1 database and required creation secret. Verified create, private read, revision, publish, public read, revocation, and response headers. |
+| 2026-08-18 | Ran a real OpenCode live acceptance pass. Creation, owner-token revision, version polling, immutable public pinning, revocation, mobile layout, and all six renderers passed. Browser inspection found the parent CSP blocked `srcdoc` scripts; the deployed hotfix corrected the CSP intersection and added a regression test. The model also omitted the creator fragment in its final Markdown link despite the structured tool result being correct, so tool guidance now requires preserving `viewerUrl` exactly. Workers Logs were enabled after confirming prior log claims were not observable; the final query found 112 invocations and zero error events. |

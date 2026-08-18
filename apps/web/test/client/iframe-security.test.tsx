@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
@@ -15,6 +17,19 @@ import {
 import { createHtmlSrcDoc } from "../../src/renderers/html";
 
 describe("sandboxed artifact iframe", () => {
+  it("allows inline scripts through the parent and tighter artifact CSP intersection", () => {
+    const staticHeaders = readFileSync(
+      join(process.cwd(), "public/_headers"),
+      "utf8",
+    );
+
+    expect(staticHeaders).toContain(
+      "script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'",
+    );
+    expect(createArtifactCsp(true)).toContain("script-src 'unsafe-inline'");
+    expect(createArtifactCsp(true)).toContain("connect-src 'none'");
+  });
+
   it("places a restrictive CSP before HTML artifact content", () => {
     const marker = '<script src="https://attacker.example/x.js"></script>';
     const srcDoc = createHtmlSrcDoc(marker, "message-nonce");

@@ -46,6 +46,8 @@ The current test service uses `https://opencode-panes.simons.workers.dev` and re
 
 Every upload requests `artifact_upload` permission for the exact API origin. Browser opening is disabled by default and uses a separate `artifact_open` permission. Owner tokens are stored atomically under `$XDG_STATE_HOME/opencode-panes`, or the platform state-directory fallback, and never appear in tool output. Titles and types remain immutable across revisions.
 
+Creator URLs contain a workspace capability in the URL fragment. The tool instructs models to preserve that URL exactly. If a model rewrites the final Markdown link without its fragment, use the structured tool result URL or enable `autoOpen` and approve the separate exact-origin browser permission.
+
 ## Optional `/artifact` Command
 
 The package includes `commands/artifact.md`. Copy it manually to a project or global command directory:

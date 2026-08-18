@@ -36,6 +36,18 @@ afterEach(async () => {
 });
 
 describe("artifact tool", () => {
+  it("instructs models to preserve the complete credentialed viewer URL", async () => {
+    const plugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const definition = plugin.tool?.artifact as ToolDefinition | undefined;
+
+    expect(definition?.description).toContain(
+      "present viewerUrl exactly as returned, including its fragment",
+    );
+  });
+
   it("creates an artifact with the session ID and persists its owner token", async () => {
     const fetchMock = mockFetch(createResponse());
     const { context, ask } = toolContext();
