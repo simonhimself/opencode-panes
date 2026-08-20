@@ -1,6 +1,6 @@
 {
   "name": "@opencode-panes/plugin",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "OpenCode server plugin for creating and revising OpenCode Panes artifacts",
   "private": true,
   "license": "MIT",
@@ -42,7 +42,7 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.18",
-    "@opencode-panes/contracts": "0.0.0",
+    "@opencode-panes/contracts": "0.1.0",
     "@types/node": "^24.3.0",
     "esbuild": "^0.25.9"
   }
