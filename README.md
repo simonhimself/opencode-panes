@@ -1,6 +1,6 @@
 # OpenCode Panes
 
-OpenCode Panes is an MVP for creating versioned browser artifacts from an OpenCode `artifact` tool. The workspace contains a React viewer and Cloudflare Worker API, shared contracts, and an OpenCode plugin. The service is deployed for testing; the plugin is not published.
+OpenCode Panes is an MVP for creating versioned browser artifacts from an OpenCode `artifact` tool. The workspace contains a React viewer and Cloudflare Worker API, shared contracts, and a private local OpenCode plugin. The service is deployed for testing; the plugin is intentionally not distributed through a package registry.
 
 ## Workspace
 
@@ -24,7 +24,7 @@ Build the plugin in another terminal:
 npm run build:plugin
 ```
 
-Configure OpenCode with the absolute file URL for `packages/opencode-plugin/dist/index.js`. See `packages/opencode-plugin/README.md` for project and global examples. No repository config is installed automatically.
+Load the built plugin through an auto-discovered file in `.opencode/plugins/` or `~/.config/opencode/plugins/`. See `packages/opencode-plugin/README.md` for project and global examples. No repository config is installed automatically.
 
 The plugin requests upload permission, creates or revises an artifact, stores owner capability data in the user's state directory, and returns a creator URL. The creator viewer supports all six MVP renderers, immutable revision selection and polling, source highlighting, copy/download, runtime controls, and selected-revision publishing. Public links expose only their pinned revision.
 
@@ -44,7 +44,7 @@ The test deployment is available at `https://opencode-panes.simons.workers.dev`.
 
 ## Optional Command
 
-The distributable template is `packages/opencode-plugin/commands/artifact.md`. Copy it manually if desired. It does not install itself.
+The private command template is `packages/opencode-plugin/commands/artifact.md`. Copy it manually if desired. It does not install itself.
 
 ```sh
 mkdir -p .opencode/commands
@@ -60,7 +60,6 @@ npm run format
 npm run typecheck
 npm test
 npm run build
-npm run pack:dry-run
 npm run smoke:plugin
 npm audit
 npm run deploy:dry-run
@@ -82,10 +81,10 @@ The build writes the deployable configuration to `apps/web/dist/opencode_panes/w
 
 ## Known Limitations
 
-- No npm publication or external-user validation has occurred.
+- The plugin is intentionally private and local-only. Registry publication and external-user release validation are out of scope.
 - The highlighter is a dependency-free lexical aid, not a complete parser for every language.
 - React artifacts use a fixed runtime and import allowlist. Arbitrary packages and server code are unsupported.
 - Browser sandboxing reduces risk but does not prove safety against every browser behavior, resource-exhaustion loop, or future API.
 - Real cross-browser hostile-loop and provider/model testing remains outstanding.
 
-See `PROJECT_PLAN.md` for exact completion status and remaining release blockers. Licensed under MIT.
+See `PROJECT_PLAN.md` for exact local-only completion status and remaining validation items. Licensed under MIT.

@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  release-check:
+  validation:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,6 @@ jobs:
       - run: npm test
       - run: npm run build:web
       - run: npm run build:plugin
-      - run: npm run pack:dry-run
       - run: npm run smoke:plugin
       - name: Wrangler generated-config dry run
         run: npm run deploy:dry-run:built

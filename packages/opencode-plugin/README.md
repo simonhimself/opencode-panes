@@ -1,6 +1,6 @@
 # @opencode-panes/plugin
 
-OpenCode plugin that registers one `artifact` tool for creating and revising OpenCode Panes artifacts. This MIT-licensed package remains private and unpublished.
+OpenCode plugin that registers one `artifact` tool for creating and revising OpenCode Panes artifacts. This MIT-licensed workspace package is intentionally private and local-only.
 
 ## Build
 
@@ -9,27 +9,22 @@ npm install
 npm run build --workspace @opencode-panes/plugin
 ```
 
-## Project Installation
+## Private Local Installation
 
-Add the built package to the project's `opencode.json` with an absolute file URL:
+Create `.opencode/plugins/opencode-panes.js` for project-scoped use, or `~/.config/opencode/plugins/opencode-panes.js` for global use. OpenCode discovers plugin files in those directories automatically.
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "file:///absolute/path/to/opencode-panes/packages/opencode-plugin/dist/index.js",
-      {
-        "apiBaseUrl": "http://127.0.0.1:5173",
-        "autoOpen": false,
-        "requestTimeoutMs": 15000
-      }
-    ]
-  ]
-}
+```js
+import PanesPlugin from "file:///absolute/path/to/opencode-panes/packages/opencode-plugin/dist/index.js";
+
+export const OpenCodePanesPlugin = async (context) =>
+  PanesPlugin(context, {
+    apiBaseUrl: "http://127.0.0.1:5173",
+    autoOpen: false,
+    requestTimeoutMs: 15000,
+  });
 ```
 
-For global installation, use the same entry in `~/.config/opencode/opencode.json`. Restart OpenCode after changing plugins or commands.
+Keep service credentials outside the loader. The plugin reads `OPENCODE_PANES_CREATE_API_KEY` when `createApiKey` is omitted. A private loader may instead read a protected local secret file and pass its contents as `createApiKey`. Restart OpenCode after changing plugins or commands.
 
 ## Configuration
 
@@ -57,7 +52,7 @@ mkdir -p .opencode/commands
 cp packages/opencode-plugin/commands/artifact.md .opencode/commands/artifact.md
 ```
 
-For an installed package, copy from `node_modules/@opencode-panes/plugin/commands/artifact.md`. For global use, target `~/.config/opencode/commands/artifact.md`. The command forwards `$ARGUMENTS` and instructs OpenCode to use the registered tool; it does not install or configure the plugin.
+For global use, target `~/.config/opencode/commands/artifact.md`. The command forwards `$ARGUMENTS` and instructs OpenCode to use the registered tool; it does not install or configure the plugin.
 
 ## Verification
 
@@ -66,7 +61,6 @@ From the repository root:
 ```sh
 npm run build:plugin
 npm test --workspace @opencode-panes/plugin
-npm run pack:dry-run
 npm run smoke:plugin
 ```
 
@@ -74,4 +68,4 @@ The smoke script imports the built package and asserts the `artifact` definition
 
 ## Limits
 
-The package requires Node.js 22.12 or newer and OpenCode 1.18.18 or newer. Source is limited to 1 MiB of UTF-8 data. The package is not on npm; the current hosted endpoint is for testing rather than a supported public service.
+The private workspace package requires Node.js 22.12 or newer and OpenCode 1.18.18 or newer. Source is limited to 1 MiB of UTF-8 data. Registry distribution is not a project goal; the current hosted endpoint supports the private local workflow.

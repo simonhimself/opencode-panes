@@ -55,7 +55,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 
 ### OpenCode Integration
 
-- [ ] Publish an OpenCode server plugin as an npm package
+- [x] Install the OpenCode server plugin as a private local plugin file
 - [x] Register one `artifact` custom tool
 - [x] Associate artifacts with the current OpenCode session ID
 - [x] Return artifact ID, revision, and browser URL in the tool result
@@ -327,20 +327,20 @@ Exit criteria:
 
 - A creator can publish one immutable revision and share it without exposing the private workspace or later revisions.
 
-### Milestone 4: OpenCode Distribution
+### Milestone 4: Private OpenCode Installation
 
 - [x] Add first-upload permission flow
 - [x] Add optional `/artifact` command
 - [x] Add optional browser auto-open
 - [x] Document project-scoped installation
 - [x] Document global installation
-- [ ] Package and publish the plugin
+- [x] Install the plugin as an auto-discovered global plugin file
 - [ ] Test with multiple OpenCode-supported model providers
 - [x] Refine tool guidance based on model behavior
 
 Exit criteria:
 
-- A new user can install the plugin and create an artifact from OpenCode using the documented steps.
+- The private operator can load the built plugin from OpenCode's local plugin directory and create an artifact using the documented steps.
 
 ### Milestone 5: Hardening
 
@@ -357,20 +357,19 @@ Exit criteria:
 Exit criteria:
 
 - Security tests cover each executable or sanitizable artifact type.
-- The hosted service is ready for external users.
+- The hosted test service supports the documented private local-plugin workflow.
 
 ## MVP Release Status
 
-- [x] Local implementation, automated tests, builds, plugin pack dry-run, built-plugin smoke check, audit, and generated-config deploy dry-run pass
+- [x] Local implementation, automated tests, builds, built-plugin smoke check, audit, and generated-config deploy dry-run pass
 - [x] MIT licensing, local release documentation, optional command template, and no-secret CI workflow are present
-- [ ] Publish the plugin to npm or otherwise complete package distribution
+- [x] Keep the plugin private and install it as an auto-discovered local plugin file
 - [x] Create and migrate a production D1 database
 - [x] Deploy the Worker and viewer to production
 - [ ] Run real cross-browser hostile-artifact and infinite-loop testing
 - [ ] Complete a real OpenCode conversation acceptance test across supported model providers
-- [ ] Validate the release with external users
 
-Deployment does not imply production readiness. Publication, rate limiting, real host/provider acceptance, cross-browser hostile testing, and external-user validation remain open.
+Deployment does not imply production readiness. Rate limiting, real host/provider acceptance, and cross-browser hostile testing remain open. The plugin is intentionally private and local-only; registry publication and external-user release validation are not project goals.
 
 ## MVP Acceptance Test
 
@@ -433,6 +432,7 @@ Add short dated entries here when a milestone changes state or a material produc
 | Date | Update |
 | --- | --- |
 | 2026-08-17 | Initial creator-first plan recorded. Scope reduced to an OpenCode plugin, browser renderer, Worker API, and D1 revision storage. |
-| 2026-08-18 | Completed the local-only MVP release pass: MIT licensing, CI, root build and generated-config deploy scripts, deployment instructions, safe lexical source highlighting, an optional `/artifact` command template, and a deterministic built-plugin registration smoke check. Local verification passed; npm publication, production D1 and deployment, cross-browser hostile-loop testing, real OpenCode/provider acceptance, and external-user release remain open. |
+| 2026-08-18 | Completed the local-only MVP release pass: MIT licensing, CI, root build and generated-config deploy scripts, deployment instructions, safe lexical source highlighting, an optional `/artifact` command template, and a deterministic built-plugin registration smoke check. Local verification passed; production D1 and deployment, cross-browser hostile-loop testing, and real OpenCode/provider acceptance remained open. |
 | 2026-08-18 | Deployed the protected test service to `opencode-panes.simons.workers.dev` with a production D1 database and required creation secret. Verified create, private read, revision, publish, public read, revocation, and response headers. |
 | 2026-08-18 | Ran a real OpenCode live acceptance pass. Creation, owner-token revision, version polling, immutable public pinning, revocation, mobile layout, and all six renderers passed. Browser inspection found the parent CSP blocked `srcdoc` scripts; the deployed hotfix corrected the CSP intersection and added a regression test. The model also omitted the creator fragment in its final Markdown link despite the structured tool result being correct, so tool guidance now requires preserving `viewerUrl` exactly. Workers Logs were enabled after confirming prior log claims were not observable; the final query found 112 invocations and zero error events. |
+| 2026-08-18 | Made plugin distribution explicitly private and local-only. Registry publication and external-user release validation were removed from scope; the supported installation is an auto-discovered OpenCode plugin file. |

@@ -22,7 +22,6 @@
     "deploy:dry-run:built": "npm run deploy:dry-run --workspace @opencode-panes/web",
     "format": "prettier --check .",
     "format:write": "prettier --write .",
-    "pack:dry-run": "npm pack --workspace @opencode-panes/plugin --dry-run",
     "smoke:plugin": "node scripts/smoke-plugin.mjs",
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"
