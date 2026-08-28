@@ -31,3 +31,27 @@ assert.deepEqual(Object.keys(artifact.args).sort(), [
 ]);
 
 console.log("Built plugin smoke check passed: artifact tool registered.");
+
+const globalEntry = pathToFileURL(
+  resolve("packages/opencode-plugin/dist/global.js"),
+).href;
+const globalPluginModule = await import(`${globalEntry}?smoke`);
+const globalPlugin = globalPluginModule.default;
+assert.equal(
+  typeof globalPlugin,
+  "function",
+  "global plugin must export a plugin",
+);
+const globalHooks = await globalPlugin(
+  {},
+  {
+    apiBaseUrl: "http://127.0.0.1:5173",
+    autoOpen: false,
+    requestTimeoutMs: 15000,
+    createApiKey: "smoke-check-only",
+  },
+);
+assert.equal(typeof globalHooks.tool?.artifact?.execute, "function");
+console.log(
+  "Bundled global plugin smoke check passed: artifact tool registered.",
+);

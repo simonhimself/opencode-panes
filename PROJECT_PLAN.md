@@ -63,6 +63,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 - [x] Provide an optional `/artifact` command
 - [x] Provide an optional browser auto-open setting
 - [x] Document project and global installation
+- [x] Bundle and install a global plugin file with no repository dependency
 
 ## OpenCode Plugin Contract
 
@@ -335,6 +336,7 @@ Exit criteria:
 - [x] Document project-scoped installation
 - [x] Document global installation
 - [x] Install the plugin as an auto-discovered global plugin file
+- [x] Add a repository-independent global plugin build and installer
 - [ ] Test with multiple OpenCode-supported model providers
 - [x] Refine tool guidance based on model behavior
 
@@ -436,3 +438,4 @@ Add short dated entries here when a milestone changes state or a material produc
 | 2026-08-18 | Deployed the protected test service to `opencode-panes.simons.workers.dev` with a production D1 database and required creation secret. Verified create, private read, revision, publish, public read, revocation, and response headers. |
 | 2026-08-18 | Ran a real OpenCode live acceptance pass. Creation, owner-token revision, version polling, immutable public pinning, revocation, mobile layout, and all six renderers passed. Browser inspection found the parent CSP blocked `srcdoc` scripts; the deployed hotfix corrected the CSP intersection and added a regression test. The model also omitted the creator fragment in its final Markdown link despite the structured tool result being correct, so tool guidance now requires preserving `viewerUrl` exactly. Workers Logs were enabled after confirming prior log claims were not observable; the final query found 112 invocations and zero error events. |
 | 2026-08-18 | Made plugin distribution explicitly private and local-only. Registry publication and external-user release validation were removed from scope; the supported installation is an auto-discovered OpenCode plugin file. |
+| 2026-08-28 | Added a standalone bundled global plugin and atomic installer. The installed plugin no longer imports or depends on the source repository. |

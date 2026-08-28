@@ -9,9 +9,11 @@ npm install
 npm run build --workspace @opencode-panes/plugin
 ```
 
+The build emits the package entry at `dist/index.js` and a standalone global entry at `dist/global.js`.
+
 ## Private Local Installation
 
-Create `.opencode/plugins/opencode-panes.js` for project-scoped use, or `~/.config/opencode/plugins/opencode-panes.js` for global use. OpenCode discovers plugin files in those directories automatically.
+Create `.opencode/plugins/opencode-panes.js` for project-scoped use, or install the standalone global file with `npm run install:plugin` from the repository root. OpenCode discovers plugin files in those directories automatically.
 
 ```js
 import PanesPlugin from "file:///absolute/path/to/opencode-panes/packages/opencode-plugin/dist/index.js";
@@ -25,6 +27,8 @@ export const OpenCodePanesPlugin = async (context) =>
 ```
 
 Keep service credentials outside the loader. The plugin reads `OPENCODE_PANES_CREATE_API_KEY` when `createApiKey` is omitted. A private loader may instead read a protected local secret file and pass its contents as `createApiKey`. Restart OpenCode after changing plugins or commands.
+
+The installed global entry defaults to `https://opencode-panes.simons.workers.dev`, `autoOpen: false`, and a 15-second timeout. It reads the creation key at runtime from `<OpenCode config directory>/secrets/opencode-panes-create-key`. The config directory uses `OPENCODE_PANES_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`, or `XDG_CONFIG_HOME/opencode`, with `~/.config/opencode` as the fallback. Set `OPENCODE_PANES_CREATE_API_KEY_FILE` to override the key path. `OPENCODE_PANES_API_BASE_URL` and plugin options can override the global API default.
 
 ## Configuration
 
@@ -63,6 +67,14 @@ npm run build:plugin
 npm test --workspace @opencode-panes/plugin
 npm run smoke:plugin
 ```
+
+For the repository-independent global installation:
+
+```sh
+npm run install:plugin
+```
+
+The installer writes only `opencode-panes.js` and atomically replaces that file. Set `OPENCODE_PANES_CONFIG_DIR` or `OPENCODE_PANES_PLUGIN_DIR` to use an isolated destination.
 
 The smoke script imports the built package and asserts the `artifact` definition through the supported Plugin API without invoking a model or modifying OpenCode config. It does not test full host startup, interactive permissions, API connectivity, or provider behavior.
 

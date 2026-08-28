@@ -21,6 +21,16 @@ await build({
   sourcemap: true,
   external: ["@opencode-ai/plugin"],
 });
+await build({
+  entryPoints: [join(packageDirectory, "src/global.ts")],
+  outfile: join(packageDirectory, "dist/global.js"),
+  bundle: true,
+  platform: "node",
+  target: "node22",
+  format: "esm",
+  sourcemap: false,
+  minify: true,
+});
 execFileSync(
   process.execPath,
   [
