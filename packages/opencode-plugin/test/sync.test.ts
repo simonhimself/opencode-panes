@@ -30,6 +30,7 @@ let stateHome: string;
 let server: ReturnType<typeof createServer>;
 let apiOrigin: string;
 let verifiedProbe: boolean;
+let failSync: boolean;
 let requests: Array<{
   method: string;
   path: string;
@@ -42,6 +43,7 @@ beforeEach(async () => {
   stateHome = await mkdtemp(join(tmpdir(), "opencode-panes-sync-state-"));
   requests = [];
   verifiedProbe = false;
+  failSync = false;
   vi.stubEnv("XDG_STATE_HOME", stateHome);
   server = createServer(
     (request, response) => void handleRequest(request, response),
@@ -63,7 +65,70 @@ afterEach(async () => {
   await rm(stateHome, { recursive: true, force: true });
 });
 
-describe("artifact_sync tool", () => {
+describe("sync and publish intent tools", () => {
+  it("publishes by syncing first, then only asks to open the Creator link", async () => {
+    let askCount = 0;
+    const ask = vi.fn<ToolContext["ask"]>(async () => {
+      askCount += 1;
+      if (askCount === 2) throw new Error("browser permission denied");
+    });
+    const context = toolContext(ask);
+    const prepared = await prepareAndFinalize(context, "Publish intent", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    ask.mockResolvedValueOnce(undefined);
+    ask.mockRejectedValueOnce(new Error("browser permission denied"));
+
+    const plugin = await OpenCodePanesPlugin({} as never, {
+      apiBaseUrl: apiOrigin,
+      createApiKey: "admission-key",
+    });
+    const definition = plugin.tool?.artifact_publish as ToolDefinition;
+    const result = await definition.execute(
+      { artifactId: prepared.artifactId },
+      context,
+    );
+
+    expect(resultMetadata(result)).toMatchObject({
+      operation: "synced",
+      artifactId: prepared.artifactId,
+      openCreatorAfterSuccess: "permission-denied",
+    });
+    expect(requests.some(({ path }) => path.includes("/publish"))).toBe(false);
+    expect(
+      requests.some(
+        ({ path, body }) =>
+          path.includes("/publish") || body.toString().includes("durationDays"),
+      ),
+    ).toBe(false);
+    expect(
+      requests.some(({ body }) => body.toString().includes("revisionVersion")),
+    ).toBe(false);
+    expect(ask).toHaveBeenCalledWith(
+      expect.objectContaining({ permission: "artifact_open" }),
+    );
+  });
+
+  it("stops the publish intent on full Sync failure before opening or publishing", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Failed publish", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    failSync = true;
+    const plugin = await OpenCodePanesPlugin({} as never, {
+      apiBaseUrl: apiOrigin,
+      createApiKey: "admission-key",
+    });
+    const definition = plugin.tool?.artifact_publish as ToolDefinition;
+    await expect(
+      definition.execute({ artifactId: prepared.artifactId }, context),
+    ).rejects.toThrow("HTTP 503");
+    expect(requests.some(({ path }) => path.includes("/publish"))).toBe(false);
+    expect(context.ask).not.toHaveBeenCalledWith(
+      expect.objectContaining({ permission: "artifact_open" }),
+    );
+  });
+
   it.each([
     "sync-after-checkpoint",
     "sync-after-create",
@@ -498,7 +563,7 @@ async function executeSync(
   return definition.execute(args, context);
 }
 
-function toolContext(): ToolContext {
+function toolContext(ask = vi.fn().mockResolvedValue(undefined)): ToolContext {
   return {
     sessionID: "session-sync",
     messageID: "message-sync",
@@ -507,7 +572,7 @@ function toolContext(): ToolContext {
     worktree: project,
     abort: new AbortController().signal,
     metadata: vi.fn(),
-    ask: vi.fn().mockResolvedValue(undefined),
+    ask,
   };
 }
 
@@ -553,6 +618,13 @@ async function handleRequest(
   });
   response.setHeader("content-type", "application/json");
   if (path === "/api/sync/artifacts") {
+    if (failSync) {
+      response.statusCode = 503;
+      response.end(
+        JSON.stringify({ error: { message: "simulated Sync failure" } }),
+      );
+      return;
+    }
     const payload = JSON.parse(body.toString("utf8")) as {
       creatorToken: string;
     };

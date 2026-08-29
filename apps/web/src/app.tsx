@@ -21,6 +21,7 @@ import {
   fetchPrivateWorkspace,
   fetchCreatorWorkspace,
   fetchPublicArtifact,
+  fetchPublicationStatus,
   followCurrentRevision,
   getStoredPublicUrl,
   includeRevision,
@@ -72,6 +73,8 @@ export function App({ route, workspaceAccess }: AppProps) {
     return <CreatorArtifactView token={route.token} />;
   if (route.kind === "shared")
     return <PublicArtifactView token={route.token} />;
+  if (route.kind === "published")
+    return <PublishedArtifactView token={route.token} />;
   if (route.kind === "not-found") {
     return (
       <EntryState
@@ -86,7 +89,9 @@ export function App({ route, workspaceAccess }: AppProps) {
     <EntryState eyebrow="OpenCode Panes" title="No artifact is open.">
       Open a viewer URL returned by the OpenCode artifact tool. Creator links
       use
-      <code>/artifacts/:id</code>; public links use <code>/shared/:token</code>.
+      <code>/artifacts/:id</code>; legacy public links use{" "}
+      <code>/shared/:token</code>. New publications use{" "}
+      <code>/published/:token</code>.
     </EntryState>
   );
 }
@@ -405,6 +410,41 @@ function PublicArtifactView({ token }: { token: string }) {
       selection={{ followLatest: false, revisionId: response.revision.id }}
       setSelection={() => undefined}
     />
+  );
+}
+
+function PublishedArtifactView({ token }: { token: string }) {
+  const [status, setStatus] =
+    useState<Awaited<ReturnType<typeof fetchPublicationStatus>>>();
+  const [error, setError] = useState<string>();
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchPublicationStatus(token, fetch, controller.signal).then(
+      (loaded) => setStatus(loaded),
+      (caught: unknown) => {
+        if (!controller.signal.aborted) setError(apiErrorMessage(caught));
+      },
+    );
+    return () => controller.abort();
+  }, [token]);
+
+  if (error) {
+    return (
+      <EntryState
+        eyebrow="Publication unavailable"
+        title="This publication cannot be opened."
+      >
+        {error} The link may have expired or been revoked.
+      </EntryState>
+    );
+  }
+  if (!status) return <LoadingState label="Loading publication" />;
+  return (
+    <EntryState eyebrow="Publication active" title="Published preview pending.">
+      This public link is active until{" "}
+      {new Date(status.expiresAt).toLocaleString()}.
+    </EntryState>
   );
 }
 

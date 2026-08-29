@@ -32,6 +32,7 @@ export const PANES_RENDERER_TYPES = [
   "code",
 ] as const;
 export const PUBLICATION_DURATIONS = [1, 7, 30] as const;
+export const DEFAULT_PUBLICATION_DURATION = 7;
 export const SYNC_STATES = ["pending", "syncing", "synced", "failed"] as const;
 
 export const artifactTypeSchema = z.enum(ARTIFACT_TYPES);
@@ -375,11 +376,29 @@ export const publicationSchema = z.strictObject({
   artifactId: artifactIdSchema,
   revisionVersion: revisionNumberSchema,
   durationDays: publicationDurationSchema,
-  publicUrl: urlSchema,
+  publicUrl: urlSchema.optional(),
   status: z.enum(["active", "expired", "revoked"]),
   createdAt: timestampSchema,
   expiresAt: timestampSchema,
   revokedAt: timestampSchema.optional(),
+});
+
+export const publicationStatusResponseSchema = z.strictObject({
+  status: z.literal("active"),
+  expiresAt: timestampSchema,
+});
+
+export const creatorPublicationRequestSchema = z.strictObject({
+  revisionVersion: revisionNumberSchema,
+  durationDays: z.union(
+    PUBLICATION_DURATIONS.map((duration) => z.literal(duration)),
+  ),
+});
+
+export const creatorPublicationExtendRequestSchema = z.strictObject({
+  durationDays: z.union(
+    PUBLICATION_DURATIONS.map((duration) => z.literal(duration)),
+  ),
 });
 
 export const cloudManifestSchema = z.strictObject({
@@ -459,6 +478,8 @@ export const creatorWorkspaceResponseSchema = z.strictObject({
   kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).optional(),
   creatorExpiresAt: timestampSchema,
   revisions: z.array(creatorWorkspaceRevisionSchema),
+  publication: publicationSchema.nullable().optional(),
+  publicationHistory: z.array(publicationSchema).optional(),
 });
 
 export type ArtifactManifest = z.infer<typeof artifactManifestSchema>;
@@ -469,6 +490,15 @@ export type SyncState = z.infer<typeof syncStateSchema>;
 export type OwnerCredential = z.infer<typeof ownerCredentialSchema>;
 export type CreatorLink = z.infer<typeof creatorLinkSchema>;
 export type Publication = z.infer<typeof publicationSchema>;
+export type PublicationStatusResponse = z.infer<
+  typeof publicationStatusResponseSchema
+>;
+export type CreatorPublicationRequest = z.infer<
+  typeof creatorPublicationRequestSchema
+>;
+export type CreatorPublicationExtendRequest = z.infer<
+  typeof creatorPublicationExtendRequestSchema
+>;
 export type PreviewEntry = z.infer<typeof previewEntrySchema>;
 export type ArtifactFile = z.infer<typeof artifactFileSchema>;
 export type FinalizedRevision = z.infer<typeof finalizedRevisionSchema>;

@@ -459,7 +459,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
       }),
       artifact_sync: tool({
         description:
-          "Sync every unsynced finalized local Revision in order to private Cloudflare storage. This never publishes an artifact.",
+          "Sync every unsynced finalized local Revision in order to private Cloudflare storage. This stays closed by default, returns the same Creator link when possible, and never publishes an artifact.",
         args: {
           artifactId: tool.schema
             .string()
@@ -482,6 +482,26 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
         },
         async execute(args, context) {
           return syncArtifact(args, context, locks, options);
+        },
+      }),
+      artifact_publish: tool({
+        description:
+          "Begin publishing a local Panes Artifact by completing private Sync and opening its Creator workspace. The human selects the exact synced Revision and 1, 7, or 30 day duration in that workspace. This intent never selects or sends a Revision, duration, or Publication request.",
+        args: {
+          artifactId: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^\S+$/)
+            .describe("Local artifact ID returned by artifact_prepare."),
+        },
+        async execute(args, context) {
+          return syncArtifact(
+            { artifactId: args.artifactId, openCreatorAfterSuccess: true },
+            context,
+            locks,
+            options,
+          );
         },
       }),
     },

@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, SourceCode } from "../../src/app";
-import { publicUrlStorageKey } from "../../src/viewer";
+import { parseViewerRoute, publicUrlStorageKey } from "../../src/viewer";
 
 const ARTIFACT: Artifact = {
   createdAt: "2026-08-17T10:00:00.000Z",
@@ -52,6 +52,16 @@ afterEach(async () => {
 });
 
 describe("artifact workspace", () => {
+  it("keeps local-first publication routes separate from legacy shared routes", () => {
+    expect(parseViewerRoute("/shared/legacy-token")).toEqual({
+      kind: "shared",
+      token: "legacy-token",
+    });
+    expect(parseViewerRoute("/published/local-first-token")).toEqual({
+      kind: "published",
+      token: "local-first-token",
+    });
+  });
   it("preserves raw source as text in code mode", () => {
     const source = '<script>alert("raw")</script>\n# heading';
     const markup = renderToStaticMarkup(
@@ -324,6 +334,13 @@ describe("artifact workspace", () => {
     const select = container.querySelector("select");
     expect(select?.textContent).toContain("v2");
     expect(select?.textContent).toContain("v1");
+    const durationSelect = container.querySelectorAll("select")[1];
+    expect(
+      [...((durationSelect?.options ?? []) as HTMLOptionsCollection)].map(
+        (option) => option.value,
+      ),
+    ).toEqual(["1", "7", "30"]);
+    expect(durationSelect?.value).toBe("7");
     expect(
       container.querySelector('iframe[sandbox="allow-scripts"]'),
     ).not.toBeNull();

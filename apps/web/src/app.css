@@ -87,8 +87,105 @@ select,
 .creator-workspace-shell {
   display: grid;
   min-height: 100vh;
-  grid-template-rows: auto minmax(460px, 1fr);
+  grid-template-rows: auto auto minmax(460px, 1fr);
   background: #171817;
+}
+
+.publication-controls {
+  display: grid;
+  gap: 12px;
+  padding: 18px 20px;
+  border-bottom: 1px solid #4b4e4a;
+  background: #171817;
+}
+
+.publication-heading,
+.publication-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.publication-heading {
+  justify-content: space-between;
+}
+
+.publication-heading h2 {
+  margin: 5px 0 0;
+  color: #f4f2eb;
+  font-size: 16px;
+  font-weight: 500;
+}
+
+.publication-state {
+  padding: 5px 8px;
+  border: 1px solid #5d6159;
+  color: #aeb1a9;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.publication-state.is-active {
+  border-color: #cb7b43;
+  color: #ffc293;
+}
+
+.publication-summary,
+.publication-hint,
+.publication-feedback {
+  margin: 0;
+  color: #b8bbb3;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.publication-url {
+  overflow: hidden;
+  color: #ffc293;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.publication-actions label {
+  display: grid;
+  gap: 4px;
+  color: #8f928b;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.publication-actions select {
+  min-height: 34px;
+  padding: 0 8px;
+  border: 1px solid #4b4e4a;
+  border-radius: 2px;
+  background: #242623;
+}
+
+.publication-feedback {
+  color: #9de0b0;
+}
+
+.publication-feedback[role="alert"] {
+  color: #ffcab9;
+}
+
+.publication-history {
+  color: #9a9d96;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+}
+
+.publication-history ul {
+  display: grid;
+  gap: 5px;
+  margin: 8px 0 0;
+  padding-left: 18px;
 }
 
 .creator-expiry {

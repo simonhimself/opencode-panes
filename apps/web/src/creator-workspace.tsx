@@ -12,7 +12,16 @@ import {
 } from "./renderers/iframe-security";
 import { MarkdownArtifactRenderer } from "./renderers/markdown";
 import { SourceCode } from "./renderers/source-code";
-import { creatorFileUrl, fetchCreatorFile } from "./viewer";
+import {
+  creatorFileUrl,
+  extendCreatorPublication,
+  fetchCreatorFile,
+  fetchCreatorWorkspace,
+  publishCreatorPublication,
+  republishCreatorPublication,
+  unpublishCreatorPublication,
+  type PublicationDuration,
+} from "./viewer";
 
 type WorkspaceMode = "preview" | "files";
 
@@ -23,15 +32,50 @@ export function CreatorWorkspace({
   token: string;
   workspace: CreatorWorkspaceResponse;
 }) {
+  const [currentWorkspace, setCurrentWorkspace] =
+    useState<CreatorWorkspaceResponse>(workspace);
   const [mode, setMode] = useState<WorkspaceMode>("preview");
-  const [version, setVersion] = useState(workspace.revisions[0]?.version ?? 0);
+  const [version, setVersion] = useState(
+    currentWorkspace.revisions[0]?.version ?? 0,
+  );
+  const [duration, setDuration] = useState<PublicationDuration>(7);
+  const [busy, setBusy] = useState(false);
+  const [feedback, setFeedback] = useState<string>();
+  const [feedbackError, setFeedbackError] = useState(false);
   const revision =
-    workspace.revisions.find((candidate) => candidate.version === version) ??
-    workspace.revisions[0];
+    currentWorkspace.revisions.find(
+      (candidate) => candidate.version === version,
+    ) ?? currentWorkspace.revisions[0];
+  const activePublication = currentWorkspace.publication ?? null;
 
   useEffect(() => {
+    setCurrentWorkspace(workspace);
     setVersion(workspace.revisions[0]?.version ?? 0);
-  }, [workspace.cloudArtifactId, workspace.revisions]);
+  }, [workspace]);
+
+  const refreshWorkspace = async () => {
+    const next = await fetchCreatorWorkspace(token);
+    setCurrentWorkspace(next);
+  };
+
+  const runPublicationAction = async (
+    action: () => Promise<unknown>,
+    success: string,
+  ) => {
+    setBusy(true);
+    setFeedback(undefined);
+    setFeedbackError(false);
+    try {
+      await action();
+      await refreshWorkspace();
+      setFeedback(success);
+    } catch (caught) {
+      setFeedback(caught instanceof Error ? caught.message : String(caught));
+      setFeedbackError(true);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   if (!revision) {
     return (
@@ -54,7 +98,7 @@ export function CreatorWorkspace({
           </span>
           <div className="title-block">
             <span className="eyebrow">CREATOR WORKSPACE</span>
-            <h1>{workspace.title}</h1>
+            <h1>{currentWorkspace.title}</h1>
           </div>
           <span className="type-readout">PRIVATE</span>
         </div>
@@ -82,7 +126,7 @@ export function CreatorWorkspace({
               onChange={(event) => setVersion(Number(event.target.value))}
               value={revision.version}
             >
-              {workspace.revisions.map((candidate) => (
+              {currentWorkspace.revisions.map((candidate) => (
                 <option key={candidate.id} value={candidate.version}>
                   v{candidate.version}
                 </option>
@@ -90,7 +134,7 @@ export function CreatorWorkspace({
             </select>
           </label>
           <span className="creator-expiry">
-            Access ends {formatDate(workspace.creatorExpiresAt)}
+            Access ends {formatDate(currentWorkspace.creatorExpiresAt)}
           </span>
         </div>
         <div className="status-strip" aria-live="polite">
@@ -106,6 +150,42 @@ export function CreatorWorkspace({
         </div>
       </header>
 
+      <PublicationControls
+        activePublication={activePublication}
+        busy={busy}
+        duration={duration}
+        feedback={feedback}
+        feedbackError={feedbackError}
+        onDurationChange={setDuration}
+        onExtend={() =>
+          void runPublicationAction(
+            () => extendCreatorPublication(token, duration),
+            "Publication extended.",
+          )
+        }
+        onPublish={() =>
+          void runPublicationAction(
+            () => publishCreatorPublication(token, revision.version, duration),
+            `Revision v${revision.version} published.`,
+          )
+        }
+        onRepublish={() =>
+          void runPublicationAction(
+            () =>
+              republishCreatorPublication(token, revision.version, duration),
+            `Revision v${revision.version} republished.`,
+          )
+        }
+        onUnpublish={() =>
+          void runPublicationAction(
+            () => unpublishCreatorPublication(token),
+            "Publication unpublished.",
+          )
+        }
+        revision={revision}
+        history={currentWorkspace.publicationHistory ?? []}
+      />
+
       <section
         aria-label={`${workspace.title} revision ${revision.version} ${mode}`}
         className="creator-stage"
@@ -117,6 +197,128 @@ export function CreatorWorkspace({
         )}
       </section>
     </main>
+  );
+}
+
+function PublicationControls({
+  activePublication,
+  busy,
+  duration,
+  feedback,
+  feedbackError,
+  history,
+  onDurationChange,
+  onExtend,
+  onPublish,
+  onRepublish,
+  onUnpublish,
+  revision,
+}: {
+  activePublication: CreatorWorkspaceResponse["publication"];
+  busy: boolean;
+  duration: PublicationDuration;
+  feedback: string | undefined;
+  feedbackError: boolean;
+  history: NonNullable<CreatorWorkspaceResponse["publicationHistory"]>;
+  onDurationChange: (duration: PublicationDuration) => void;
+  onExtend: () => void;
+  onPublish: () => void;
+  onRepublish: () => void;
+  onUnpublish: () => void;
+  revision: CreatorWorkspaceRevision;
+}) {
+  const isActive = activePublication?.status === "active";
+  return (
+    <section
+      className="publication-controls"
+      aria-labelledby="publication-title"
+    >
+      <div className="publication-heading">
+        <div>
+          <span className="eyebrow">PUBLICATION</span>
+          <h2 id="publication-title">One public link, chosen by you</h2>
+        </div>
+        <span className={`publication-state ${isActive ? "is-active" : ""}`}>
+          {isActive ? "Active" : "Not published"}
+        </span>
+      </div>
+      <p className="publication-summary">
+        {isActive
+          ? `Revision v${activePublication.revisionVersion} is public until ${formatDateTime(activePublication.expiresAt)}.`
+          : `Revision v${revision.version} is selected. Publishing will make only this synced Revision public.`}
+      </p>
+      {isActive && activePublication.publicUrl ? (
+        <a
+          className="publication-url"
+          href={activePublication.publicUrl}
+          rel="noreferrer"
+          target="_blank"
+        >
+          {activePublication.publicUrl}
+        </a>
+      ) : null}
+      <div className="publication-actions">
+        <label>
+          <span>Duration</span>
+          <select
+            disabled={busy}
+            onChange={(event) =>
+              onDurationChange(
+                Number(event.target.value) as PublicationDuration,
+              )
+            }
+            value={duration}
+          >
+            <option value={1}>1 day</option>
+            <option value={7}>7 days</option>
+            <option value={30}>30 days</option>
+          </select>
+        </label>
+        <button disabled={busy} onClick={onPublish} type="button">
+          Publish v{revision.version}
+        </button>
+        {isActive ? (
+          <>
+            <button disabled={busy} onClick={onExtend} type="button">
+              Extend by {duration} {duration === 1 ? "day" : "days"}
+            </button>
+            <button disabled={busy} onClick={onRepublish} type="button">
+              Republish v{revision.version}
+            </button>
+            <button disabled={busy} onClick={onUnpublish} type="button">
+              Unpublish
+            </button>
+          </>
+        ) : null}
+      </div>
+      {isActive ? (
+        <p className="publication-hint">
+          Publishing this same Revision keeps its existing expiry. Use Extend
+          when you want to add time.
+        </p>
+      ) : null}
+      {feedback ? (
+        <p
+          className="publication-feedback"
+          role={feedbackError ? "alert" : "status"}
+        >
+          {feedback}
+        </p>
+      ) : null}
+      {history.length > 0 ? (
+        <details className="publication-history">
+          <summary>Publication history ({history.length})</summary>
+          <ul>
+            {history.map((publication) => (
+              <li key={publication.id}>
+                v{publication.revisionVersion} · {publication.status} · expires{" "}
+                {formatDateTime(publication.expiresAt)}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </section>
   );
 }
 
@@ -432,6 +634,16 @@ function formatDate(value: string): string {
   return Number.isNaN(date.getTime())
     ? value
     : new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(date);
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : new Intl.DateTimeFormat(undefined, {
+        dateStyle: "medium",
+        timeStyle: "short",
+      }).format(date);
 }
 
 function escapeHtml(value: string): string {

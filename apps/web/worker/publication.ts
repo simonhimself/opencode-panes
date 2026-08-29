@@ -1,0 +1,667 @@
+import {
+  creatorPublicationExtendRequestSchema,
+  creatorPublicationRequestSchema,
+  ownerTokenSchema,
+  publicationSchema,
+  publicationStatusResponseSchema,
+  type Publication,
+} from "@opencode-panes/contracts";
+
+const PUBLICATION_KEY_VERSION = 1;
+const PUBLICATION_LEASE_TTL_MS = 15_000;
+const PUBLICATION_BODY_LIMIT = 16 * 1024;
+const CAPABILITY_HEADERS = {
+  "Cache-Control": "no-store",
+  "Referrer-Policy": "no-referrer",
+} as const;
+
+interface CreatorArtifactRow {
+  cloud_artifact_id: string;
+  cloud_project_id: string;
+  slug: string;
+  title: string;
+  kind: string | null;
+  expires_at: string;
+  revoked_at: string | null;
+}
+
+interface PublicationRow {
+  id: string;
+  artifact_id: string;
+  revision_version: number;
+  duration_days: number;
+  token_hash: string;
+  token_ciphertext: string | null;
+  token_nonce: string | null;
+  encryption_key_version: number | null;
+  status: "active" | "expired" | "revoked";
+  created_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+}
+
+interface RevisionRow {
+  id: string;
+  version: number;
+  committed_at: string | null;
+}
+
+type Parsed<T> = { ok: true; data: T } | { ok: false; response: Response };
+
+export async function routePublicationRequest(
+  request: Request,
+  env: Env,
+): Promise<Response | undefined> {
+  const publicMatch = new URL(request.url).pathname.match(
+    /^\/api\/publications\/([^/]+)$/u,
+  );
+  if (publicMatch) {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return methodNotAllowed(["GET", "HEAD"]);
+    }
+    const token = decodeSegment(publicMatch[1]);
+    if (!token || !ownerTokenSchema.safeParse(token).success) return notFound();
+    return publicPublicationStatus(token, env.DB);
+  }
+
+  const match = new URL(request.url).pathname.match(
+    /^\/api\/creator\/([^/]+)\/(?:publication\/)?(publish|republish|extend|unpublish)$/u,
+  );
+  if (!match) return undefined;
+  const token = decodeSegment(match[1]);
+  if (!token || !ownerTokenSchema.safeParse(token).success) return notFound();
+  if (request.method !== "POST") return methodNotAllowed(["POST"]);
+
+  const artifact = await authenticateCreator(token, env.DB);
+  if (artifact instanceof Response) return artifact;
+  const operation = match[2];
+  if (operation === "unpublish") return unpublishPublication(env.DB, artifact);
+
+  if (operation === "extend") {
+    const body = await parseBody(
+      request,
+      creatorPublicationExtendRequestSchema,
+    );
+    if (!body.ok) return body.response;
+    return mutatePublication(request, env, artifact, "extend", body.data);
+  }
+  const body = await parseBody(request, creatorPublicationRequestSchema);
+  if (!body.ok) return body.response;
+  return mutatePublication(
+    request,
+    env,
+    artifact,
+    operation === "extend"
+      ? "extend"
+      : operation === "republish"
+        ? "republish"
+        : "publish",
+    body.data,
+  );
+}
+
+export async function getPublicationSnapshot(
+  env: Env,
+  artifactId: string,
+): Promise<{
+  publication: Publication | null;
+  publicationHistory: Publication[];
+}> {
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `UPDATE publications
+        SET status = 'expired', token_ciphertext = NULL, token_nonce = NULL,
+            encryption_key_version = NULL
+      WHERE artifact_id = ? AND status = 'active' AND expires_at <= ?`,
+  )
+    .bind(artifactId, now)
+    .run();
+  const rows = await env.DB.prepare(
+    `SELECT id, artifact_id, revision_version, duration_days, token_hash,
+            token_ciphertext, token_nonce, encryption_key_version, status,
+            created_at, expires_at, revoked_at
+       FROM publications
+      WHERE artifact_id = ?
+      ORDER BY created_at DESC`,
+  )
+    .bind(artifactId)
+    .all<PublicationRow>();
+  const history = await Promise.all(
+    rows.results.map((row) => publicationView(row)),
+  );
+  return {
+    publication: history.find((item) => item.status === "active") ?? null,
+    publicationHistory: history,
+  };
+}
+
+async function authenticateCreator(
+  token: string,
+  db: D1Database,
+): Promise<CreatorArtifactRow | Response> {
+  const row = await db
+    .prepare(
+      `SELECT a.cloud_artifact_id, a.cloud_project_id, a.slug, a.title, a.kind,
+              l.expires_at, l.revoked_at
+         FROM creator_links l
+         JOIN sync_artifacts a ON a.cloud_artifact_id = l.artifact_id
+        WHERE l.token_hash = ?`,
+    )
+    .bind(await hashToken(token))
+    .first<CreatorArtifactRow>();
+  if (!row) return notFound("Creator link not found");
+  if (row.revoked_at || Date.parse(row.expires_at) <= Date.now())
+    return gone("Creator link is no longer active");
+  return row;
+}
+
+async function mutatePublication(
+  request: Request,
+  env: Env,
+  artifact: CreatorArtifactRow,
+  operation: "publish" | "republish" | "extend",
+  body: { revisionVersion?: number; durationDays: 1 | 7 | 30 },
+): Promise<Response> {
+  const leaseOwner = `publication-${crypto.randomUUID()}`;
+  const lease = await acquirePublicationLease(
+    env.DB,
+    artifact.cloud_artifact_id,
+    leaseOwner,
+  );
+  if (!lease) return conflict("Publication is busy; retry this action");
+  try {
+    if (operation === "extend")
+      return extendPublication(request, env, artifact, body.durationDays);
+
+    const revision = await env.DB.prepare(
+      `SELECT id, version, committed_at FROM local_revisions
+        WHERE artifact_id = ? AND version = ? AND committed_at IS NOT NULL`,
+    )
+      .bind(artifact.cloud_artifact_id, body.revisionVersion)
+      .first<RevisionRow>();
+    if (!revision) return notFound("Revision not found");
+
+    const nowDate = new Date();
+    const now = nowDate.toISOString();
+    const active = await activePublication(env.DB, artifact.cloud_artifact_id);
+    if (
+      operation === "publish" &&
+      active &&
+      Date.parse(active.expires_at) > nowDate.getTime() &&
+      active.revision_version === revision.version
+    ) {
+      const token = await decryptToken(env, active);
+      return publicationResponse(request, active, token, 200);
+    }
+
+    const publicationId = `publication_${crypto.randomUUID()}`;
+    const token = randomToken();
+    const encrypted = await encryptToken(
+      env,
+      token,
+      artifact.cloud_artifact_id,
+      publicationId,
+    );
+    const expiresAt = new Date(
+      nowDate.getTime() + body.durationDays * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const statements = [
+      env.DB.prepare(
+        `UPDATE publications
+            SET status = 'expired', token_ciphertext = NULL, token_nonce = NULL,
+                encryption_key_version = NULL
+          WHERE artifact_id = ? AND status = 'active' AND expires_at <= ?`,
+      ).bind(artifact.cloud_artifact_id, now),
+      env.DB.prepare(
+        `UPDATE publications
+            SET status = 'revoked', revoked_at = ?, token_ciphertext = NULL,
+                token_nonce = NULL, encryption_key_version = NULL
+          WHERE artifact_id = ? AND status = 'active'`,
+      ).bind(now, artifact.cloud_artifact_id),
+      env.DB.prepare(
+        `INSERT INTO publications
+          (id, artifact_id, revision_version, duration_days, token_hash,
+           token_ciphertext, token_nonce, encryption_key_version, status,
+           created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
+      ).bind(
+        publicationId,
+        artifact.cloud_artifact_id,
+        revision.version,
+        body.durationDays,
+        await hashToken(token),
+        encrypted.ciphertext,
+        encrypted.nonce,
+        PUBLICATION_KEY_VERSION,
+        now,
+        expiresAt,
+      ),
+    ];
+    await env.DB.batch(statements);
+    const created = await env.DB.prepare(
+      `SELECT id, artifact_id, revision_version, duration_days, token_hash,
+              token_ciphertext, token_nonce, encryption_key_version, status,
+              created_at, expires_at, revoked_at
+         FROM publications WHERE id = ?`,
+    )
+      .bind(publicationId)
+      .first<PublicationRow>();
+    if (!created) throw new Error("Created Publication was not found");
+    return publicationResponse(request, created, token, 201);
+  } finally {
+    await releasePublicationLease(
+      env.DB,
+      artifact.cloud_artifact_id,
+      leaseOwner,
+    );
+  }
+}
+
+async function extendPublication(
+  request: Request,
+  env: Env,
+  artifact: CreatorArtifactRow,
+  durationDays: 1 | 7 | 30,
+): Promise<Response> {
+  const active = await activePublication(env.DB, artifact.cloud_artifact_id);
+  if (!active || Date.parse(active.expires_at) <= Date.now()) {
+    if (active)
+      await expirePublication(env.DB, active.id, new Date().toISOString());
+    return conflict("Publication is no longer active; use Republish instead");
+  }
+  const expiresAt = new Date(
+    Date.parse(active.expires_at) + durationDays * 24 * 60 * 60 * 1000,
+  ).toISOString();
+  await env.DB.prepare(
+    `UPDATE publications SET expires_at = ?, duration_days = ?
+      WHERE id = ? AND status = 'active' AND expires_at > ?`,
+  )
+    .bind(expiresAt, durationDays, active.id, new Date().toISOString())
+    .run();
+  const updated = await env.DB.prepare(
+    `SELECT id, artifact_id, revision_version, duration_days, token_hash,
+            token_ciphertext, token_nonce, encryption_key_version, status,
+            created_at, expires_at, revoked_at
+       FROM publications WHERE id = ?`,
+  )
+    .bind(active.id)
+    .first<PublicationRow>();
+  if (!updated || updated.status !== "active")
+    return conflict("Publication is no longer active; use Republish instead");
+  const token = await decryptToken(env, updated);
+  return publicationResponse(request, updated, token, 200);
+}
+
+async function unpublishPublication(
+  db: D1Database,
+  artifact: CreatorArtifactRow,
+): Promise<Response> {
+  const now = new Date().toISOString();
+  const leaseOwner = `publication-${crypto.randomUUID()}`;
+  if (
+    !(await acquirePublicationLease(db, artifact.cloud_artifact_id, leaseOwner))
+  )
+    return conflict("Publication is busy; retry this action");
+  try {
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE publications SET status = 'expired', token_ciphertext = NULL,
+            token_nonce = NULL, encryption_key_version = NULL
+          WHERE artifact_id = ? AND status = 'active' AND expires_at <= ?`,
+        )
+        .bind(artifact.cloud_artifact_id, now),
+      db
+        .prepare(
+          `UPDATE publications SET status = 'revoked', revoked_at = ?,
+            token_ciphertext = NULL, token_nonce = NULL, encryption_key_version = NULL
+          WHERE artifact_id = ? AND status = 'active'`,
+        )
+        .bind(now, artifact.cloud_artifact_id),
+    ]);
+    return new Response(null, { status: 204, headers: CAPABILITY_HEADERS });
+  } finally {
+    await releasePublicationLease(db, artifact.cloud_artifact_id, leaseOwner);
+  }
+}
+
+async function activePublication(db: D1Database, artifactId: string) {
+  return db
+    .prepare(
+      `SELECT id, artifact_id, revision_version, duration_days, token_hash,
+              token_ciphertext, token_nonce, encryption_key_version, status,
+              created_at, expires_at, revoked_at
+         FROM publications WHERE artifact_id = ? AND status = 'active' LIMIT 1`,
+    )
+    .bind(artifactId)
+    .first<PublicationRow>();
+}
+
+async function publicationView(row: PublicationRow): Promise<Publication> {
+  const status =
+    row.status === "active" && Date.parse(row.expires_at) <= Date.now()
+      ? "expired"
+      : row.status;
+  return publicationSchema.parse({
+    id: row.id,
+    artifactId: row.artifact_id,
+    revisionVersion: row.revision_version,
+    durationDays: row.duration_days,
+    status,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    ...(row.revoked_at ? { revokedAt: row.revoked_at } : {}),
+  });
+}
+
+async function publicationResponse(
+  request: Request,
+  row: PublicationRow,
+  token: string,
+  status: number,
+) {
+  return jsonResponse(
+    publicationSchema.parse({
+      id: row.id,
+      artifactId: row.artifact_id,
+      revisionVersion: row.revision_version,
+      durationDays: row.duration_days,
+      publicUrl: publicUrl(request, token),
+      status: "active",
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+    }),
+    status,
+  );
+}
+
+async function publicPublicationStatus(token: string, db: D1Database) {
+  const row = await db
+    .prepare(
+      `SELECT id, status, expires_at FROM publications WHERE token_hash = ?
+        ORDER BY created_at DESC LIMIT 1`,
+    )
+    .bind(await hashToken(token))
+    .first<Pick<PublicationRow, "id" | "status" | "expires_at">>();
+  if (!row) return notFound();
+  if (row.status !== "active") return gone("Publication is no longer active");
+  if (Date.parse(row.expires_at) <= Date.now()) {
+    await expirePublication(db, row.id, new Date().toISOString());
+    return gone("Publication is no longer active");
+  }
+  return jsonResponse(
+    publicationStatusResponseSchema.parse({
+      status: "active",
+      expiresAt: row.expires_at,
+    }),
+  );
+}
+
+async function acquirePublicationLease(
+  db: D1Database,
+  artifactId: string,
+  owner: string,
+) {
+  const now = new Date().toISOString();
+  const expiresAt = new Date(
+    Date.now() + PUBLICATION_LEASE_TTL_MS,
+  ).toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE sync_artifacts SET publication_lease_owner = ?,
+          publication_lease_expires_at = ?
+        WHERE cloud_artifact_id = ? AND (publication_lease_owner IS NULL
+          OR publication_lease_expires_at <= ? OR publication_lease_owner = ?)`,
+    )
+    .bind(owner, expiresAt, artifactId, now, owner)
+    .run();
+  return result.meta.changes === 1;
+}
+
+async function releasePublicationLease(
+  db: D1Database,
+  artifactId: string,
+  owner: string,
+) {
+  await db
+    .prepare(
+      `UPDATE sync_artifacts SET publication_lease_owner = NULL,
+          publication_lease_expires_at = NULL
+        WHERE cloud_artifact_id = ? AND publication_lease_owner = ?`,
+    )
+    .bind(artifactId, owner)
+    .run();
+}
+
+async function expirePublication(db: D1Database, id: string, now: string) {
+  await db
+    .prepare(
+      `UPDATE publications SET status = 'expired', token_ciphertext = NULL,
+          token_nonce = NULL, encryption_key_version = NULL
+        WHERE id = ? AND status = 'active' AND expires_at <= ?`,
+    )
+    .bind(id, now)
+    .run();
+}
+
+async function encryptToken(
+  env: Env,
+  token: string,
+  artifactId: string,
+  publicationId: string,
+) {
+  const key = await encryptionKey(env, "encrypt");
+  const nonce = new Uint8Array(12);
+  crypto.getRandomValues(nonce);
+  const ciphertext = await crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: nonce.buffer as ArrayBuffer,
+      additionalData: new TextEncoder().encode(aad(artifactId, publicationId))
+        .buffer as ArrayBuffer,
+    },
+    key,
+    new TextEncoder().encode(token).buffer as ArrayBuffer,
+  );
+  return {
+    ciphertext: encodeBase64(new Uint8Array(ciphertext)),
+    nonce: bytesToHex(nonce),
+  };
+}
+
+async function decryptToken(env: Env, row: PublicationRow): Promise<string> {
+  if (
+    row.encryption_key_version !== PUBLICATION_KEY_VERSION ||
+    !row.token_ciphertext ||
+    !row.token_nonce
+  )
+    throw new Error("Publication token ciphertext is unavailable");
+  const nonce = hexToBytes(row.token_nonce);
+  if (!nonce || nonce.byteLength !== 12)
+    throw new Error("Publication nonce is malformed");
+  const key = await encryptionKey(env, "decrypt");
+  try {
+    const plaintext = await crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: nonce.buffer as ArrayBuffer,
+        additionalData: new TextEncoder().encode(aad(row.artifact_id, row.id))
+          .buffer as ArrayBuffer,
+      },
+      key,
+      decodeBase64(row.token_ciphertext).buffer as ArrayBuffer,
+    );
+    const token = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
+    if (!ownerTokenSchema.safeParse(token).success)
+      throw new Error("Publication token is malformed");
+    return token;
+  } catch {
+    throw new Error("Publication token authentication failed");
+  }
+}
+
+async function encryptionKey(env: Env, usage: "encrypt" | "decrypt") {
+  const value = env.PUBLICATION_ENCRYPTION_KEY_V1;
+  if (!value) throw new Error("Publication encryption key is not configured");
+  const bytes = decodeKey(value);
+  if (!bytes || bytes.byteLength !== 32)
+    throw new Error("Publication encryption key is malformed");
+  return crypto.subtle.importKey(
+    "raw",
+    bytes.buffer as ArrayBuffer,
+    { name: "AES-GCM", length: 256 },
+    false,
+    [usage],
+  );
+}
+
+function decodeKey(value: string): Uint8Array | undefined {
+  if (/^[0-9a-f]{64}$/u.test(value)) return hexToBytes(value);
+  try {
+    const bytes = decodeBase64(value);
+    return bytes.byteLength === 32 ? bytes : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function aad(artifactId: string, publicationId: string) {
+  return `opencode-panes/publication/${artifactId}/${publicationId}/key-v${PUBLICATION_KEY_VERSION}`;
+}
+
+function randomToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return bytesToHex(bytes);
+}
+
+async function hashToken(token: string) {
+  return bytesToHex(
+    new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)),
+    ),
+  );
+}
+
+function publicUrl(request: Request, token: string) {
+  return new URL(
+    `/published/${encodeURIComponent(token)}`,
+    request.url,
+  ).toString();
+}
+
+async function parseBody<T>(
+  request: Request,
+  schema: { safeParse(value: unknown): { success: boolean; data?: T } },
+): Promise<Parsed<T>> {
+  if (
+    !request.headers
+      .get("Content-Type")
+      ?.toLowerCase()
+      .startsWith("application/json")
+  )
+    return {
+      ok: false,
+      response: validation("Content-Type must be application/json"),
+    };
+  try {
+    const contentLength = Number(request.headers.get("Content-Length"));
+    if (
+      Number.isFinite(contentLength) &&
+      contentLength > PUBLICATION_BODY_LIMIT
+    )
+      return { ok: false, response: validation("Request is too large") };
+    const body = await readBoundedBody(request, PUBLICATION_BODY_LIMIT);
+    if (!body)
+      return { ok: false, response: validation("Request is too large") };
+    const value = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(body),
+    ) as unknown;
+    const parsed = schema.safeParse(value);
+    if (parsed.success) return { ok: true, data: parsed.data as T };
+  } catch {
+    // Fall through to the generic validation response.
+  }
+  return { ok: false, response: validation("Request validation failed") };
+}
+
+async function readBoundedBody(request: Request, maxBytes: number) {
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel("Request body exceeds the publication limit");
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+function jsonResponse(value: unknown, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      ...CAPABILITY_HEADERS,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+  });
+}
+
+function validation(message: string) {
+  return jsonResponse({ error: { code: "VALIDATION_ERROR", message } }, 400);
+}
+function conflict(message: string) {
+  return jsonResponse({ error: { code: "CONFLICT", message } }, 409);
+}
+function notFound(message = "Publication not found") {
+  return jsonResponse({ error: { code: "NOT_FOUND", message } }, 404);
+}
+function gone(message = "Publication is no longer active") {
+  return jsonResponse({ error: { code: "NOT_FOUND", message } }, 410);
+}
+function methodNotAllowed(methods: string[]) {
+  const response = jsonResponse(
+    { error: { code: "VALIDATION_ERROR", message: "Method not allowed" } },
+    405,
+  );
+  response.headers.set("Allow", methods.join(", "));
+  return response;
+}
+
+function decodeSegment(value: string | undefined) {
+  if (!value) return undefined;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return undefined;
+  }
+}
+function bytesToHex(bytes: Uint8Array) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
+}
+function hexToBytes(value: string) {
+  if (!/^[0-9a-f]+$/u.test(value) || value.length % 2 !== 0) return undefined;
+  return Uint8Array.from(value.match(/.{2}/gu) ?? [], (byte) =>
+    Number.parseInt(byte, 16),
+  );
+}
+function encodeBase64(bytes: Uint8Array) {
+  return btoa(String.fromCharCode(...bytes));
+}
+function decodeBase64(value: string) {
+  return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+}

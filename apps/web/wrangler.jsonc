@@ -6,7 +6,9 @@
   "compatibility_flags": ["nodejs_compat"],
   // Production admission control. Upload the value as an encrypted Worker secret.
   "secrets": {
-    "required": ["PANES_CREATE_API_KEY"],
+    // Versioned AES-GCM key material. Set with `wrangler secret put`; never
+    // place a value in this file or in source control.
+    "required": ["PANES_CREATE_API_KEY", "PUBLICATION_ENCRYPTION_KEY_V1"],
   },
   "observability": {
     "enabled": true,

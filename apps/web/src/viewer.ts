@@ -1,6 +1,8 @@
 import {
   artifactIdSchema,
   workspaceTokenSchema,
+  type Publication,
+  type PublicationStatusResponse,
   type Artifact,
   type ArtifactType,
   type CreatorWorkspaceResponse,
@@ -16,6 +18,7 @@ export type ViewerRoute =
   | { kind: "artifact"; artifactId: string }
   | { kind: "creator"; token: string }
   | { kind: "shared"; token: string }
+  | { kind: "published"; token: string }
   | { kind: "home" }
   | { kind: "not-found" };
 
@@ -47,6 +50,7 @@ export interface PrivateWorkspaceData {
 }
 
 export type CreatorWorkspaceData = CreatorWorkspaceResponse;
+export type PublicationDuration = 1 | 7 | 30;
 
 export interface RevisionSelection {
   followLatest: boolean;
@@ -135,6 +139,14 @@ export function parseViewerRoute(pathname: string): ViewerRoute {
     const token = decodeSegment(sharedMatch[1]);
     if (workspaceTokenSchema.safeParse(token).success) {
       return { kind: "shared", token: token as string };
+    }
+  }
+
+  const publishedMatch = pathname.match(/^\/published\/([^/]+)\/?$/);
+  if (publishedMatch) {
+    const token = decodeSegment(publishedMatch[1]);
+    if (workspaceTokenSchema.safeParse(token).success) {
+      return { kind: "published", token: token as string };
     }
   }
 
@@ -378,6 +390,18 @@ export function fetchPublicArtifact(
   );
 }
 
+export function fetchPublicationStatus(
+  token: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<PublicationStatusResponse> {
+  return requestJson<PublicationStatusResponse>(
+    `/api/publications/${encodeURIComponent(token)}`,
+    signal ? { signal } : {},
+    fetcher,
+  );
+}
+
 export function fetchCreatorWorkspace(
   token: string,
   fetcher: Fetcher = fetch,
@@ -386,6 +410,67 @@ export function fetchCreatorWorkspace(
   return requestJson<CreatorWorkspaceData>(
     `/api/creator/${encodeURIComponent(token)}`,
     signal ? { signal } : {},
+    fetcher,
+  );
+}
+
+export function publishCreatorPublication(
+  token: string,
+  revisionVersion: number,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/creator/${encodeURIComponent(token)}/publish`,
+    {
+      body: JSON.stringify({ revisionVersion, durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function republishCreatorPublication(
+  token: string,
+  revisionVersion: number,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/creator/${encodeURIComponent(token)}/republish`,
+    {
+      body: JSON.stringify({ revisionVersion, durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function extendCreatorPublication(
+  token: string,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/creator/${encodeURIComponent(token)}/extend`,
+    {
+      body: JSON.stringify({ durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function unpublishCreatorPublication(
+  token: string,
+  fetcher: Fetcher = fetch,
+): Promise<null> {
+  return requestJson<null>(
+    `/api/creator/${encodeURIComponent(token)}/unpublish`,
+    { method: "POST" },
     fetcher,
   );
 }
@@ -558,7 +643,7 @@ function isPublicViewerUrl(value: string): boolean {
       (url.protocol === "http:" || url.protocol === "https:") &&
       !url.username &&
       !url.password &&
-      /^\/shared\/[^/]+\/?$/.test(url.pathname) &&
+      /^\/(?:shared|published)\/[^/]+\/?$/.test(url.pathname) &&
       !url.search &&
       !url.hash
     );

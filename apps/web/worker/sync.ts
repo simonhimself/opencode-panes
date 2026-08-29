@@ -24,6 +24,7 @@ import {
 } from "@opencode-panes/renderers/preview-security";
 
 import { getCommittedRevisionFile, privateRevisionObjectKey } from "./storage";
+import { getPublicationSnapshot, routePublicationRequest } from "./publication";
 
 const SYNC_CREATE_KEY_HEADER = "X-Panes-Create-Key";
 const FILE_HASH_HEADER = "X-Panes-File-SHA256";
@@ -96,6 +97,8 @@ export async function routeSyncRequest(
   env: Env,
 ): Promise<Response | undefined> {
   const { pathname } = new URL(request.url);
+  const publicationResponse = await routePublicationRequest(request, env);
+  if (publicationResponse) return publicationResponse;
   if (pathname === "/api/sync/artifacts") {
     if (request.method !== "POST") return methodNotAllowed(["POST"]);
     return createSyncArtifact(request, env);
@@ -1048,6 +1051,7 @@ async function readCreatorCapability(
       ...(row.kind ? { kind: row.kind } : {}),
       creatorExpiresAt: row.expires_at,
       revisions: workspaceRevisions,
+      ...(await getPublicationSnapshot(env, row.cloud_artifact_id)),
     }),
     200,
     CREATOR_CAPABILITY_HEADERS,

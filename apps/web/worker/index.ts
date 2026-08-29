@@ -907,6 +907,16 @@ function routeTemplate(pathname: string): string {
     return "/api/sync/artifacts/:artifactId/revisions/:version/commit";
   }
   if (/^\/api\/public\/[^/]+$/.test(pathname)) return "/api/public/:token";
+  if (/^\/api\/publications\/[^/]+$/.test(pathname)) {
+    return "/api/publications/:token";
+  }
+  if (
+    /^\/api\/creator\/[^/]+\/(?:publish|republish|extend|unpublish)$/u.test(
+      pathname,
+    )
+  ) {
+    return "/api/creator/:token/publication-action";
+  }
   if (/^\/api\/artifacts\/[^/]+\/revisions$/.test(pathname)) {
     return "/api/artifacts/:artifactId/revisions";
   }
