@@ -518,6 +518,14 @@ export function creatorFileUrl(
   return download ? `${url}?download=1` : url;
 }
 
+export function creatorRevisionZipUrl(token: string, version: number): string {
+  return `/api/creator/${encodeURIComponent(token)}/revisions/${version}/download.zip`;
+}
+
+export function publicRevisionZipUrl(token: string): string {
+  return `/api/publications/${encodeURIComponent(token)}/download.zip`;
+}
+
 export async function fetchCreatorFile(
   token: string,
   version: number,

@@ -906,6 +906,14 @@ function routeTemplate(pathname: string): string {
     return "/api/creator/:token/revisions/:version/files/:path";
   }
   if (
+    /^\/api\/creator\/[^/]+\/revisions\/\d+\/download\.zip$/u.test(pathname)
+  ) {
+    return "/api/creator/:token/revisions/:version/download.zip";
+  }
+  if (/^\/api\/publications\/[^/]+\/download\.zip$/u.test(pathname)) {
+    return "/api/publications/:token/download.zip";
+  }
+  if (
     /^\/api\/sync\/artifacts\/[^/]+\/revisions\/\d+\/commit$/u.test(pathname)
   ) {
     return "/api/sync/artifacts/:artifactId/revisions/:version/commit";

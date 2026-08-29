@@ -25,6 +25,12 @@ import {
 
 import { getCommittedRevisionFile, privateRevisionObjectKey } from "./storage";
 import { getPublicationSnapshot, routePublicationRequest } from "./publication";
+import {
+  prepareRevisionArchive,
+  revisionArchiveResponse,
+  revisionZipFilename,
+  validateArchiveManifestPaths,
+} from "./zip";
 
 const SYNC_CREATE_KEY_HEADER = "X-Panes-Create-Key";
 const FILE_HASH_HEADER = "X-Panes-File-SHA256";
@@ -102,6 +108,26 @@ export async function routeSyncRequest(
   if (pathname === "/api/sync/artifacts") {
     if (request.method !== "POST") return methodNotAllowed(["POST"]);
     return createSyncArtifact(request, env);
+  }
+
+  const creatorDownloadMatch = pathname.match(
+    /^\/api\/creator\/([^/]+)\/revisions\/(\d+)\/download\.zip$/u,
+  );
+  if (creatorDownloadMatch) {
+    const token = decodePathSegment(creatorDownloadMatch[1]);
+    const version = parseVersion(creatorDownloadMatch[2]);
+    if (!token || !ownerTokenSchema.safeParse(token).success)
+      return errorResponse(
+        404,
+        "NOT_FOUND",
+        "Creator link not found",
+        undefined,
+        CREATOR_CAPABILITY_HEADERS,
+      );
+    if (version instanceof Response) return version;
+    if (request.method !== "GET" && request.method !== "HEAD")
+      return methodNotAllowed(["GET", "HEAD"], CREATOR_CAPABILITY_HEADERS);
+    return downloadCreatorRevision(request, env, token, version);
   }
 
   const creatorMatch = pathname.match(/^\/api\/creator\/([^/]+)$/u);
@@ -1003,6 +1029,14 @@ interface CreatorRevisionRow {
   cloud_manifest_key: string;
 }
 
+interface CreatorRevisionFileRow {
+  path: string;
+  sha256: string;
+  byte_size: number;
+  media_type: string;
+  object_key: string;
+}
+
 async function readCreatorCapability(
   request: Request,
   env: Env,
@@ -1125,7 +1159,14 @@ async function readCreatorFile(
     row.cloud_manifest_key,
   );
   if (!manifestObject) return capabilityFileNotFound();
-  const manifest = cloudManifestSchema.safeParse(await manifestObject.json());
+  let manifest;
+  try {
+    const rawManifest = await manifestObject.json();
+    validateArchiveManifestPaths(rawManifest);
+    manifest = cloudManifestSchema.safeParse(rawManifest);
+  } catch {
+    return capabilityFileNotFound();
+  }
   const manifestRevision = manifest.success
     ? manifest.data.revisions.find((candidate) => candidate.version === version)
     : undefined;
@@ -1192,6 +1233,91 @@ async function readCreatorFile(
     status: 200,
     headers,
   });
+}
+
+async function downloadCreatorRevision(
+  request: Request,
+  env: Env,
+  token: string,
+  version: number,
+): Promise<Response> {
+  const artifact = await loadCreatorCapability(env.DB, token);
+  if (artifact instanceof Response) return artifact;
+  const revisionRow = await env.DB.prepare(
+    `SELECT id, artifact_id, version, preview_entry, approved_origins,
+            created_at, cloud_manifest_key
+       FROM local_revisions
+      WHERE artifact_id = ? AND version = ? AND committed_at IS NOT NULL`,
+  )
+    .bind(artifact.cloud_artifact_id, version)
+    .first<CreatorRevisionRow>();
+  if (!revisionRow) return capabilityFileNotFound();
+
+  const manifestObject = await env.PRIVATE_ARTIFACTS.get(
+    revisionRow.cloud_manifest_key,
+  );
+  if (!manifestObject) return capabilityFileNotFound();
+  let manifest;
+  try {
+    const rawManifest = await manifestObject.json();
+    validateArchiveManifestPaths(rawManifest);
+    manifest = cloudManifestSchema.safeParse(rawManifest);
+  } catch {
+    return capabilityFileNotFound();
+  }
+  const revision = manifest.success
+    ? manifest.data.revisions.find((candidate) => candidate.version === version)
+    : undefined;
+  if (
+    !manifest.success ||
+    manifest.data.projectId !== artifact.cloud_project_id ||
+    manifest.data.artifactId !== artifact.cloud_artifact_id ||
+    manifest.data.slug !== artifact.slug ||
+    manifest.data.title !== artifact.title ||
+    !revision
+  )
+    return capabilityFileNotFound();
+
+  const fileRows = await env.DB.prepare(
+    `SELECT path, sha256, byte_size, media_type, object_key
+       FROM revision_files WHERE revision_id = ?`,
+  )
+    .bind(revisionRow.id)
+    .all<CreatorRevisionFileRow>();
+  try {
+    if (
+      fileRows.results.some(
+        (row) =>
+          row.object_key !==
+          privateRevisionObjectKey(
+            artifact.cloud_project_id,
+            artifact.cloud_artifact_id,
+            syncRevisionId(artifact.cloud_artifact_id, version),
+            row.path,
+          ),
+      )
+    )
+      return capabilityFileNotFound();
+    const archive = await prepareRevisionArchive({
+      bucket: env.PRIVATE_ARTIFACTS,
+      revision,
+      files: fileRows.results.map((row) => ({
+        path: row.path,
+        sha256: row.sha256,
+        byteSize: row.byte_size,
+        mediaType: row.media_type,
+        objectKey: row.object_key,
+      })),
+    });
+    return revisionArchiveResponse(
+      archive,
+      env.PRIVATE_ARTIFACTS,
+      revisionZipFilename(artifact.slug, version),
+      request.method === "HEAD",
+    );
+  } catch {
+    return capabilityFileNotFound();
+  }
 }
 
 function capabilityFileNotFound(): Response {

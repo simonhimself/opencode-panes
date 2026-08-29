@@ -215,6 +215,21 @@ select,
   font-size: 11px;
 }
 
+.workspace-download {
+  padding: 8px 10px;
+  border: 1px solid #cb7b43;
+  color: #ffc293;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-decoration: none;
+  text-transform: uppercase;
+}
+
+.workspace-download:hover {
+  border-color: #ffc293;
+  background: #30322f;
+}
+
 .creator-stage {
   min-height: 0;
   padding: 12px;

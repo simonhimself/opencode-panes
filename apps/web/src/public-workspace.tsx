@@ -5,7 +5,7 @@ import {
   CapabilityPreview,
   type CapabilityFileClient,
 } from "./creator-workspace";
-import { fetchPublicFile, publicFileUrl } from "./viewer";
+import { fetchPublicFile, publicFileUrl, publicRevisionZipUrl } from "./viewer";
 
 export function PublicWorkspace({
   token,
@@ -67,6 +67,14 @@ export function PublicWorkspace({
           <span className="public-expiry">
             Available until {formatDateTime(workspace.expiresAt)}
           </span>
+          <a
+            className="workspace-download"
+            download
+            href={publicRevisionZipUrl(token)}
+            referrerPolicy="no-referrer"
+          >
+            Download ZIP
+          </a>
         </div>
         <div className="status-strip" aria-live="polite">
           <span className="state-dot" />

@@ -14,6 +14,7 @@ import { MarkdownArtifactRenderer } from "./renderers/markdown";
 import { SourceCode } from "./renderers/source-code";
 import {
   creatorFileUrl,
+  creatorRevisionZipUrl,
   extendCreatorPublication,
   fetchCreatorFile,
   fetchCreatorWorkspace,
@@ -178,6 +179,14 @@ export function CreatorWorkspace({
           <span className="creator-expiry">
             Access ends {formatDate(currentWorkspace.creatorExpiresAt)}
           </span>
+          <a
+            className="workspace-download"
+            download
+            href={creatorRevisionZipUrl(token, revision.version)}
+            referrerPolicy="no-referrer"
+          >
+            Download ZIP
+          </a>
         </div>
         <div className="status-strip" aria-live="polite">
           <span className="state-dot" />

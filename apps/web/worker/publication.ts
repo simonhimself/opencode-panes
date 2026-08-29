@@ -16,6 +16,12 @@ import {
   normalizePreviewContentType,
 } from "@opencode-panes/renderers/preview-security";
 import { privateRevisionObjectKey } from "./storage";
+import {
+  prepareRevisionArchive,
+  revisionArchiveResponse,
+  revisionZipFilename,
+  validateArchiveManifestPaths,
+} from "./zip";
 
 const PUBLICATION_KEY_VERSION = 1;
 const PUBLICATION_LEASE_TTL_MS = 15_000;
@@ -88,6 +94,17 @@ export async function routePublicationRequest(
   env: Env,
 ): Promise<Response | undefined> {
   const pathname = new URL(request.url).pathname;
+  const publicDownloadMatch = pathname.match(
+    /^\/api\/publications\/([^/]+)\/download\.zip$/u,
+  );
+  if (publicDownloadMatch) {
+    const token = decodeSegment(publicDownloadMatch[1]);
+    if (!token || !ownerTokenSchema.safeParse(token).success)
+      return publicFileNotFound();
+    if (request.method !== "GET" && request.method !== "HEAD")
+      return methodNotAllowed(["GET", "HEAD"]);
+    return publicPublicationDownload(request, env, token);
+  }
   const publicFileMatch = pathname.match(
     /^\/api\/publications\/([^/]+)\/files\/(.+)$/u,
   );
@@ -663,6 +680,91 @@ async function publicPublicationFile(
     status: 200,
     headers,
   });
+}
+
+async function publicPublicationDownload(
+  request: Request,
+  env: Env,
+  token: string,
+): Promise<Response> {
+  const publication = await lookupPublicPublication(token, env.DB);
+  if (!publication) return publicFileNotFound();
+  if (publication.status !== "active") return gone();
+  if (Date.parse(publication.expires_at) <= Date.now()) {
+    await expirePublication(env.DB, publication.id, new Date().toISOString());
+    return gone();
+  }
+
+  const manifestObject = await env.PRIVATE_ARTIFACTS.get(
+    publication.cloud_manifest_key,
+  );
+  let manifest;
+  try {
+    const rawManifest = await manifestObject?.json();
+    validateArchiveManifestPaths(rawManifest);
+    manifest = cloudManifestSchema.safeParse(rawManifest);
+  } catch {
+    return publicFileNotFound();
+  }
+  const revision = manifest.success
+    ? manifest.data.revisions.find(
+        (candidate) => candidate.version === publication.revision_version,
+      )
+    : undefined;
+  if (
+    !manifest.success ||
+    manifest.data.projectId !== publication.cloud_project_id ||
+    manifest.data.artifactId !== publication.artifact_id ||
+    manifest.data.slug !== publication.slug ||
+    manifest.data.title !== publication.title ||
+    (manifest.data.kind ?? null) !== publication.kind ||
+    !revision
+  )
+    return publicFileNotFound();
+
+  const rows = await env.DB.prepare(
+    `SELECT path, sha256, byte_size, media_type, object_key
+       FROM revision_files WHERE revision_id = ?`,
+  )
+    .bind(publication.revision_id)
+    .all<PublicRevisionFileRow>();
+  try {
+    if (
+      rows.results.some(
+        (row) =>
+          row.object_key !==
+          privateRevisionObjectKey(
+            publication.cloud_project_id,
+            publication.artifact_id,
+            publicRevisionId(
+              publication.artifact_id,
+              publication.revision_version,
+            ),
+            row.path,
+          ),
+      )
+    )
+      return publicFileNotFound();
+    const archive = await prepareRevisionArchive({
+      bucket: env.PRIVATE_ARTIFACTS,
+      revision,
+      files: rows.results.map((row) => ({
+        path: row.path,
+        sha256: row.sha256,
+        byteSize: row.byte_size,
+        mediaType: row.media_type,
+        objectKey: row.object_key,
+      })),
+    });
+    return revisionArchiveResponse(
+      archive,
+      env.PRIVATE_ARTIFACTS,
+      revisionZipFilename(publication.slug, publication.revision_version),
+      request.method === "HEAD",
+    );
+  } catch {
+    return publicFileNotFound();
+  }
 }
 
 function publicRevisionId(artifactId: string, version: number): string {
