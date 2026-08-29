@@ -1,9 +1,20 @@
-import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 
 import {
   MAX_ARTIFACT_SOURCE_BYTES,
+  artifactManifestSchema,
   type ArtifactType,
 } from "@opencode-panes/contracts";
 import type {
@@ -20,11 +31,14 @@ const REMOTE_API = "https://panes.example";
 const OWNER_TOKEN = "owner-secret-token";
 const WORKSPACE_TOKEN = "workspace-secret-token";
 const SOURCE = "<h1>Hello</h1>";
+const execFileAsync = promisify(execFile);
 
 let stateHome: string;
+let temporaryDirectory: string;
 
 beforeEach(async () => {
   stateHome = await mkdtemp(join(tmpdir(), "opencode-panes-test-"));
+  temporaryDirectory = await mkdtemp(join(tmpdir(), "opencode-panes-project-"));
   vi.stubEnv("XDG_STATE_HOME", stateHome);
 });
 
@@ -33,6 +47,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
   await rm(stateHome, { recursive: true, force: true });
+  await rm(temporaryDirectory, { recursive: true, force: true });
 });
 
 describe("artifact tool", () => {
@@ -542,7 +557,7 @@ describe("artifact tool", () => {
       .fn<ToolContext["ask"]>()
       .mockResolvedValueOnce(undefined)
       .mockRejectedValueOnce(new Error("rejected"));
-    const { context } = toolContext(ask);
+    const { context } = toolContext({}, ask);
     const result = await executeArtifact(
       { title: "Remote", type: "html", source: SOURCE },
       context,
@@ -556,6 +571,205 @@ describe("artifact tool", () => {
     expect(structuredResult(result).metadata).toMatchObject({
       autoOpen: "permission-denied",
     });
+  });
+});
+
+describe("artifact_prepare tool", () => {
+  it("creates a Git-project artifact manifest and writable draft without fetching", async () => {
+    const repository = await gitRepository(
+      "git@github.com:Example/Prototype.git",
+    );
+    const fetchMock = vi.fn<typeof fetch>();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await executePrepare(
+      { title: "Landing Page", requestedOrigins: [] },
+      toolContext({ directory: repository, worktree: repository }).context,
+    );
+
+    const artifactDirectory = join(repository, "artifacts", "landing-page");
+    const manifest = JSON.parse(
+      await readFile(join(artifactDirectory, "artifact.json"), "utf8"),
+    );
+    const draft = JSON.parse(
+      await readFile(join(artifactDirectory, "draft.json"), "utf8"),
+    );
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(artifactManifestSchema.parse(manifest)).toMatchObject({
+      schemaVersion: 1,
+      projectId: "https://github.com/example/prototype",
+      artifactId: manifest.artifactId,
+      slug: "landing-page",
+      title: "Landing Page",
+      revisions: [],
+    });
+    expect(draft).toMatchObject({
+      artifactId: manifest.artifactId,
+      baseRevision: null,
+      requestedOrigins: [],
+    });
+    expect(await stat(join(artifactDirectory, "draft"))).toMatchObject({
+      isDirectory: expect.any(Function),
+    });
+    expect(structuredResult(result).metadata).toMatchObject({
+      operation: "created",
+      artifactId: manifest.artifactId,
+      projectId: "https://github.com/example/prototype",
+      slug: "landing-page",
+      draftPath: join(resolve(artifactDirectory), "draft"),
+      baseRevision: null,
+    });
+  });
+
+  it("uses the session directory for a non-Git session and persists generated project identity", async () => {
+    const session = join(temporaryDirectory, "session");
+    await mkdir(session, { recursive: true });
+    const context = toolContext({
+      directory: session,
+      worktree: join(session, "missing"),
+    });
+
+    const first = await executePrepare({ title: "First" }, context.context);
+    const firstMetadata = structuredResult(first).metadata;
+    const second = await executePrepare({ title: "Second" }, context.context);
+    const secondMetadata = structuredResult(second).metadata;
+
+    expect(firstMetadata?.draftPath).toContain(join(session, "artifacts"));
+    expect(secondMetadata?.projectId).toBe(firstMetadata?.projectId);
+    expect(secondMetadata?.artifactId).not.toBe(firstMetadata?.artifactId);
+    expect(
+      await stat(join(session, "artifacts", ".panes-project.json")),
+    ).toMatchObject({
+      isFile: expect.any(Function),
+    });
+  });
+
+  it("copies the latest finalized revision into a new draft without changing the revision", async () => {
+    const repository = await gitRepository();
+    const artifactDirectory = join(repository, "artifacts", "existing");
+    await mkdir(join(artifactDirectory, "v1", "assets"), { recursive: true });
+    await writeFile(
+      join(artifactDirectory, "v1", "index.html"),
+      "<h1>Original</h1>\n",
+    );
+    await writeFile(
+      join(artifactDirectory, "v1", "assets", "data.bin"),
+      Buffer.from([0, 255, 1]),
+    );
+    await writeFile(
+      join(artifactDirectory, "artifact.json"),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        projectId: "project-1",
+        artifactId: "artifact-1",
+        slug: "existing",
+        title: "Existing",
+        revisions: [
+          {
+            id: "revision-1",
+            version: 1,
+            preview: { adapter: "browser", entryPath: "index.html" },
+            approvedOrigins: [],
+            files: [],
+            createdAt: "2026-08-17T12:00:00.000Z",
+          },
+        ],
+      })}\n`,
+    );
+
+    const result = await executePrepare(
+      {
+        artifactId: "artifact-1",
+        requestedOrigins: ["https://api.example.com/"],
+      },
+      toolContext({ directory: repository, worktree: repository }).context,
+    );
+
+    const draftPath = structuredResult(result).metadata?.draftPath as string;
+    expect(await readFile(join(draftPath, "index.html"), "utf8")).toBe(
+      "<h1>Original</h1>\n",
+    );
+    expect(await readFile(join(draftPath, "assets", "data.bin"))).toEqual(
+      Buffer.from([0, 255, 1]),
+    );
+    expect(
+      await readFile(join(artifactDirectory, "v1", "index.html"), "utf8"),
+    ).toBe("<h1>Original</h1>\n");
+    expect(structuredResult(result).metadata).toMatchObject({
+      operation: "prepared",
+      artifactId: "artifact-1",
+      baseRevision: 1,
+      requestedOrigins: ["https://api.example.com"],
+    });
+  });
+
+  it("requires an explicit choice for slug collisions and existing drafts", async () => {
+    const repository = await gitRepository();
+    const context = toolContext({
+      directory: repository,
+      worktree: repository,
+    }).context;
+    const created = await executePrepare({ title: "Collision" }, context);
+
+    await expect(
+      executePrepare(
+        { title: "Collision", idempotencyKey: "different-request" },
+        context,
+      ),
+    ).rejects.toThrow("already exists");
+
+    const artifactId = structuredResult(created).metadata?.artifactId as string;
+    await expect(
+      executePrepare(
+        { artifactId, requestedOrigins: ["https://different.example"] },
+        context,
+      ),
+    ).rejects.toThrow("Draft already exists");
+
+    const resumed = await executePrepare(
+      { artifactId, requestedOrigins: [], draftAction: "resume" },
+      context,
+    );
+    expect(structuredResult(resumed).metadata).toMatchObject({
+      operation: "created",
+      artifactId,
+    });
+
+    const resumedDraftPath = structuredResult(resumed).metadata
+      ?.draftPath as string;
+    await writeFile(join(resumedDraftPath, "discard-me.txt"), "temporary");
+    const discarded = await executePrepare(
+      { artifactId, requestedOrigins: [], draftAction: "discard" },
+      context,
+    );
+    expect(structuredResult(discarded).metadata?.operation).toBe("prepared");
+    await expect(
+      stat(join(resumedDraftPath, "discard-me.txt")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("returns the existing state for a repeated idempotent request", async () => {
+    const repository = await gitRepository();
+    const context = toolContext({
+      directory: repository,
+      worktree: repository,
+    }).context;
+    const request = {
+      title: "Repeatable",
+      requestedOrigins: ["https://api.example.com"],
+      idempotencyKey: "prepare-repeat-1",
+    };
+
+    const first = await executePrepare(request, context);
+    const second = await executePrepare(request, context);
+
+    expect(structuredResult(second).metadata).toEqual(
+      structuredResult(first).metadata,
+    );
+    expect(await readdir(join(repository, "artifacts", "repeatable"))).toEqual(
+      expect.arrayContaining(["artifact.json", "draft", "draft.json"]),
+    );
   });
 });
 
@@ -578,18 +792,64 @@ async function executeArtifact(
   return definition.execute(args, context);
 }
 
-function toolContext(ask = vi.fn<ToolContext["ask"]>().mockResolvedValue()) {
+async function executePrepare(
+  args: {
+    artifactId?: string;
+    title?: string;
+    slug?: string;
+    kind?: string;
+    requestedOrigins?: string[];
+    draftAction?: "resume" | "discard";
+    idempotencyKey?: string;
+  },
+  context: ToolContext,
+) {
+  const plugin = await OpenCodePanesPlugin(
+    {} as Parameters<typeof OpenCodePanesPlugin>[0],
+    {},
+  );
+  const definition = plugin.tool?.artifact_prepare as
+    ToolDefinition | undefined;
+  if (!definition) throw new Error("artifact_prepare tool was not registered");
+  return definition.execute(args, context);
+}
+
+function toolContext(
+  overrides: Partial<Pick<ToolContext, "directory" | "worktree">> = {},
+  ask = vi.fn<ToolContext["ask"]>().mockResolvedValue(),
+) {
   const context: ToolContext = {
     sessionID: "session-1",
     messageID: "message-1",
     agent: "build",
-    directory: "/project",
-    worktree: "/project",
+    directory: overrides.directory ?? "/project",
+    worktree: overrides.worktree ?? "/project",
     abort: new AbortController().signal,
     metadata: vi.fn(),
     ask,
   };
   return { context, ask };
+}
+
+async function gitRepository(remote?: string) {
+  const repository = join(temporaryDirectory, `repo-${randomSuffix()}`);
+  await mkdir(repository, { recursive: true });
+  await execFileAsync("git", ["init", "-q", repository]);
+  if (remote) {
+    await execFileAsync("git", [
+      "-C",
+      repository,
+      "remote",
+      "add",
+      "origin",
+      remote,
+    ]);
+  }
+  return repository;
+}
+
+function randomSuffix() {
+  return Math.random().toString(36).slice(2);
 }
 
 function mockFetch(body: unknown, status = 200) {

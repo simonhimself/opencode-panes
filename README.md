@@ -1,6 +1,6 @@
 # OpenCode Panes
 
-OpenCode Panes is an MVP for creating versioned browser artifacts from an OpenCode `artifact` tool. The workspace contains a React viewer and Cloudflare Worker API, shared contracts, and a private local OpenCode plugin. The service is deployed for testing; the plugin is intentionally not distributed through a package registry.
+OpenCode Panes is an MVP for creating versioned browser artifacts from OpenCode. The workspace contains a React viewer and Cloudflare Worker API, shared contracts, and a private local OpenCode plugin. The service is deployed for testing; the plugin is intentionally not distributed through a package registry.
 
 ## Workspace
 
@@ -36,7 +36,7 @@ The global entry uses `https://opencode-panes.simons.workers.dev`, keeps browser
 
 The built package entry remains available for project-local development through an auto-discovered file in `.opencode/plugins/` or `~/.config/opencode/plugins/`. See `packages/opencode-plugin/README.md` for package details.
 
-The plugin requests upload permission, creates or revises an artifact, stores owner capability data in the user's state directory, and returns a creator URL. The creator viewer supports all six MVP renderers, immutable revision selection and polling, source highlighting, copy/download, runtime controls, and selected-revision publishing. Public links expose only their pinned revision.
+The legacy `artifact` tool requests upload permission, creates or revises a cloud artifact, stores owner capability data in the user's state directory, and returns a creator URL. The local-first `artifact_prepare` tool creates a project-local manifest and writable Draft without network access or Git mutations. The creator viewer supports all six MVP renderers, immutable revision selection and polling, source highlighting, copy/download, runtime controls, and selected-revision publishing. Public links expose only their pinned revision.
 
 ## Creation Key
 

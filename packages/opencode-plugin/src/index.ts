@@ -1,21 +1,40 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import {
+  chmod,
+  cp,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir, platform } from "node:os";
-import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { basename, dirname, join, resolve } from "node:path";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 
 import {
   MAX_ARTIFACT_SOURCE_BYTES,
+  MAX_ARTIFACT_KIND_LENGTH,
+  artifactManifestSchema,
+  artifactSlugSchema,
   WORKSPACE_TOKEN_FRAGMENT_KEY,
   artifactIdSchema,
   artifactTypeSchema,
+  draftSchema,
   createArtifactRequestSchema,
   createArtifactResponseSchema,
   createRevisionRequestSchema,
   errorEnvelopeSchema,
   ownerTokenSchema,
+  requestedOriginsSchema,
   revisionResponseSchema,
   workspaceTokenSchema,
+  type ArtifactManifest,
   type ArtifactType,
 } from "@opencode-panes/contracts";
 import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin";
@@ -23,6 +42,9 @@ import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:5173";
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const STATE_DIRECTORY_NAME = "opencode-panes";
+const PROJECT_ID_FILE_NAME = ".panes-project.json";
+const PREPARE_STATE_FILE_NAME = ".panes-prepare.json";
+const execFileAsync = promisify(execFile);
 
 const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description. After success, present viewerUrl exactly as returned, including its fragment; never shorten, sanitize, or rewrite that URL.`;
 
@@ -108,11 +130,574 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
           );
         },
       }),
+      artifact_prepare: tool({
+        description:
+          "Prepare a project-local Panes artifact or its next writable Draft. This never contacts Cloudflare, changes Git state, or creates a preview. Use normal filesystem tools to create Draft files, then use the finalize tool.",
+        args: {
+          artifactId: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe(
+              "Existing local artifact ID when preparing its next Draft.",
+            ),
+          title: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(200)
+            .optional()
+            .describe("Title for a new local artifact."),
+          slug: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe("Optional safe artifact directory slug."),
+          kind: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(MAX_ARTIFACT_KIND_LENGTH)
+            .optional()
+            .describe("Optional descriptive artifact kind."),
+          requestedOrigins: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe(
+              "HTTP(S) origins requested by the Draft, defaulting to none.",
+            ),
+          draftAction: tool.schema
+            .enum(["resume", "discard"])
+            .optional()
+            .describe("Explicitly resume or discard an existing Draft."),
+          idempotencyKey: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(256)
+            .optional()
+            .describe(
+              "Stable key for safely repeating this preparation request.",
+            ),
+        },
+        async execute(args, context) {
+          return prepareArtifact(args, context);
+        },
+      }),
     },
   };
 };
 
 export default OpenCodePanesPlugin;
+
+type PrepareArguments = {
+  artifactId?: string | undefined;
+  title?: string | undefined;
+  slug?: string | undefined;
+  kind?: string | undefined;
+  requestedOrigins?: string[] | undefined;
+  draftAction?: "resume" | "discard" | undefined;
+  idempotencyKey?: string | undefined;
+};
+
+type PrepareOperation = "created" | "prepared";
+
+interface PrepareResult {
+  operation: PrepareOperation;
+  projectId: string;
+  artifactId: string;
+  slug: string;
+  title: string;
+  draftPath: string;
+  manifestPath: string;
+  draftMetadataPath: string;
+  baseRevision: number | null;
+  requestedOrigins: string[];
+}
+
+interface StoredPrepareState {
+  idempotencyKey?: string;
+  requestHash: string;
+  result: PrepareResult;
+}
+
+async function prepareArtifact(args: PrepareArguments, context: ToolContext) {
+  const request = validatePrepareArguments(args);
+  const project = await resolveLocalProject(context);
+  await mkdir(project.artifactRoot, { recursive: true });
+
+  if (request.artifactId) {
+    const existing = await findArtifact(
+      project.artifactRoot,
+      request.artifactId,
+    );
+    if (!existing) {
+      throw new Error(
+        `No local artifact with ID ${request.artifactId} was found under ${project.artifactRoot}.`,
+      );
+    }
+    return prepareExistingArtifact(existing, request);
+  }
+
+  const slug = request.slug ?? slugify(request.title);
+  const existing = await readArtifactDirectory(
+    join(project.artifactRoot, slug),
+  );
+  if (existing) {
+    const state = await readPrepareState(
+      join(existing.artifactDirectory, PREPARE_STATE_FILE_NAME),
+    );
+    if (
+      state &&
+      state.requestHash === request.requestHash &&
+      state.idempotencyKey === request.idempotencyKey
+    ) {
+      return prepareToolResult(state.result);
+    }
+    throw new Error(
+      `Artifact slug ${JSON.stringify(slug)} already exists. Choose a different slug or provide its artifactId explicitly.`,
+    );
+  }
+
+  const artifactDirectory = join(project.artifactRoot, slug);
+  await mkdir(artifactDirectory);
+  const artifactId = `artifact-${randomUUID()}`;
+  const now = new Date().toISOString();
+  const manifest = {
+    schemaVersion: 1,
+    projectId: project.projectId,
+    artifactId,
+    slug,
+    title: request.title,
+    ...(request.kind ? { kind: request.kind } : {}),
+    revisions: [],
+  } satisfies ArtifactManifest;
+  await writeJson(join(artifactDirectory, "artifact.json"), manifest);
+
+  const result = await installDraft({
+    artifactDirectory,
+    manifest,
+    requestedOrigins: request.requestedOrigins,
+    operation: "created",
+    request,
+    now,
+  });
+  return prepareToolResult(result);
+}
+
+async function prepareExistingArtifact(
+  existing: LocalArtifact,
+  request: ValidatedPrepareArguments,
+) {
+  const { artifactDirectory, manifest } = existing;
+  if (request.title && request.title !== manifest.title) {
+    throw new Error(
+      `Artifact title is ${JSON.stringify(manifest.title)}. Retry with the stored title or omit title when preparing a revision.`,
+    );
+  }
+  if (request.slug && request.slug !== manifest.slug) {
+    throw new Error(
+      `Artifact ID ${manifest.artifactId} uses slug ${JSON.stringify(manifest.slug)}.`,
+    );
+  }
+  if (request.kind && request.kind !== manifest.kind) {
+    throw new Error(
+      `Artifact kind is ${JSON.stringify(manifest.kind ?? "unset")}. Retry without changing it.`,
+    );
+  }
+
+  const draftDirectory = join(artifactDirectory, "draft");
+  const draftMetadataPath = join(artifactDirectory, "draft.json");
+  const prepareStatePath = join(artifactDirectory, PREPARE_STATE_FILE_NAME);
+  const draftExists = await pathExists(draftDirectory);
+  const draftMetadataExists = await pathExists(draftMetadataPath);
+  const state = await readPrepareState(prepareStatePath);
+  if (draftExists || draftMetadataExists || state) {
+    if (
+      state &&
+      state.requestHash === request.requestHash &&
+      state.idempotencyKey === request.idempotencyKey
+    ) {
+      return prepareToolResult(state.result);
+    }
+    if (request.draftAction === "resume") {
+      if (!state) {
+        throw new Error(
+          `Draft for artifact ${manifest.artifactId} cannot be resumed because its preparation state is missing.`,
+        );
+      }
+      return prepareToolResult(state.result);
+    }
+    if (request.draftAction !== "discard") {
+      throw new Error(
+        `Draft already exists for artifact ${manifest.artifactId}. Choose draftAction "resume" or "discard" explicitly.`,
+      );
+    }
+    await rm(draftDirectory, { recursive: true, force: true });
+    await unlink(draftMetadataPath).catch(() => undefined);
+    await unlink(prepareStatePath).catch(() => undefined);
+  }
+
+  const now = new Date().toISOString();
+  const result = await installDraft({
+    artifactDirectory,
+    manifest,
+    requestedOrigins: request.requestedOrigins,
+    operation: "prepared",
+    request,
+    now,
+  });
+  return prepareToolResult(result);
+}
+
+interface ValidatedPrepareArguments {
+  artifactId?: string | undefined;
+  title: string;
+  slug?: string | undefined;
+  kind?: string | undefined;
+  requestedOrigins: string[];
+  draftAction?: "resume" | "discard" | undefined;
+  idempotencyKey?: string | undefined;
+  requestHash: string;
+}
+
+function validatePrepareArguments(
+  args: PrepareArguments,
+): ValidatedPrepareArguments {
+  const artifactId =
+    args.artifactId !== undefined
+      ? artifactIdSchema.safeParse(args.artifactId)
+      : undefined;
+  if (artifactId && !artifactId.success)
+    throw validationError("Artifact ID is invalid");
+
+  const title = args.title?.trim();
+  if (!artifactId?.success && !title) {
+    throw validationError("A title is required when creating an artifact");
+  }
+  if (args.title !== undefined && (!title || title.length > 200)) {
+    throw validationError("Title must be between 1 and 200 characters");
+  }
+
+  const slug =
+    args.slug !== undefined
+      ? artifactSlugSchema.safeParse(args.slug.trim())
+      : undefined;
+  if (slug && !slug.success)
+    throw validationError(
+      "Slug must use lowercase safe words separated by hyphens",
+    );
+
+  const kind = args.kind?.trim();
+  if (
+    args.kind !== undefined &&
+    (!kind || kind.length > MAX_ARTIFACT_KIND_LENGTH)
+  ) {
+    throw validationError(
+      `Kind must be at most ${MAX_ARTIFACT_KIND_LENGTH} characters`,
+    );
+  }
+
+  const origins = requestedOriginsSchema.safeParse(
+    args.requestedOrigins === undefined ? [] : args.requestedOrigins,
+  );
+  if (!origins.success) {
+    throw validationError("Requested origins must be unique HTTP(S) origins");
+  }
+  if (args.draftAction && !["resume", "discard"].includes(args.draftAction)) {
+    throw validationError("Draft action must be resume or discard");
+  }
+  const idempotencyKey = args.idempotencyKey?.trim();
+  if (
+    args.idempotencyKey !== undefined &&
+    (!idempotencyKey || idempotencyKey.length > 256)
+  ) {
+    throw validationError(
+      "Idempotency key must be between 1 and 256 characters",
+    );
+  }
+
+  const normalized = {
+    artifactId: artifactId?.success ? artifactId.data : undefined,
+    title,
+    slug: slug?.success ? slug.data : undefined,
+    kind: kind || undefined,
+    requestedOrigins: origins.data,
+    idempotencyKey,
+  };
+  return {
+    ...normalized,
+    title: title ?? "",
+    draftAction: args.draftAction,
+    requestHash: sha256(JSON.stringify(normalized)),
+  };
+}
+
+async function installDraft(input: {
+  artifactDirectory: string;
+  manifest: ArtifactManifest;
+  requestedOrigins: string[];
+  operation: PrepareOperation;
+  request: ValidatedPrepareArguments;
+  now: string;
+}) {
+  const draftDirectory = join(input.artifactDirectory, "draft");
+  const latestRevision = input.manifest.revisions.at(-1);
+  if (latestRevision) {
+    await cp(
+      join(input.artifactDirectory, `v${latestRevision.version}`),
+      draftDirectory,
+      { recursive: true, errorOnExist: true, force: false },
+    );
+  } else {
+    await mkdir(draftDirectory);
+  }
+
+  const draft = {
+    artifactId: input.manifest.artifactId,
+    baseRevision: latestRevision?.version ?? null,
+    requestedOrigins: input.requestedOrigins,
+    createdAt: input.now,
+    updatedAt: input.now,
+  };
+  const parsedDraft = draftSchemaParse(draft);
+  const draftMetadataPath = join(input.artifactDirectory, "draft.json");
+  await writeJson(draftMetadataPath, parsedDraft);
+  const result: PrepareResult = {
+    operation: input.operation,
+    projectId: input.manifest.projectId,
+    artifactId: input.manifest.artifactId,
+    slug: input.manifest.slug,
+    title: input.manifest.title,
+    draftPath: draftDirectory,
+    manifestPath: join(input.artifactDirectory, "artifact.json"),
+    draftMetadataPath,
+    baseRevision: parsedDraft.baseRevision,
+    requestedOrigins: parsedDraft.requestedOrigins,
+  };
+  await writeJson(join(input.artifactDirectory, PREPARE_STATE_FILE_NAME), {
+    ...(input.request.idempotencyKey
+      ? { idempotencyKey: input.request.idempotencyKey }
+      : {}),
+    requestHash: input.request.requestHash,
+    result,
+  } satisfies StoredPrepareState);
+  return result;
+}
+
+function draftSchemaParse(value: unknown) {
+  const parsed = draftSchema.safeParse(value);
+  if (!parsed.success)
+    throw new Error("Could not create valid local Draft metadata");
+  return parsed.data;
+}
+
+function prepareToolResult(result: PrepareResult) {
+  const metadata = { ...result };
+  return {
+    title: `${result.operation === "created" ? "Created" : "Prepared"} ${result.title} Draft`,
+    output: JSON.stringify(metadata),
+    metadata,
+  };
+}
+
+interface LocalArtifact {
+  artifactDirectory: string;
+  manifest: ArtifactManifest;
+}
+
+async function findArtifact(artifactRoot: string, artifactId: string) {
+  const entries = await readdir(artifactRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const artifact = await readArtifactDirectory(
+      join(artifactRoot, entry.name),
+    );
+    if (artifact?.manifest.artifactId === artifactId) return artifact;
+  }
+  return undefined;
+}
+
+async function readArtifactDirectory(artifactDirectory: string) {
+  let directoryStat;
+  try {
+    directoryStat = await lstat(artifactDirectory);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (!directoryStat.isDirectory()) {
+    throw new Error(`Artifact path ${artifactDirectory} is not a directory.`);
+  }
+  try {
+    const value = JSON.parse(
+      await readFile(join(artifactDirectory, "artifact.json"), "utf8"),
+    );
+    const parsed = artifactManifestSchema.safeParse(value);
+    if (!parsed.success) {
+      throw new Error(`Artifact manifest at ${artifactDirectory} is invalid.`);
+    }
+    return { artifactDirectory, manifest: parsed.data } satisfies LocalArtifact;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function readPrepareState(
+  path: string,
+): Promise<StoredPrepareState | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path, "utf8"));
+    if (
+      !value ||
+      typeof value !== "object" ||
+      typeof value.requestHash !== "string"
+    ) {
+      throw new Error(`Preparation state at ${path} is invalid.`);
+    }
+    return value as StoredPrepareState;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function writeJson(path: string, value: unknown) {
+  const temporary = join(
+    dirname(path),
+    `.${basename(path)}.${randomUUID()}.tmp`,
+  );
+  await writeFile(temporary, `${JSON.stringify(value)}\n`, {
+    encoding: "utf8",
+    mode: 0o644,
+  });
+  try {
+    await rename(temporary, path);
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function pathExists(path: string) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function resolveLocalProject(context: ToolContext) {
+  const git = await inspectGit(context.directory);
+  const artifactRoot = join(
+    git ? context.worktree : context.directory,
+    "artifacts",
+  );
+  const projectId = git?.remote
+    ? normalizeGitRemote(git.remote)
+    : await readOrCreateProjectId(artifactRoot);
+  if (!artifactIdSchema.safeParse(projectId).success) {
+    throw new Error(
+      "The project identity is not a valid local artifact identifier.",
+    );
+  }
+  return { artifactRoot, projectId };
+}
+
+async function inspectGit(directory: string) {
+  try {
+    const { stdout: rootOutput } = await execFileAsync(
+      "git",
+      ["-C", directory, "rev-parse", "--show-toplevel"],
+      { timeout: 5_000 },
+    );
+    const root = resolve(rootOutput.trim());
+    let remote: string | undefined;
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["-C", root, "config", "--get", "remote.origin.url"],
+        { timeout: 5_000 },
+      );
+      remote = stdout.trim() || undefined;
+    } catch {
+      remote = undefined;
+    }
+    return { root, remote };
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeGitRemote(remote: string) {
+  let value = remote.trim();
+  const scp = value.match(/^(?:[^@]+@)?([^:]+):(.+)$/u);
+  if (scp && !value.includes("//")) {
+    value = `https://${scp[1]}/${scp[2]}`;
+  } else if (value.startsWith("ssh://")) {
+    value = `https://${value.slice("ssh://".length).replace(/^([^@]+)@/u, "")}`;
+  } else if (value.startsWith("git+ssh://")) {
+    value = `https://${value.slice("git+ssh://".length).replace(/^([^@]+)@/u, "")}`;
+  }
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.hostname = url.hostname.toLowerCase();
+    url.pathname = url.pathname
+      .replace(/\/+$/u, "")
+      .replace(/\.git$/u, "")
+      .toLowerCase();
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  } catch {
+    return value.replace(/\/+$/u, "").replace(/\.git$/u, "");
+  }
+}
+
+async function readOrCreateProjectId(artifactRoot: string) {
+  const path = join(artifactRoot, PROJECT_ID_FILE_NAME);
+  try {
+    const value = JSON.parse(await readFile(path, "utf8"));
+    if (
+      !value ||
+      typeof value !== "object" ||
+      typeof value.projectId !== "string"
+    ) {
+      throw new Error(`Project identity at ${path} is invalid.`);
+    }
+    return value.projectId;
+  } catch (error) {
+    if (!(isNodeError(error) && error.code === "ENOENT")) throw error;
+  }
+  const projectId = `project-${randomUUID()}`;
+  await mkdir(artifactRoot, { recursive: true });
+  await writeJson(path, { projectId });
+  return projectId;
+}
+
+function slugify(title: string) {
+  const slug = title
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 128)
+    .replace(/-+$/u, "");
+  const result = slug || "artifact";
+  const parsed = artifactSlugSchema.safeParse(result);
+  if (!parsed.success)
+    throw new Error("Could not derive a safe artifact slug from the title");
+  return parsed.data;
+}
 
 function resolveOptions(
   options: Record<string, unknown> | undefined,

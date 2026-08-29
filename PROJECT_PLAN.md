@@ -57,6 +57,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 
 - [x] Install the OpenCode server plugin as a private local plugin file
 - [x] Register one `artifact` custom tool
+- [x] Register the local-first `artifact_prepare` tool
 - [x] Associate artifacts with the current OpenCode session ID
 - [x] Return artifact ID, revision, and browser URL in the tool result
 - [x] Request permission before uploading source for the first time
@@ -67,7 +68,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 
 ## OpenCode Plugin Contract
 
-The plugin registers one tool:
+The plugin registers the legacy cloud tool and the local-first preparation tool:
 
 ```ts
 artifact({
@@ -75,6 +76,16 @@ artifact({
   title: string,
   type: "html" | "react" | "svg" | "mermaid" | "markdown" | "code",
   source: string,
+})
+
+artifact_prepare({
+  artifactId?: string,
+  title?: string,
+  slug?: string,
+  kind?: string,
+  requestedOrigins?: string[],
+  draftAction?: "resume" | "discard",
+  idempotencyKey?: string,
 })
 ```
 
@@ -85,6 +96,8 @@ Behavior:
 - The OpenCode `sessionID` is recorded automatically from tool context.
 - The tool result contains the artifact ID, revision number, and private viewer URL.
 - The source is not repeated in the tool result.
+
+The local-first `artifact_prepare` tool creates a project-local `artifact.json` and writable `draft/` under the Git worktree's `artifacts/` directory, or under the session directory when Git is unavailable. It does not contact Cloudflare or modify Git state. Finalization of these Drafts is a later local-first milestone.
 
 Initial tool guidance:
 
