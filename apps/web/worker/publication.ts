@@ -40,6 +40,7 @@ interface CreatorArtifactRow {
   kind: string | null;
   expires_at: string;
   revoked_at: string | null;
+  lifecycle_state?: "active" | "deleting";
 }
 
 interface PublicationRow {
@@ -208,6 +209,38 @@ export async function getPublicationSnapshot(
   };
 }
 
+export async function mutatePublicationForInventory(
+  env: Env,
+  artifactId: string,
+  operation: "extend" | "republish" | "unpublish",
+  body?: {
+    revisionVersion?: number | undefined;
+    durationDays?: 1 | 7 | 30 | undefined;
+  },
+): Promise<Response> {
+  const artifact = await env.DB.prepare(
+    `SELECT a.cloud_artifact_id, a.cloud_project_id, a.slug, a.title, a.kind,
+            l.expires_at, l.revoked_at, a.lifecycle_state
+       FROM sync_artifacts a
+       LEFT JOIN creator_links l ON l.artifact_id = a.cloud_artifact_id
+      WHERE a.cloud_artifact_id = ?
+      ORDER BY l.created_at DESC LIMIT 1`,
+  )
+    .bind(artifactId)
+    .first<CreatorArtifactRow>();
+  if (!artifact) return notFound("Sync Artifact not found");
+  if (artifact.lifecycle_state === "deleting")
+    return conflict("Sync Artifact is being deleted");
+  if (operation === "unpublish") return unpublishPublication(env.DB, artifact);
+  if (!body?.durationDays) return validation("Request validation failed");
+  return mutatePublication(env, artifact, operation, {
+    ...(body.revisionVersion === undefined
+      ? {}
+      : { revisionVersion: body.revisionVersion }),
+    durationDays: body.durationDays,
+  });
+}
+
 async function authenticateCreator(
   token: string,
   db: D1Database,
@@ -215,7 +248,7 @@ async function authenticateCreator(
   const row = await db
     .prepare(
       `SELECT a.cloud_artifact_id, a.cloud_project_id, a.slug, a.title, a.kind,
-              l.expires_at, l.revoked_at
+              l.expires_at, l.revoked_at, a.lifecycle_state
          FROM creator_links l
          JOIN sync_artifacts a ON a.cloud_artifact_id = l.artifact_id
         WHERE l.token_hash = ?`,
@@ -223,6 +256,8 @@ async function authenticateCreator(
     .bind(await hashToken(token))
     .first<CreatorArtifactRow>();
   if (!row) return notFound("Creator link not found");
+  if (row.lifecycle_state === "deleting")
+    return conflict("Sync Artifact is being deleted");
   if (row.revoked_at || Date.parse(row.expires_at) <= Date.now())
     return gone("Creator link is no longer active");
   return row;
@@ -468,7 +503,7 @@ async function lookupPublicPublication(
            ON r.artifact_id = p.artifact_id
           AND r.version = p.revision_version
           AND r.committed_at IS NOT NULL
-        WHERE p.token_hash = ?
+         WHERE p.token_hash = ? AND a.lifecycle_state = 'active'
         ORDER BY p.created_at DESC LIMIT 1`,
     )
     .bind(await hashToken(token))

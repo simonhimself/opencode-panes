@@ -839,7 +839,8 @@ select,
 }
 
 .inventory-state.is-expired,
-.inventory-state.is-revoked {
+.inventory-state.is-revoked,
+.inventory-state.is-deleting {
   color: #c8c1aa;
 }
 
@@ -900,8 +901,91 @@ select,
   color: #9de0b0;
 }
 
+.inventory-creator-link {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 12px;
+  border: 1px solid #5d6159;
+  background: #20231f;
+}
+
+.inventory-creator-link a {
+  color: #ffc293;
+  overflow-wrap: anywhere;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+}
+
+.inventory-creator-link > span:not(.eyebrow) {
+  color: #9de0b0;
+  font-size: 12px;
+}
+
+.inventory-creator-link button {
+  justify-self: start;
+}
+
 .inventory-warning {
   margin: 18px 0 0;
+}
+
+.inventory-actions {
+  display: grid;
+  gap: 14px;
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid #3e403d;
+}
+
+.inventory-action-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+}
+
+.inventory-action-group label,
+.inventory-delete-action label {
+  display: grid;
+  gap: 5px;
+  color: #858a82;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.inventory-action-group select,
+.inventory-delete-action input {
+  min-height: 34px;
+  box-sizing: border-box;
+  padding: 0 8px;
+  border: 1px solid #4b4e4a;
+  border-radius: 2px;
+  background: #1e201e;
+  color: #d9d9d2;
+}
+
+.inventory-delete-action {
+  display: grid;
+  gap: 8px;
+}
+
+.inventory-delete-action label {
+  line-height: 1.5;
+  text-transform: none;
+}
+
+.inventory-delete-action label code {
+  color: #ffcab9;
+  overflow-wrap: anywhere;
+  text-transform: none;
+}
+
+.inventory-danger {
+  justify-self: start;
+  border-color: #975848;
+  color: #ffcab9;
 }
 
 .inventory-empty {

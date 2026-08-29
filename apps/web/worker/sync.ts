@@ -66,6 +66,12 @@ interface SyncArtifactRow {
   creator_expires_at: string;
   sync_lease_owner?: string | null;
   sync_lease_expires_at?: string | null;
+  lifecycle_state?: "active" | "deleting";
+}
+
+export interface InventoryCreatorRotation {
+  creatorUrl: string;
+  creatorExpiresAt: string;
 }
 
 interface SyncUploadRow {
@@ -256,14 +262,16 @@ async function createSyncArtifact(
   const existing = await env.DB.prepare(
     `SELECT cloud_artifact_id, cloud_project_id, local_project_id,
             local_artifact_id, slug, title, kind, owner_token_hash,
-            creation_idempotency_key, creator_token_hash,
-            creator_created_at, creator_expires_at
+             creation_idempotency_key, creator_token_hash,
+             creator_created_at, creator_expires_at, lifecycle_state
        FROM sync_artifacts
       WHERE creation_idempotency_key = ?`,
   )
     .bind(body.data.idempotencyKey)
     .first<SyncArtifactRow>();
   if (existing) {
+    if (existing.lifecycle_state === "deleting")
+      return errorResponse(409, "CONFLICT", "Sync Artifact is being deleted");
     if (!(await sameCreationRequest(existing, body.data))) {
       return errorResponse(
         409,
@@ -354,14 +362,16 @@ async function createSyncArtifact(
     const replay = await env.DB.prepare(
       `SELECT cloud_artifact_id, cloud_project_id, local_project_id,
               local_artifact_id, slug, title, kind, owner_token_hash,
-              creation_idempotency_key, creator_token_hash,
-              creator_created_at, creator_expires_at
+               creation_idempotency_key, creator_token_hash,
+               creator_created_at, creator_expires_at, lifecycle_state
          FROM sync_artifacts
         WHERE creation_idempotency_key = ?`,
     )
       .bind(body.data.idempotencyKey)
       .first<SyncArtifactRow>();
     if (replay && (await sameCreationRequest(replay, body.data))) {
+      if (replay.lifecycle_state === "deleting")
+        return errorResponse(409, "CONFLICT", "Sync Artifact is being deleted");
       const leaseError = await acquireSyncLease(
         request,
         env.DB,
@@ -1344,12 +1354,64 @@ async function rotateCreatorLink(
   if (artifact instanceof Response) return artifact;
   const leaseError = await acquireSyncLease(request, env.DB, artifactId);
   if (leaseError) return leaseError;
-  const body = await parseJsonBody(
-    request,
-    syncCreatorRotateRequestSchema,
-    SYNC_BODY_LIMIT,
-  );
-  if (!body.ok) return body.response;
+  try {
+    const body = await parseJsonBody(
+      request,
+      syncCreatorRotateRequestSchema,
+      SYNC_BODY_LIMIT,
+    );
+    if (!body.ok) return body.response;
+    const rotated = await rotateCreatorLinkAfterLease(request, env, artifactId);
+    return jsonResponse(
+      syncCreatorRotateResponseSchema.parse({
+        cloudArtifactId: artifactId,
+        creatorToken: rotated.creatorToken,
+        creatorUrl: rotated.creatorUrl,
+        creatorExpiresAt: rotated.creatorExpiresAt,
+      }),
+      200,
+      CREATOR_CAPABILITY_HEADERS,
+    );
+  } finally {
+    await releaseSyncLeaseByOwner(env.DB, artifactId, sessionId(request));
+  }
+}
+
+export async function rotateCreatorLinkForInventory(
+  request: Request,
+  env: Env,
+  artifactId: string,
+): Promise<InventoryCreatorRotation | Response> {
+  const row = await env.DB.prepare(
+    `SELECT cloud_artifact_id, cloud_project_id, local_project_id,
+            local_artifact_id, slug, title, kind, owner_token_hash,
+            creation_idempotency_key, creator_token_hash,
+            creator_created_at, creator_expires_at, lifecycle_state
+       FROM sync_artifacts WHERE cloud_artifact_id = ?`,
+  )
+    .bind(artifactId)
+    .first<SyncArtifactRow>();
+  if (!row) return errorResponse(404, "NOT_FOUND", "Sync Artifact not found");
+  if (row.lifecycle_state === "deleting")
+    return errorResponse(409, "CONFLICT", "Sync Artifact is being deleted");
+  const leaseError = await acquireSyncLease(request, env.DB, artifactId);
+  if (leaseError) return leaseError;
+  try {
+    const rotated = await rotateCreatorLinkAfterLease(request, env, artifactId);
+    return {
+      creatorUrl: rotated.creatorUrl,
+      creatorExpiresAt: rotated.creatorExpiresAt,
+    };
+  } finally {
+    await releaseSyncLeaseByOwner(env.DB, artifactId, sessionId(request));
+  }
+}
+
+async function rotateCreatorLinkAfterLease(
+  request: Request,
+  env: Env,
+  artifactId: string,
+) {
   const creatorToken = `sync-creator-${crypto.randomUUID()}`;
   const tokenHash = await hashToken(creatorToken);
   const createdAt = new Date().toISOString();
@@ -1378,19 +1440,14 @@ async function rotateCreatorLink(
         WHERE cloud_artifact_id = ?`,
     ).bind(tokenHash, createdAt, expiresAt, createdAt, artifactId),
   ]);
-  return jsonResponse(
-    syncCreatorRotateResponseSchema.parse({
-      cloudArtifactId: artifactId,
-      creatorToken,
-      creatorUrl: new URL(
-        `/creator/${encodeURIComponent(creatorToken)}`,
-        request.url,
-      ).toString(),
-      creatorExpiresAt: expiresAt,
-    }),
-    200,
-    CREATOR_CAPABILITY_HEADERS,
-  );
+  return {
+    creatorToken,
+    creatorUrl: new URL(
+      `/creator/${encodeURIComponent(creatorToken)}`,
+      request.url,
+    ).toString(),
+    creatorExpiresAt: expiresAt,
+  };
 }
 
 async function acquireSyncLease(
@@ -1407,8 +1464,9 @@ async function acquireSyncLease(
           SET sync_lease_owner = ?, sync_lease_expires_at = ?, updated_at = ?
         WHERE cloud_artifact_id = ?
           AND (sync_lease_owner IS NULL
-            OR sync_lease_expires_at <= ?
-            OR sync_lease_owner = ?)`,
+           OR sync_lease_expires_at <= ?
+            OR sync_lease_owner = ?)
+          AND lifecycle_state = 'active'`,
     )
     .bind(owner, expires, now, artifactId, now, owner)
     .run();
@@ -1448,6 +1506,21 @@ async function releaseSyncLease(
   return new Response(null, { status: 204 });
 }
 
+async function releaseSyncLeaseByOwner(
+  db: D1Database,
+  artifactId: string,
+  owner: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE sync_artifacts
+          SET sync_lease_owner = NULL, sync_lease_expires_at = NULL
+        WHERE cloud_artifact_id = ? AND sync_lease_owner = ?`,
+    )
+    .bind(artifactId, owner)
+    .run();
+}
+
 async function authenticateSyncOwner(
   request: Request,
   db: D1Database,
@@ -1468,13 +1541,15 @@ async function authenticateSyncOwner(
       `SELECT cloud_artifact_id, cloud_project_id, local_project_id,
               local_artifact_id, slug, title, kind, owner_token_hash,
               creation_idempotency_key, creator_token_hash,
-              creator_created_at, creator_expires_at
+              creator_created_at, creator_expires_at, lifecycle_state
          FROM sync_artifacts
         WHERE cloud_artifact_id = ?`,
     )
     .bind(artifactId)
     .first<SyncArtifactRow>();
   if (!row) return errorResponse(404, "NOT_FOUND", "Sync Artifact not found");
+  if (row.lifecycle_state === "deleting")
+    return errorResponse(409, "CONFLICT", "Sync Artifact is being deleted");
   if (!constantTimeHashEqual(row.owner_token_hash, await hashToken(token))) {
     return errorResponse(403, "FORBIDDEN", "The owner credential is invalid");
   }
@@ -1763,8 +1838,9 @@ async function acquireCleanupLease(
           SET sync_lease_owner = ?, sync_lease_expires_at = ?
         WHERE cloud_artifact_id = ?
           AND (sync_lease_owner IS NULL
-            OR sync_lease_expires_at <= ?
-            OR sync_lease_owner = ?)`,
+           OR sync_lease_expires_at <= ?
+            OR sync_lease_owner = ?)
+          AND lifecycle_state = 'active'`,
     )
     .bind(owner, expires, artifactId, now, owner)
     .run();

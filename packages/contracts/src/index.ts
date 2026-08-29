@@ -522,6 +522,11 @@ export const inventoryCreatorLinkSchema = z.strictObject({
   expiresAt: timestampSchema,
 });
 
+export const inventoryRevisionSchema = z.strictObject({
+  version: revisionNumberSchema,
+  createdAt: timestampSchema,
+});
+
 export const inventoryPublicationSchema = z.strictObject({
   status: z.enum(["none", "active", "expired", "revoked"]),
   revisionVersion: revisionNumberSchema.nullable(),
@@ -534,11 +539,13 @@ export const inventoryArtifactSchema = z.strictObject({
   slug: artifactSlugSchema,
   title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
   kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).nullable(),
+  lifecycleState: z.enum(["active", "deleting"]),
   revisionCount: z.number().int().nonnegative().safe(),
   storageBytes: z.number().int().nonnegative().safe(),
   lastSyncedAt: timestampSchema.nullable(),
   creatorLink: inventoryCreatorLinkSchema,
   publication: inventoryPublicationSchema,
+  revisions: z.array(inventoryRevisionSchema),
   warnings: z.array(z.string().min(1).max(256)),
 });
 
@@ -549,6 +556,23 @@ export const inventoryProjectSchema = z.strictObject({
 
 export const inventoryResponseSchema = z.strictObject({
   projects: z.array(inventoryProjectSchema),
+});
+
+export const inventoryCreatorRotateResponseSchema = z.strictObject({
+  cloudArtifactId: artifactIdSchema,
+  creatorUrl: urlSchema,
+  creatorExpiresAt: timestampSchema,
+});
+
+export const inventoryPublicationMutationRequestSchema = z.strictObject({
+  revisionVersion: revisionNumberSchema.optional(),
+  durationDays: publicationDurationSchema,
+});
+
+export const inventoryPublicationUnpublishRequestSchema = z.strictObject({});
+
+export const inventoryCloudDeletionRequestSchema = z.strictObject({
+  confirmation: z.string().min(1).max(256),
 });
 
 export type ArtifactManifest = z.infer<typeof artifactManifestSchema>;
@@ -601,10 +625,23 @@ export type PublicPublicationResponse = z.infer<
   typeof publicPublicationResponseSchema
 >;
 export type InventoryCreatorLink = z.infer<typeof inventoryCreatorLinkSchema>;
+export type InventoryRevision = z.infer<typeof inventoryRevisionSchema>;
 export type InventoryPublication = z.infer<typeof inventoryPublicationSchema>;
 export type InventoryArtifact = z.infer<typeof inventoryArtifactSchema>;
 export type InventoryProject = z.infer<typeof inventoryProjectSchema>;
 export type InventoryResponse = z.infer<typeof inventoryResponseSchema>;
+export type InventoryCreatorRotateResponse = z.infer<
+  typeof inventoryCreatorRotateResponseSchema
+>;
+export type InventoryPublicationMutationRequest = z.infer<
+  typeof inventoryPublicationMutationRequestSchema
+>;
+export type InventoryPublicationUnpublishRequest = z.infer<
+  typeof inventoryPublicationUnpublishRequestSchema
+>;
+export type InventoryCloudDeletionRequest = z.infer<
+  typeof inventoryCloudDeletionRequestSchema
+>;
 
 export const deriveCloudManifest = (
   manifest: unknown,

@@ -1,8 +1,20 @@
 import {
+  inventoryCreatorRotateResponseSchema,
+  inventoryPublicationMutationRequestSchema,
+  inventoryPublicationUnpublishRequestSchema,
   inventoryResponseSchema,
+  syncCreatorRotateRequestSchema,
   type InventoryResponse,
 } from "@opencode-panes/contracts";
 import { decryptPublicationToken } from "./publication";
+import {
+  rotateCreatorLinkForInventory,
+  type InventoryCreatorRotation,
+} from "./sync";
+import { mutatePublicationForInventory } from "./publication";
+import { readBoundedText } from "./bounded-json";
+
+const INVENTORY_BODY_LIMIT = 4096;
 
 interface InventoryRow {
   project_id: string;
@@ -10,6 +22,7 @@ interface InventoryRow {
   slug: string;
   title: string;
   kind: string | null;
+  lifecycle_state: "active" | "deleting";
   revision_count: number;
   storage_bytes: number;
   last_synced_at: string | null;
@@ -23,6 +36,7 @@ interface InventoryRow {
   publication_token_ciphertext: string | null;
   publication_token_nonce: string | null;
   publication_encryption_key_version: number | null;
+  revision_metadata: string | null;
 }
 
 interface PublicationCiphertext {
@@ -52,14 +66,24 @@ export async function loadInventory(
        a.cloud_project_id AS project_id,
        a.cloud_artifact_id AS artifact_id,
        a.slug,
-       a.title,
-       a.kind,
+        a.title,
+        a.kind,
+        a.lifecycle_state,
        COUNT(DISTINCT CASE WHEN r.committed_at IS NOT NULL THEN r.id END)
          AS revision_count,
        COALESCE(SUM(CASE WHEN r.committed_at IS NOT NULL THEN f.byte_size ELSE 0 END), 0)
          AS storage_bytes,
-       MAX(CASE WHEN r.committed_at IS NOT NULL THEN r.committed_at END)
-         AS last_synced_at,
+        MAX(CASE WHEN r.committed_at IS NOT NULL THEN r.committed_at END)
+          AS last_synced_at,
+        (
+          SELECT json_group_array(json_object(
+            'version', committed.version,
+            'createdAt', committed.created_at
+          ))
+          FROM local_revisions committed
+          WHERE committed.artifact_id = a.cloud_artifact_id
+            AND committed.committed_at IS NOT NULL
+        ) AS revision_metadata,
        (
          SELECT CASE
            WHEN latest.revoked_at IS NOT NULL THEN 'revoked'
@@ -137,7 +161,8 @@ export async function loadInventory(
      FROM sync_artifacts a
      LEFT JOIN local_revisions r ON r.artifact_id = a.cloud_artifact_id
      LEFT JOIN revision_files f ON f.revision_id = r.id
-     GROUP BY a.cloud_project_id, a.cloud_artifact_id, a.slug, a.title, a.kind
+      GROUP BY a.cloud_project_id, a.cloud_artifact_id, a.slug, a.title, a.kind,
+        a.lifecycle_state
      ORDER BY a.cloud_project_id ASC, a.slug ASC`,
   )
     .bind(now)
@@ -181,6 +206,7 @@ export async function loadInventory(
       slug: row.slug,
       title: row.title,
       kind: row.kind,
+      lifecycleState: row.lifecycle_state,
       revisionCount: row.revision_count,
       storageBytes: row.storage_bytes,
       lastSyncedAt: row.last_synced_at,
@@ -189,6 +215,12 @@ export async function loadInventory(
         expiresAt: row.creator_expires_at,
       },
       publication,
+      revisions: row.revision_metadata
+        ? (JSON.parse(row.revision_metadata) as Array<{
+            version: number;
+            createdAt: string;
+          }>)
+        : [],
       warnings,
     });
   }
@@ -235,4 +267,101 @@ export function inventoryResponse(
       "X-Content-Type-Options": "nosniff",
     },
   });
+}
+
+export async function rotateInventoryCreator(
+  request: Request,
+  env: Env,
+  artifactId: string,
+): Promise<Response> {
+  const body = await readJson(request);
+  if (!body.ok || !syncCreatorRotateRequestSchema.safeParse(body.value).success)
+    return inventoryError(400, "Request validation failed");
+
+  const rotated: InventoryCreatorRotation | Response =
+    await rotateCreatorLinkForInventory(request, env, artifactId);
+  if (rotated instanceof Response) return rotated;
+  return inventoryJsonResponse(
+    inventoryCreatorRotateResponseSchema.parse({
+      cloudArtifactId: artifactId,
+      creatorUrl: rotated.creatorUrl,
+      creatorExpiresAt: rotated.creatorExpiresAt,
+    }),
+  );
+}
+
+export async function mutateInventoryPublicationRequest(
+  request: Request,
+  env: Env,
+  artifactId: string,
+  operation: "extend" | "republish" | "unpublish",
+): Promise<Response> {
+  const body =
+    operation === "unpublish" && request.body === null
+      ? { ok: true as const, value: {} }
+      : await readJson(request);
+  if (!body.ok) return inventoryError(400, "Request validation failed");
+  if (operation === "unpublish") {
+    if (request.method !== "POST")
+      return inventoryError(405, "Method not allowed");
+    if (
+      !inventoryPublicationUnpublishRequestSchema.safeParse(body.value).success
+    )
+      return inventoryError(400, "Request validation failed");
+    return mutatePublicationForInventory(env, artifactId, "unpublish");
+  }
+  const parsed = inventoryPublicationMutationRequestSchema.safeParse(
+    body.value,
+  );
+  if (!parsed.success) return inventoryError(400, "Request validation failed");
+  if (
+    (operation === "extend" && parsed.data.revisionVersion !== undefined) ||
+    (operation === "republish" && parsed.data.revisionVersion === undefined)
+  ) {
+    return inventoryError(400, "Request validation failed");
+  }
+  return mutatePublicationForInventory(env, artifactId, operation, parsed.data);
+}
+
+export function inventoryJsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      "Cache-Control": "no-store",
+      "Content-Type": "application/json; charset=utf-8",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+  });
+}
+
+function inventoryError(status: number, message: string): Response {
+  return inventoryJsonResponse(
+    {
+      error: {
+        code: "VALIDATION_ERROR",
+        message,
+      },
+    },
+    status,
+  );
+}
+
+async function readJson(
+  request: Request,
+): Promise<{ ok: true; value: unknown } | { ok: false }> {
+  if (
+    !request.headers
+      .get("Content-Type")
+      ?.toLowerCase()
+      .startsWith("application/json")
+  )
+    return { ok: false };
+  try {
+    const text = await readBoundedText(request, INVENTORY_BODY_LIMIT);
+    if (text === undefined) return { ok: false };
+    return { ok: true, value: JSON.parse(text) as unknown };
+  } catch {
+    return { ok: false };
+  }
 }

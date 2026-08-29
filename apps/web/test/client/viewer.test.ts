@@ -4,6 +4,8 @@ import {
   captureWorkspaceAccess,
   clearStoredPublicUrl,
   createSerializedPoller,
+  deleteInventoryArtifact,
+  extendInventoryPublication,
   fetchPrivateWorkspace,
   fetchPublicArtifact,
   followCurrentRevision,
@@ -11,9 +13,12 @@ import {
   parseViewerRoute,
   publicUrlStorageKey,
   publishRevision,
+  republishInventoryPublication,
+  rotateInventoryCreator,
   safeDownloadFilename,
   selectRevision,
   storePublicUrl,
+  unpublishInventoryPublication,
   workspaceTokenStorageKey,
 } from "../../src/viewer";
 
@@ -188,6 +193,42 @@ describe("viewer API requests", () => {
     );
     expect(JSON.parse(String(request?.body))).toEqual({
       revisionId: "revision-1",
+    });
+  });
+
+  it("sends inventory lifecycle mutations without private bearer credentials", async () => {
+    const calls: Array<{ init: RequestInit | undefined; url: string }> = [];
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, url: String(input) });
+      return new Response(null, { status: 204 });
+    };
+
+    await rotateInventoryCreator("artifact-1", fetcher);
+    await extendInventoryPublication("artifact-1", 7, fetcher);
+    await republishInventoryPublication("artifact-1", 2, 30, fetcher);
+    await unpublishInventoryPublication("artifact-1", fetcher);
+    await deleteInventoryArtifact(
+      "artifact-1",
+      "DELETE CLOUD COPY OF Test artifact",
+      fetcher,
+    );
+
+    expect(calls.map(({ init }) => init?.method)).toEqual([
+      "POST",
+      "POST",
+      "POST",
+      "POST",
+      "DELETE",
+    ]);
+    for (const { init } of calls) {
+      expect(new Headers(init?.headers).has("Authorization")).toBe(false);
+      expect(new Headers(init?.headers).get("Content-Type")).toBe(
+        "application/json",
+      );
+    }
+    expect(JSON.parse(String(calls[2]?.init?.body))).toEqual({
+      revisionVersion: 2,
+      durationDays: 30,
     });
   });
 });

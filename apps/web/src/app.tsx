@@ -1,4 +1,8 @@
-import type { Artifact, Revision } from "@opencode-panes/contracts";
+import type {
+  Artifact,
+  InventoryArtifact,
+  Revision,
+} from "@opencode-panes/contracts";
 import {
   useEffect,
   useEffectEvent,
@@ -27,10 +31,15 @@ import {
   followCurrentRevision,
   getStoredPublicUrl,
   includeRevision,
+  deleteInventoryArtifact,
+  extendInventoryPublication,
+  republishInventoryPublication,
+  rotateInventoryCreator,
   publishRevision,
   selectRevision,
   storePublicUrl,
   unpublishArtifact,
+  unpublishInventoryPublication,
   type RevisionSelection,
   type ViewerRoute,
   type WorkspaceAccess,
@@ -185,6 +194,12 @@ function InventoryPage() {
                   artifact={artifact}
                   copyMessage={copyMessage}
                   key={artifact.artifactId}
+                  onRefresh={async () => {
+                    const loaded = await fetchInventory();
+                    setInventory(loaded);
+                    setError(undefined);
+                  }}
+                  onNotice={setCopyMessage}
                   onCopy={async () => {
                     if (!artifact.publication.publicUrl) return;
                     try {
@@ -220,7 +235,8 @@ function InventoryHeader({ projectCount }: { projectCount: number }) {
         </div>
       </div>
       <p className="inventory-summary">
-        {projectCount} project{projectCount === 1 ? "" : "s"} · read-only
+        {projectCount} project{projectCount === 1 ? "" : "s"} · operator
+        controls
       </p>
     </header>
   );
@@ -230,14 +246,43 @@ function InventoryArtifactCard({
   artifact,
   copyMessage,
   onCopy,
+  onNotice,
+  onRefresh,
 }: {
-  artifact: Awaited<
-    ReturnType<typeof fetchInventory>
-  >["projects"][number]["artifacts"][number];
+  artifact: InventoryArtifact;
   copyMessage?: string | undefined;
   onCopy: () => Promise<void>;
+  onNotice: (message: string) => void;
+  onRefresh: () => Promise<void>;
 }) {
+  const [busy, setBusy] = useState<string>();
+  const [durationDays, setDurationDays] = useState<1 | 7 | 30>(7);
+  const [revisionVersion, setRevisionVersion] = useState(
+    artifact.revisions[0]?.version ?? artifact.publication.revisionVersion ?? 0,
+  );
+  const [confirmation, setConfirmation] = useState("");
+  const [rotatedCreator, setRotatedCreator] = useState<{
+    url: string;
+    expiresAt: string;
+  }>();
   const publication = artifact.publication;
+  const deleting = artifact.lifecycleState === "deleting";
+  const deletionConfirmation = `DELETE CLOUD COPY OF ${artifact.title}`;
+  useEffect(() => {
+    if (deleting) setRotatedCreator(undefined);
+  }, [deleting]);
+  const runAction = async (label: string, action: () => Promise<unknown>) => {
+    setBusy(label);
+    try {
+      await action();
+      await onRefresh();
+      onNotice(`${artifact.title}: ${label} complete`);
+    } catch (error) {
+      onNotice(`${artifact.title}: ${apiErrorMessage(error)}`);
+    } finally {
+      setBusy(undefined);
+    }
+  };
   return (
     <article className="inventory-card">
       <header className="inventory-card-header">
@@ -246,8 +291,10 @@ function InventoryArtifactCard({
           <h3>{artifact.title}</h3>
           <code>{artifact.slug}</code>
         </div>
-        <span className={`inventory-state is-${publication.status}`}>
-          {publication.status}
+        <span
+          className={`inventory-state is-${deleting ? "deleting" : publication.status}`}
+        >
+          {deleting ? "deleting" : publication.status}
         </span>
       </header>
       <dl className="inventory-facts">
@@ -292,6 +339,160 @@ function InventoryArtifactCard({
           ) : null}
         </div>
       ) : null}
+      <div
+        className="inventory-actions"
+        aria-label={`${artifact.title} actions`}
+      >
+        {deleting ? (
+          <p className="inventory-warning" role="status">
+            Cloud deletion is in progress. Re-enter the confirmation to resume
+            cleanup if needed.
+          </p>
+        ) : null}
+        <div className="inventory-action-group">
+          <button
+            disabled={Boolean(busy) || deleting}
+            onClick={() =>
+              void runAction("Creator link rotated", () =>
+                rotateInventoryCreator(artifact.artifactId).then((rotated) => {
+                  setRotatedCreator({
+                    url: rotated.creatorUrl,
+                    expiresAt: rotated.creatorExpiresAt,
+                  });
+                }),
+              )
+            }
+            type="button"
+          >
+            {busy === "Creator link rotated"
+              ? "Rotating…"
+              : "Rotate Creator link"}
+          </button>
+          <label>
+            Duration
+            <select
+              disabled={Boolean(busy) || deleting}
+              onChange={(event) =>
+                setDurationDays(Number(event.target.value) as 1 | 7 | 30)
+              }
+              value={durationDays}
+            >
+              <option value={1}>1 day</option>
+              <option value={7}>7 days</option>
+              <option value={30}>30 days</option>
+            </select>
+          </label>
+          <button
+            disabled={
+              Boolean(busy) || deleting || publication.status !== "active"
+            }
+            onClick={() =>
+              void runAction("Publication extended", () =>
+                extendInventoryPublication(artifact.artifactId, durationDays),
+              )
+            }
+            type="button"
+          >
+            Extend publication
+          </button>
+          <button
+            disabled={
+              Boolean(busy) || deleting || publication.status !== "active"
+            }
+            onClick={() =>
+              void runAction("Publication unpublished", () =>
+                unpublishInventoryPublication(artifact.artifactId),
+              )
+            }
+            type="button"
+          >
+            Unpublish
+          </button>
+        </div>
+        {rotatedCreator ? (
+          <div className="inventory-creator-link">
+            <span className="eyebrow">NEW CREATOR LINK</span>
+            <a href={rotatedCreator.url} rel="noreferrer" target="_blank">
+              {rotatedCreator.url}
+            </a>
+            <span>
+              Expires {formatInventoryTime(rotatedCreator.expiresAt)} (30 days)
+            </span>
+            <button
+              onClick={() =>
+                void copyText(rotatedCreator.url).then(
+                  () => onNotice(`${artifact.title} Creator URL copied`),
+                  () => onNotice("Clipboard access is unavailable"),
+                )
+              }
+              type="button"
+            >
+              Copy Creator URL
+            </button>
+          </div>
+        ) : null}
+        <div className="inventory-action-group">
+          <label>
+            Republish revision
+            <select
+              disabled={
+                Boolean(busy) || deleting || artifact.revisions.length === 0
+              }
+              onChange={(event) =>
+                setRevisionVersion(Number(event.target.value))
+              }
+              value={revisionVersion}
+            >
+              {artifact.revisions.map((revision) => (
+                <option key={revision.version} value={revision.version}>
+                  v{revision.version}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            disabled={
+              Boolean(busy) || deleting || artifact.revisions.length === 0
+            }
+            onClick={() =>
+              void runAction("Publication republished", () =>
+                republishInventoryPublication(
+                  artifact.artifactId,
+                  revisionVersion,
+                  durationDays,
+                ),
+              )
+            }
+            type="button"
+          >
+            Republish
+          </button>
+        </div>
+        <div className="inventory-delete-action">
+          <label htmlFor={`delete-${artifact.artifactId}`}>
+            Type <code>{deletionConfirmation}</code> to permanently remove
+            Creator/public links, cloud metadata, and stored bytes. Canonical
+            local files remain unchanged.
+          </label>
+          <input
+            id={`delete-${artifact.artifactId}`}
+            onChange={(event) => setConfirmation(event.target.value)}
+            value={confirmation}
+          />
+          <button
+            className="inventory-danger"
+            disabled={Boolean(busy) || confirmation !== deletionConfirmation}
+            onClick={() =>
+              void runAction("Cloud copy deleted", () =>
+                deleteInventoryArtifact(artifact.artifactId, confirmation),
+              )
+            }
+            type="button"
+          >
+            Delete cloud copy
+          </button>
+        </div>
+      </div>
       {artifact.warnings.map((warning) => (
         <p className="inventory-warning" key={warning} role="alert">
           {warning}

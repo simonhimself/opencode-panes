@@ -35,6 +35,10 @@ import {
   syncCreateResponseSchema,
   syncRevisionCommitRequestSchema,
   syncRevisionCommitResponseSchema,
+  inventoryCreatorRotateResponseSchema,
+  inventoryPublicationMutationRequestSchema,
+  inventoryCloudDeletionRequestSchema,
+  inventoryPublicationUnpublishRequestSchema,
   workspaceTokenSchema,
 } from "../src/index.js";
 
@@ -287,6 +291,47 @@ describe("local-first artifact manifests", () => {
 });
 
 describe("local-first lifecycle contracts", () => {
+  it("keeps authenticated inventory mutations strict and secret-minimal", () => {
+    expect(
+      inventoryCreatorRotateResponseSchema.safeParse({
+        cloudArtifactId: "cloud-artifact-1",
+        creatorUrl: "https://panes.example/creator/new-token",
+        creatorExpiresAt: "2026-09-16T12:00:00.000Z",
+      }).success,
+    ).toBe(true);
+    expect(
+      inventoryCreatorRotateResponseSchema.safeParse({
+        cloudArtifactId: "cloud-artifact-1",
+        creatorUrl: "https://panes.example/creator/new-token",
+        creatorExpiresAt: "2026-09-16T12:00:00.000Z",
+        creatorToken: "new-token",
+      }).success,
+    ).toBe(false);
+    expect(
+      inventoryPublicationMutationRequestSchema.safeParse({
+        durationDays: 7,
+      }).success,
+    ).toBe(true);
+    expect(
+      inventoryPublicationUnpublishRequestSchema.safeParse({}).success,
+    ).toBe(true);
+    expect(
+      inventoryPublicationUnpublishRequestSchema.safeParse({ token: "secret" })
+        .success,
+    ).toBe(false);
+    expect(
+      inventoryCloudDeletionRequestSchema.safeParse({
+        confirmation: "DELETE cloud copy of Example",
+      }).success,
+    ).toBe(true);
+    expect(
+      inventoryCloudDeletionRequestSchema.safeParse({
+        confirmation: "DELETE cloud copy of Example",
+        artifactId: "cloud-artifact-1",
+      }).success,
+    ).toBe(false);
+  });
+
   it("validates Draft, Sync, Owner, Creator, and Publication state", () => {
     expect(
       draftSchema.safeParse({

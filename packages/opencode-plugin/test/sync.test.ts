@@ -31,6 +31,8 @@ let server: ReturnType<typeof createServer>;
 let apiOrigin: string;
 let verifiedProbe: boolean;
 let failSync: boolean;
+let cloudCopyExists: boolean;
+let cloudDeleteCount: number;
 let requests: Array<{
   method: string;
   path: string;
@@ -44,6 +46,8 @@ beforeEach(async () => {
   requests = [];
   verifiedProbe = false;
   failSync = false;
+  cloudCopyExists = false;
+  cloudDeleteCount = 0;
   vi.stubEnv("XDG_STATE_HOME", stateHome);
   server = createServer(
     (request, response) => void handleRequest(request, response),
@@ -186,6 +190,28 @@ describe("sync and publish intent tools", () => {
     expect(
       requests.filter(({ path }) => path.endsWith("/creator/rotate")),
     ).toHaveLength(1);
+  });
+
+  it("does not delete the cloud copy when a canonical local Artifact is removed", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Delete local", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    const cloudRequests = requests.length;
+
+    await rm(join(project, "artifacts", "delete-local"), {
+      recursive: true,
+      force: true,
+    });
+    const plugin = await OpenCodePanesPlugin({} as never, {});
+    const prepare = plugin.tool?.artifact_prepare as ToolDefinition;
+    await prepare.execute({ title: "New local Artifact" }, context);
+
+    expect(requests).toHaveLength(cloudRequests);
+    expect(cloudDeleteCount).toBe(0);
+    expect(cloudCopyExists).toBe(true);
+    expect(requests.some(({ path }) => path.endsWith("/commit"))).toBe(true);
   });
 
   it("uploads every finalized Revision, commits exact bytes, and reports complete history", async () => {
@@ -660,6 +686,7 @@ async function handleRequest(
     return;
   }
   if (path.endsWith("/commit")) {
+    cloudCopyExists = true;
     response.statusCode = 201;
     response.end(
       JSON.stringify({
@@ -669,6 +696,10 @@ async function handleRequest(
       }),
     );
     return;
+  }
+  if (request.method === "DELETE") {
+    cloudDeleteCount += 1;
+    cloudCopyExists = false;
   }
   response.statusCode = 204;
   response.end();

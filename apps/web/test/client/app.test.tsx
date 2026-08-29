@@ -69,7 +69,7 @@ describe("artifact workspace", () => {
     expect(parseViewerRoute("/inventory")).toEqual({ kind: "inventory" });
   });
 
-  it("renders a grouped read-only inventory and copies a recoverable URL", async () => {
+  it("renders a grouped inventory and copies a recoverable URL", async () => {
     const writeText = vi.fn(async () => undefined);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
@@ -90,6 +90,7 @@ describe("artifact workspace", () => {
                       slug: "demo",
                       title: "Demo artifact",
                       kind: null,
+                      lifecycleState: "active",
                       revisionCount: 2,
                       storageBytes: 2048,
                       lastSyncedAt: "2026-08-29T12:00:00.000Z",
@@ -104,6 +105,16 @@ describe("artifact workspace", () => {
                         publicUrl:
                           "https://panes.example/published/public-token",
                       },
+                      revisions: [
+                        {
+                          version: 2,
+                          createdAt: "2026-08-29T12:00:00.000Z",
+                        },
+                        {
+                          version: 1,
+                          createdAt: "2026-08-28T12:00:00.000Z",
+                        },
+                      ],
                       warnings: [
                         "The active public URL could not be recovered.",
                       ],
@@ -138,6 +149,187 @@ describe("artifact workspace", () => {
     );
     expect(container.textContent).toContain("public URL copied");
     expect(container.textContent).not.toContain("owner_token_hash");
+    expect(container.textContent).not.toContain("read-only");
+  });
+
+  it("shows a rotated Creator URL only after rotation and explains deletion consequences", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const payload = {
+      projects: [
+        {
+          projectId: "project-demo",
+          artifacts: [
+            {
+              artifactId: "artifact-demo",
+              slug: "demo",
+              title: "Demo artifact",
+              kind: null,
+              lifecycleState: "active",
+              revisionCount: 1,
+              storageBytes: 10,
+              lastSyncedAt: "2026-08-29T12:00:00.000Z",
+              creatorLink: {
+                status: "active",
+                expiresAt: "2026-09-28T12:00:00.000Z",
+              },
+              publication: {
+                status: "none",
+                revisionVersion: null,
+                expiresAt: null,
+              },
+              revisions: [
+                { version: 1, createdAt: "2026-08-29T12:00:00.000Z" },
+              ],
+              warnings: [],
+            },
+          ],
+        },
+      ],
+    };
+    const requests: Array<{ method: string; url: string }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        requests.push({ method: init?.method ?? "GET", url });
+        if (url.endsWith("/creator/rotate")) {
+          return new Response(
+            JSON.stringify({
+              cloudArtifactId: "artifact-demo",
+              creatorUrl: "https://panes.example/creator/rotated-secret",
+              creatorExpiresAt: "2026-09-28T12:00:00.000Z",
+            }),
+          );
+        }
+        return new Response(JSON.stringify(payload));
+      }),
+    );
+
+    await act(async () => {
+      root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+    expect(container.textContent).toContain(
+      "permanently remove Creator/public links, cloud metadata, and stored bytes",
+    );
+    expect(container.textContent).toContain(
+      "Canonical local files remain unchanged",
+    );
+    expect(container.textContent).not.toContain("rotated-secret");
+
+    const rotate = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Rotate Creator link",
+    );
+    await act(async () => {
+      rotate?.click();
+      await settle();
+    });
+    expect(container.textContent).toContain("rotated-secret");
+    expect(container.textContent).toContain("Expires Sep 28, 2026");
+    expect(container.textContent).toContain("(30 days)");
+    const copy = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Copy Creator URL",
+    );
+    expect(copy).not.toBeUndefined();
+    await act(async () => {
+      copy?.click();
+      await settle();
+    });
+    expect(writeText).toHaveBeenCalledWith(
+      "https://panes.example/creator/rotated-secret",
+    );
+    expect(requests.filter(({ method }) => method === "POST")).toHaveLength(1);
+  });
+
+  it("requires exact deletion confirmation and refreshes after an inventory action", async () => {
+    const requests: Array<{ method: string; url: string; body?: string }> = [];
+    const payload = {
+      projects: [
+        {
+          projectId: "project-demo",
+          artifacts: [
+            {
+              artifactId: "artifact-demo",
+              slug: "demo",
+              title: "Demo artifact",
+              kind: null,
+              lifecycleState: "active",
+              revisionCount: 1,
+              storageBytes: 10,
+              lastSyncedAt: "2026-08-29T12:00:00.000Z",
+              creatorLink: {
+                status: "active",
+                expiresAt: "2026-09-28T12:00:00.000Z",
+              },
+              publication: {
+                status: "active",
+                revisionVersion: 1,
+                expiresAt: "2026-09-05T12:00:00.000Z",
+                publicUrl: null,
+              },
+              revisions: [
+                { version: 1, createdAt: "2026-08-29T12:00:00.000Z" },
+              ],
+              warnings: [],
+            },
+          ],
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        requests.push({
+          method: init?.method ?? "GET",
+          url,
+          ...(init?.body ? { body: String(init.body) } : {}),
+        });
+        if (init?.method === "DELETE")
+          return new Response(null, { status: 204 });
+        return new Response(JSON.stringify(payload));
+      }),
+    );
+
+    await act(async () => {
+      root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+
+    const deleteButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Delete cloud copy",
+    );
+    expect(deleteButton?.disabled).toBe(true);
+    const input = container.querySelector<HTMLInputElement>(
+      "#delete-artifact-demo",
+    );
+    expect(input).not.toBeNull();
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      setter?.call(input, "DELETE CLOUD COPY OF Demo artifact");
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+      await settle();
+    });
+    expect(deleteButton?.disabled).toBe(false);
+
+    await act(async () => {
+      deleteButton?.click();
+      await settle();
+    });
+    expect(requests.filter(({ method }) => method === "DELETE")).toHaveLength(
+      1,
+    );
+    expect(requests.filter(({ method }) => method === "GET")).toHaveLength(2);
+    expect(requests.find(({ method }) => method === "DELETE")?.body).toBe(
+      JSON.stringify({ confirmation: "DELETE CLOUD COPY OF Demo artifact" }),
+    );
   });
 
   it.each([

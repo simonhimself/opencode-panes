@@ -3,7 +3,16 @@ import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../worker";
 import { clearAccessJwksCache } from "../worker/access";
-import { inventoryResponseSchema } from "@opencode-panes/contracts";
+import {
+  cloudDeletionConfirmation,
+  deleteInventoryArtifact,
+} from "../worker/deletion";
+import {
+  inventoryCreatorRotateResponseSchema,
+  inventoryResponseSchema,
+  publicationSchema,
+} from "@opencode-panes/contracts";
+import { readBoundedText } from "../worker/bounded-json";
 
 const ORIGIN = "https://panes.example";
 const KEY_MATERIAL =
@@ -20,6 +29,8 @@ beforeEach(async () => {
   clearAccessJwksCache();
   vi.unstubAllGlobals();
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM artifact_deletion_objects"),
+    env.DB.prepare("DELETE FROM artifact_deletion_tombstones"),
     env.DB.prepare("DELETE FROM publications"),
     env.DB.prepare("DELETE FROM creator_links"),
     env.DB.prepare("DELETE FROM revision_files"),
@@ -31,6 +42,40 @@ beforeEach(async () => {
 });
 
 describe("authenticated cloud inventory", () => {
+  it("cancels a chunked body as soon as it exceeds the byte limit", async () => {
+    const cancel = vi.fn(async () => undefined);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(5));
+        controller.enqueue(new Uint8Array(6));
+      },
+      cancel,
+    });
+    const text = await readBoundedText(
+      new Request(ORIGIN, { body, method: "POST" }),
+      10,
+    );
+    expect(text).toBeUndefined();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("protects every inventory mutation before looking up an Artifact", async () => {
+    const response = await api(
+      "/api/inventory/artifacts/missing-artifact/creator/rotate",
+      { method: "POST", body: "{}" },
+      {
+        DB: env.DB,
+        PRIVATE_ARTIFACTS: env.PRIVATE_ARTIFACTS,
+        PANES_ACCESS_ISSUER: "https://team.cloudflareaccess.com",
+        PANES_ACCESS_AUDIENCE: "inventory-audience",
+        PANES_ACCESS_ALLOWED_EMAIL: "simonhimself@gmail.com",
+      },
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).not.toContain("missing-artifact");
+  });
+
   it("rejects missing or invalid configuration before querying inventory", async () => {
     const unauthorized = await api("/api/inventory");
     expect(unauthorized.status).toBe(503);
@@ -96,6 +141,404 @@ describe("authenticated cloud inventory", () => {
     expect(response.status).toBe(200);
   });
 
+  it("rotates Creator access and applies shared Publication rules", async () => {
+    const material = await accessMaterial("mutations");
+    stubJwks(material);
+    await seedInventory();
+    const headers = {
+      "Cf-Access-Jwt-Assertion": await accessToken(material, {
+        email: "simonhimself@gmail.com",
+      }),
+    };
+
+    const rotated = await api(
+      "/api/inventory/artifacts/cloud-artifact-one/creator/rotate",
+      {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: "{}",
+      },
+      accessEnv(material),
+    );
+    expect(rotated.status).toBe(200);
+    const rotatedBody = inventoryCreatorRotateResponseSchema.parse(
+      await rotated.json(),
+    );
+    expect(rotatedBody.creatorUrl).toMatch(
+      /^https:\/\/panes\.example\/creator\/[^/]+$/u,
+    );
+    expect(Date.parse(rotatedBody.creatorExpiresAt)).toBeGreaterThan(
+      Date.now(),
+    );
+    expect(JSON.stringify(rotatedBody)).not.toContain("creatorToken");
+
+    const extended = await api(
+      "/api/inventory/artifacts/cloud-artifact-one/publication/extend",
+      {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ durationDays: 1 }),
+      },
+      accessEnv(material),
+    );
+    expect(extended.status).toBe(200);
+    expect(publicationSchema.parse(await extended.json()).expiresAt).toBe(
+      "2026-09-06T12:00:00.000Z",
+    );
+  });
+
+  it("requires exact cloud deletion confirmation and preserves a resumable tombstone", async () => {
+    const material = await accessMaterial("delete");
+    stubJwks(material);
+    await seedInventory();
+    const revisionKey = "private/one/v2/index.html";
+    const manifestKey =
+      "private/manifests/cloud-project-one/cloud-artifact-one/v2.json";
+    await env.DB.prepare(
+      "UPDATE local_revisions SET cloud_manifest_key = ? WHERE artifact_id = ? AND version = 2",
+    )
+      .bind(manifestKey, "cloud-artifact-one")
+      .run();
+    await env.PRIVATE_ARTIFACTS.put(revisionKey, "revision bytes");
+    await env.PRIVATE_ARTIFACTS.put(manifestKey, "manifest bytes");
+    const headers = {
+      "Cf-Access-Jwt-Assertion": await accessToken(material, {
+        email: "simonhimself@gmail.com",
+      }),
+      "Content-Type": "application/json",
+    };
+    const path = "/api/inventory/artifacts/cloud-artifact-one";
+    const incorrect = await api(
+      path,
+      {
+        method: "DELETE",
+        headers,
+        body: JSON.stringify({ confirmation: "DELETE" }),
+      },
+      accessEnv(material),
+    );
+    expect(incorrect.status).toBe(400);
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM sync_artifacts WHERE cloud_artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first(),
+    ).not.toBeNull();
+
+    const padded = await api(
+      path,
+      {
+        method: "DELETE",
+        headers,
+        body: JSON.stringify({
+          confirmation: `${cloudDeletionConfirmation("Inventory one")} `,
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(padded.status).toBe(400);
+
+    const deleted = await api(
+      path,
+      {
+        method: "DELETE",
+        headers,
+        body: JSON.stringify({
+          confirmation: cloudDeletionConfirmation("Inventory one"),
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(deleted.status).toBe(204);
+    expect(await env.PRIVATE_ARTIFACTS.head(revisionKey)).toBeNull();
+    expect(await env.PRIVATE_ARTIFACTS.head(manifestKey)).toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM sync_artifacts WHERE cloud_artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM local_revisions WHERE artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT 1 FROM local_artifacts WHERE id = ?")
+        .bind("cloud-artifact-one")
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM revision_files WHERE revision_id LIKE 'revision-one-%'",
+      ).first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT 1 FROM sync_uploads WHERE artifact_id = ?")
+        .bind("cloud-artifact-one")
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT 1 FROM creator_links WHERE artifact_id = ?")
+        .bind("cloud-artifact-one")
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT 1 FROM publications WHERE artifact_id = ?")
+        .bind("cloud-artifact-one")
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT 1 FROM projects WHERE id = ?")
+        .bind("local-project-one")
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM artifact_deletion_objects WHERE cloud_artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first(),
+    ).toBeNull();
+    const tombstone = await env.DB.prepare(
+      "SELECT * FROM artifact_deletion_tombstones WHERE cloud_artifact_id = ?",
+    )
+      .bind("cloud-artifact-one")
+      .first<Record<string, unknown>>();
+    expect(tombstone?.completed_at).toEqual(expect.any(String));
+    expect(JSON.stringify(tombstone)).not.toMatch(
+      /token|ciphertext|nonce|object_key|file contents/iu,
+    );
+
+    const replay = await api(
+      path,
+      {
+        method: "DELETE",
+        headers,
+        body: JSON.stringify({
+          confirmation: cloudDeletionConfirmation("Inventory one"),
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(replay.status).toBe(204);
+  });
+
+  it("retries deletion after an R2 failure without deleting D1 metadata early", async () => {
+    const material = await accessMaterial("delete-retry");
+    stubJwks(material);
+    await seedInventory();
+    const failingBucket = {
+      delete: async () => {
+        throw new Error("injected R2 failure");
+      },
+    } as unknown as R2Bucket;
+    const failingEnv = {
+      ...accessEnv(material),
+      PRIVATE_ARTIFACTS: failingBucket,
+    } as Env;
+    const headers = {
+      "Cf-Access-Jwt-Assertion": await accessToken(material, {
+        email: "simonhimself@gmail.com",
+      }),
+      "Content-Type": "application/json",
+    };
+    const request = () =>
+      new Request(`${ORIGIN}/api/inventory/artifacts/cloud-artifact-one`, {
+        method: "DELETE",
+        headers,
+        body: JSON.stringify({
+          confirmation: cloudDeletionConfirmation("Inventory one"),
+        }),
+      });
+    await expect(
+      deleteInventoryArtifact(request(), failingEnv, "cloud-artifact-one"),
+    ).rejects.toThrow("injected R2 failure");
+    expect(
+      await env.DB.prepare(
+        "SELECT lifecycle_state FROM sync_artifacts WHERE cloud_artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first<{ lifecycle_state: string }>(),
+    ).toMatchObject({
+      lifecycle_state: "deleting",
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM local_revisions WHERE artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first(),
+    ).not.toBeNull();
+
+    const retried = await deleteInventoryArtifact(
+      request(),
+      accessEnv(material),
+      "cloud-artifact-one",
+    );
+    expect(retried.status).toBe(204);
+  });
+
+  it("does not revoke capabilities when deletion cannot acquire both leases", async () => {
+    const material = await accessMaterial("busy-delete");
+    stubJwks(material);
+    await seedInventory();
+    await env.DB.prepare(
+      "UPDATE sync_artifacts SET sync_lease_owner = ?, sync_lease_expires_at = ? WHERE cloud_artifact_id = ?",
+    )
+      .bind("other-session", "2099-01-01T00:00:00.000Z", "cloud-artifact-one")
+      .run();
+    const response = await api(
+      "/api/inventory/artifacts/cloud-artifact-one",
+      {
+        method: "DELETE",
+        headers: {
+          "Cf-Access-Jwt-Assertion": await accessToken(material, {
+            email: "simonhimself@gmail.com",
+          }),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          confirmation: cloudDeletionConfirmation("Inventory one"),
+        }),
+      },
+      accessEnv(material),
+    );
+
+    expect(response.status).toBe(409);
+    expect(
+      await env.DB.prepare(
+        "SELECT revoked_at FROM creator_links WHERE artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first<{ revoked_at: string | null }>(),
+    ).toMatchObject({ revoked_at: null });
+    expect(
+      await env.DB.prepare(
+        "SELECT status, token_ciphertext FROM publications WHERE artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first<{ status: string; token_ciphertext: string | null }>(),
+    ).toMatchObject({
+      status: "active",
+      token_ciphertext: expect.any(String),
+    });
+  });
+
+  it("rejects an oversized chunked deletion body before buffering it fully", async () => {
+    const material = await accessMaterial("oversized-delete");
+    stubJwks(material);
+    await seedInventory();
+    const chunks = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"confirmation":"'));
+        controller.enqueue(new Uint8Array(5000).fill(65));
+        controller.close();
+      },
+    });
+    const response = await api(
+      "/api/inventory/artifacts/cloud-artifact-one",
+      {
+        method: "DELETE",
+        headers: {
+          "Cf-Access-Jwt-Assertion": await accessToken(material, {
+            email: "simonhimself@gmail.com",
+          }),
+          "Content-Type": "application/json",
+        },
+        body: chunks,
+      },
+      accessEnv(material),
+    );
+    expect(response.status).toBe(400);
+    expect(
+      await env.DB.prepare(
+        "SELECT lifecycle_state FROM sync_artifacts WHERE cloud_artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first<{ lifecycle_state: string }>(),
+    ).toMatchObject({ lifecycle_state: "active" });
+  });
+
+  it("rejects an oversized chunked inventory mutation body", async () => {
+    const material = await accessMaterial("oversized-mutation");
+    stubJwks(material);
+    await seedInventory();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"durationDays":7,'));
+        controller.enqueue(new Uint8Array(5000).fill(65));
+        controller.close();
+      },
+    });
+    const response = await api(
+      "/api/inventory/artifacts/cloud-artifact-one/publication/extend",
+      {
+        method: "POST",
+        headers: {
+          "Cf-Access-Jwt-Assertion": await accessToken(material, {
+            email: "simonhimself@gmail.com",
+          }),
+          "Content-Type": "application/json",
+        },
+        body,
+      },
+      accessEnv(material),
+    );
+    expect(response.status).toBe(400);
+    expect(
+      await env.DB.prepare("SELECT expires_at FROM publications WHERE id = ?")
+        .bind("publication-one")
+        .first<{ expires_at: string }>(),
+    ).toMatchObject({ expires_at: "2026-09-05T12:00:00.000Z" });
+  });
+
+  it("retains an object that remains committed by another Artifact", async () => {
+    const material = await accessMaterial("shared-object");
+    stubJwks(material);
+    await seedInventory();
+    const sharedKey = "private/shared/committed/manifest.json";
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE local_revisions SET cloud_manifest_key = ? WHERE artifact_id = ?",
+      ).bind(sharedKey, "cloud-artifact-two"),
+      env.DB.prepare(
+        "UPDATE local_revisions SET cloud_manifest_key = ? WHERE artifact_id = ?",
+      ).bind(sharedKey, "cloud-artifact-one"),
+    ]);
+    await env.PRIVATE_ARTIFACTS.put(sharedKey, "shared manifest");
+    const response = await api(
+      "/api/inventory/artifacts/cloud-artifact-one",
+      {
+        method: "DELETE",
+        headers: {
+          "Cf-Access-Jwt-Assertion": await accessToken(material, {
+            email: "simonhimself@gmail.com",
+          }),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          confirmation: cloudDeletionConfirmation("Inventory one"),
+        }),
+      },
+      accessEnv(material),
+    );
+
+    expect(response.status).toBe(204);
+    expect(await env.PRIVATE_ARTIFACTS.head(sharedKey)).not.toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM local_revisions WHERE artifact_id = ? AND cloud_manifest_key = ?",
+      )
+        .bind("cloud-artifact-two", sharedKey)
+        .first(),
+    ).not.toBeNull();
+  });
+
   it("accepts only a valid signed Access JWT and groups committed Artifacts", async () => {
     const material = await accessMaterial("one");
     const fetchJwks = stubJwks(material);
@@ -121,6 +564,7 @@ describe("authenticated cloud inventory", () => {
         {
           artifactId: "cloud-artifact-one",
           title: "Inventory one",
+          lifecycleState: "active",
           revisionCount: 2,
           storageBytes: 9,
           lastSyncedAt: "2026-08-29T12:02:00.000Z",
@@ -139,6 +583,7 @@ describe("authenticated cloud inventory", () => {
         {
           artifactId: "cloud-artifact-two",
           title: "Inventory two",
+          lifecycleState: "active",
           revisionCount: 1,
           storageBytes: 3,
           publication: {
@@ -210,6 +655,44 @@ describe("authenticated cloud inventory", () => {
     const material = await accessMaterial("lifecycle");
     stubJwks(material);
     await seedInventory();
+    const retainedObjectKey = "private/one/v2/index.html";
+    await env.PRIVATE_ARTIFACTS.put(retainedObjectKey, "canonical cloud bytes");
+    await env.DB.prepare(
+      "UPDATE creator_links SET expires_at = ?, revoked_at = NULL WHERE artifact_id = ?",
+    )
+      .bind("2020-01-01T00:00:00.000Z", "cloud-artifact-one")
+      .run();
+    await env.DB.prepare(
+      "UPDATE publications SET expires_at = ?, status = 'active', revoked_at = NULL WHERE artifact_id = ?",
+    )
+      .bind("2020-01-01T00:00:00.000Z", "cloud-artifact-one")
+      .run();
+    const expiredResponse = await api(
+      "/api/inventory",
+      {
+        headers: {
+          "Cf-Access-Jwt-Assertion": await accessToken(material, {
+            email: "simonhimself@gmail.com",
+          }),
+        },
+      },
+      accessEnv(material),
+    );
+    const expiredInventory = inventoryResponseSchema.parse(
+      await expiredResponse.json(),
+    );
+    expect(expiredInventory.projects[0]?.artifacts[0]).toMatchObject({
+      creatorLink: { status: "expired" },
+      publication: { status: "expired" },
+    });
+    expect(await env.PRIVATE_ARTIFACTS.head(retainedObjectKey)).not.toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM local_revisions WHERE artifact_id = ? AND committed_at IS NOT NULL",
+      )
+        .bind("cloud-artifact-one")
+        .first(),
+    ).not.toBeNull();
     await env.DB.batch([
       env.DB.prepare(
         "UPDATE creator_links SET revoked_at = ? WHERE artifact_id = ?",
@@ -240,6 +723,14 @@ describe("authenticated cloud inventory", () => {
     expect(inventory.projects[0]?.artifacts[0]?.publication).not.toHaveProperty(
       "publicUrl",
     );
+    expect(await env.PRIVATE_ARTIFACTS.head(retainedObjectKey)).not.toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM local_revisions WHERE artifact_id = ? AND committed_at IS NOT NULL",
+      )
+        .bind("cloud-artifact-one")
+        .first(),
+    ).not.toBeNull();
   });
 
   it.each([

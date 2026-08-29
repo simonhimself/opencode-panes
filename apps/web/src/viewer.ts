@@ -6,6 +6,7 @@ import {
   type ArtifactType,
   type CreatorWorkspaceResponse,
   type InventoryResponse,
+  type InventoryCreatorRotateResponse,
   type PublicPublicationResponse,
   type Revision,
   type ShareResponse,
@@ -415,6 +416,85 @@ export function fetchInventory(
   return requestJson<InventoryData>(
     "/api/inventory",
     signal ? { signal } : {},
+    fetcher,
+  );
+}
+
+export function rotateInventoryCreator(
+  artifactId: string,
+  fetcher: Fetcher = fetch,
+): Promise<InventoryCreatorRotateResponse> {
+  return requestJson<InventoryCreatorRotateResponse>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/creator/rotate`,
+    {
+      body: "{}",
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function extendInventoryPublication(
+  artifactId: string,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/publication/extend`,
+    {
+      body: JSON.stringify({ durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function republishInventoryPublication(
+  artifactId: string,
+  revisionVersion: number,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/publication/republish`,
+    {
+      body: JSON.stringify({ revisionVersion, durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function unpublishInventoryPublication(
+  artifactId: string,
+  fetcher: Fetcher = fetch,
+): Promise<null> {
+  return requestJson<null>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/publication/unpublish`,
+    {
+      body: "{}",
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export async function deleteInventoryArtifact(
+  artifactId: string,
+  confirmation: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> {
+  await requestJson<null>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}`,
+    {
+      body: JSON.stringify({ confirmation }),
+      headers: { "Content-Type": "application/json" },
+      method: "DELETE",
+    },
     fetcher,
   );
 }

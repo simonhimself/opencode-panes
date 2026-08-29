@@ -19,7 +19,13 @@ import {
 } from "@opencode-panes/contracts";
 import { cleanupTemporarySyncUploads, routeSyncRequest } from "./sync";
 import { verifyAccessRequest } from "./access";
-import { inventoryResponse, loadInventory } from "./inventory";
+import { deleteInventoryArtifact } from "./deletion";
+import {
+  inventoryResponse,
+  loadInventory,
+  mutateInventoryPublicationRequest,
+  rotateInventoryCreator,
+} from "./inventory";
 
 // JSON can encode one UTF-8 source byte as a six-byte Unicode escape.
 export const MAX_JSON_BODY_BYTES = MAX_ARTIFACT_SOURCE_BYTES * 6 + 16 * 1024;
@@ -115,11 +121,7 @@ export default {
 async function routeRequest(request: Request, env: Env): Promise<Response> {
   const { pathname } = new URL(request.url);
 
-  const syncResponse = await routeSyncRequest(request, env);
-  if (syncResponse) return syncResponse;
-
-  if (pathname === "/api/inventory") {
-    if (request.method !== "GET") return methodNotAllowed(["GET"]);
+  if (pathname.startsWith("/api/inventory")) {
     const access = await verifyAccessRequest(request, env);
     if (!access.ok) {
       return errorResponse(
@@ -130,7 +132,49 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
           : "Inventory authentication is required",
       );
     }
+  }
+
+  const syncResponse = await routeSyncRequest(request, env);
+  if (syncResponse) return syncResponse;
+
+  if (pathname === "/api/inventory") {
+    if (request.method !== "GET") return methodNotAllowed(["GET"]);
     return inventoryResponse(await loadInventory(request, env));
+  }
+
+  const inventoryCreatorRotation = pathname.match(
+    /^\/api\/inventory\/artifacts\/([^/]+)\/creator\/rotate$/u,
+  );
+  if (inventoryCreatorRotation) {
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    const artifactId = parseArtifactId(inventoryCreatorRotation[1]);
+    if (artifactId instanceof Response) return artifactId;
+    return rotateInventoryCreator(request, env, artifactId);
+  }
+
+  const inventoryPublication = pathname.match(
+    /^\/api\/inventory\/artifacts\/([^/]+)\/publication\/(extend|unpublish|republish)$/u,
+  );
+  if (inventoryPublication) {
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    const artifactId = parseArtifactId(inventoryPublication[1]);
+    if (artifactId instanceof Response) return artifactId;
+    return mutateInventoryPublicationRequest(
+      request,
+      env,
+      artifactId,
+      inventoryPublication[2] as "extend" | "unpublish" | "republish",
+    );
+  }
+
+  const inventoryDeletion = pathname.match(
+    /^\/api\/inventory\/artifacts\/([^/]+)$/u,
+  );
+  if (inventoryDeletion) {
+    if (request.method !== "DELETE") return methodNotAllowed(["DELETE"]);
+    const artifactId = parseArtifactId(inventoryDeletion[1]);
+    if (artifactId instanceof Response) return artifactId;
+    return deleteInventoryArtifact(request, env, artifactId);
   }
 
   if (pathname === "/api/artifacts") {
