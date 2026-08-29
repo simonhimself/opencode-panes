@@ -52,6 +52,7 @@ import {
   errorEnvelopeSchema,
   ownerTokenSchema,
   requestedOriginsSchema,
+  revisionNumberSchema,
   revisionResponseSchema,
   workspaceTokenSchema,
   type ArtifactManifest,
@@ -68,8 +69,10 @@ const STATE_DIRECTORY_NAME = "opencode-panes";
 const PROJECT_ID_FILE_NAME = ".panes-project.json";
 const PREPARE_STATE_FILE_NAME = ".panes-prepare.json";
 const FINALIZE_JOURNAL_FILE_NAME = ".panes-finalize.json";
+const ARTIFACT_LOCK_FILE_NAME = ".panes-lock.json";
 const PREVIEW_FRAME_PATH = "__panes__/frame";
 const execFileAsync = promisify(execFile);
+const PROCESS_OWNER_ID = randomUUID();
 
 const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description. After success, present viewerUrl exactly as returned, including its fragment; never shorten, sanitize, or rewrite that URL.`;
 
@@ -170,6 +173,13 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             .describe(
               "Existing local artifact ID when preparing its next Draft.",
             ),
+          name: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(200)
+            .optional()
+            .describe("Existing artifact title or slug to resolve."),
           title: tool.schema
             .string()
             .trim()
@@ -201,6 +211,14 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             .enum(["resume", "discard"])
             .optional()
             .describe("Explicitly resume or discard an existing Draft."),
+          revision: tool.schema
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+              "Reopen this finalized Revision instead of preparing a Draft.",
+            ),
           idempotencyKey: tool.schema
             .string()
             .trim()
@@ -212,7 +230,60 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             ),
         },
         async execute(args, context) {
-          return prepareArtifact(args, context);
+          return prepareArtifact(args, context, locks, previewServer);
+        },
+      }),
+      artifact_discover: tool({
+        description:
+          "Scan the current project artifact root for valid local Panes manifests. Ambiguous names return choices without changing files.",
+        args: {
+          query: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(200)
+            .optional()
+            .describe("Exact artifact ID, slug, or title to resolve."),
+        },
+        async execute(args, context) {
+          return discoverArtifacts(args, context);
+        },
+      }),
+      artifact_reopen: tool({
+        description:
+          "Reopen a finalized local Panes Revision with a fresh process-local loopback preview URL. This never creates a Draft.",
+        args: {
+          artifactId: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^\S+$/)
+            .optional()
+            .describe("Exact local artifact ID."),
+          name: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(200)
+            .optional()
+            .describe("Artifact title or slug when an ID is unavailable."),
+          revision: tool.schema
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe(
+              "Finalized Revision number, defaulting to the latest Revision.",
+            ),
+          draftAction: tool.schema
+            .enum(["discard"])
+            .optional()
+            .describe(
+              "Explicitly discard an abandoned Draft before reopening.",
+            ),
+        },
+        async execute(args, context) {
+          return reopenArtifact(args, context, previewServer, locks);
         },
       }),
       artifact_finalize: tool({
@@ -250,15 +321,38 @@ export default OpenCodePanesPlugin;
 
 type PrepareArguments = {
   artifactId?: string | undefined;
+  name?: string | undefined;
   title?: string | undefined;
   slug?: string | undefined;
   kind?: string | undefined;
   requestedOrigins?: string[] | undefined;
   draftAction?: "resume" | "discard" | undefined;
+  revision?: number | undefined;
   idempotencyKey?: string | undefined;
 };
 
 type PrepareOperation = "created" | "prepared";
+
+type ReopenArguments = {
+  artifactId?: string | undefined;
+  name?: string | undefined;
+  revision?: number | undefined;
+  draftAction?: "discard" | undefined;
+};
+
+interface DiscoveredArtifact {
+  projectId: string;
+  artifactId: string;
+  slug: string;
+  title: string;
+  kind?: string | undefined;
+  artifactPath: string;
+  revisions: number[];
+  latestRevision: number | null;
+  hasDraft: boolean;
+  hasFinalizationJournal: boolean;
+  integrity: "valid" | "modified" | "needs-recovery";
+}
 
 interface PrepareResult {
   operation: PrepareOperation;
@@ -279,24 +373,40 @@ interface StoredPrepareState {
   result: PrepareResult;
 }
 
-async function prepareArtifact(args: PrepareArguments, context: ToolContext) {
+async function prepareArtifact(
+  args: PrepareArguments,
+  context: ToolContext,
+  locks: Map<string, Promise<void>>,
+  previewServer: LocalPreviewServer,
+) {
   const request = validatePrepareArguments(args);
   const project = await resolveLocalProject(context);
-  await mkdir(project.artifactRoot, { recursive: true });
 
-  if (request.artifactId) {
-    const existing = await findArtifact(
+  if (request.artifactId || request.name) {
+    const existing = await resolveArtifact(
       project.artifactRoot,
       request.artifactId,
+      request.name,
     );
     if (!existing) {
       throw new Error(
-        `No local artifact with ID ${request.artifactId} was found under ${project.artifactRoot}.`,
+        `No local artifact matching ${JSON.stringify(request.artifactId ?? request.name)} was found under ${project.artifactRoot}.`,
       );
     }
-    return prepareExistingArtifact(existing, request);
+    return withArtifactLock(locks, existing.artifactDirectory, async () => {
+      if (request.revision !== undefined) {
+        return reopenExistingArtifact(
+          existing,
+          request.revision,
+          request.draftAction,
+          previewServer,
+        );
+      }
+      return prepareExistingArtifact(existing, request);
+    });
   }
 
+  await mkdir(project.artifactRoot, { recursive: true });
   const slug = request.slug ?? slugify(request.title);
   const existing = await readArtifactDirectory(
     join(project.artifactRoot, slug),
@@ -319,28 +429,30 @@ async function prepareArtifact(args: PrepareArguments, context: ToolContext) {
 
   const artifactDirectory = join(project.artifactRoot, slug);
   await mkdir(artifactDirectory);
-  const artifactId = `artifact-${randomUUID()}`;
-  const now = new Date().toISOString();
-  const manifest = {
-    schemaVersion: 1,
-    projectId: project.projectId,
-    artifactId,
-    slug,
-    title: request.title,
-    ...(request.kind ? { kind: request.kind } : {}),
-    revisions: [],
-  } satisfies ArtifactManifest;
-  await writeJson(join(artifactDirectory, "artifact.json"), manifest);
+  return withArtifactLock(locks, artifactDirectory, async () => {
+    const artifactId = `artifact-${randomUUID()}`;
+    const now = new Date().toISOString();
+    const manifest = {
+      schemaVersion: 1,
+      projectId: project.projectId,
+      artifactId,
+      slug,
+      title: request.title,
+      ...(request.kind ? { kind: request.kind } : {}),
+      revisions: [],
+    } satisfies ArtifactManifest;
+    await writeJson(join(artifactDirectory, "artifact.json"), manifest);
 
-  const result = await installDraft({
-    artifactDirectory,
-    manifest,
-    requestedOrigins: request.requestedOrigins,
-    operation: "created",
-    request,
-    now,
+    const result = await installDraft({
+      artifactDirectory,
+      manifest,
+      requestedOrigins: request.requestedOrigins,
+      operation: "created",
+      request,
+      now,
+    });
+    return prepareToolResult(result);
   });
-  return prepareToolResult(result);
 }
 
 async function prepareExistingArtifact(
@@ -414,11 +526,13 @@ async function prepareExistingArtifact(
 
 interface ValidatedPrepareArguments {
   artifactId?: string | undefined;
+  name?: string | undefined;
   title: string;
   slug?: string | undefined;
   kind?: string | undefined;
   requestedOrigins: string[];
   draftAction?: "resume" | "discard" | undefined;
+  revision?: number | undefined;
   idempotencyKey?: string | undefined;
   requestHash: string;
 }
@@ -434,7 +548,11 @@ function validatePrepareArguments(
     throw validationError("Artifact ID is invalid");
 
   const title = args.title?.trim();
-  if (!artifactId?.success && !title) {
+  const name = args.name?.trim();
+  if (args.name !== undefined && (!name || name.length > 200)) {
+    throw validationError("Artifact name must be between 1 and 200 characters");
+  }
+  if (!artifactId?.success && !name && !title) {
     throw validationError("A title is required when creating an artifact");
   }
   if (args.title !== undefined && (!title || title.length > 200)) {
@@ -469,6 +587,12 @@ function validatePrepareArguments(
   if (args.draftAction && !["resume", "discard"].includes(args.draftAction)) {
     throw validationError("Draft action must be resume or discard");
   }
+  if (
+    args.revision !== undefined &&
+    !revisionNumberSchema.safeParse(args.revision).success
+  ) {
+    throw validationError("Revision must be a positive integer");
+  }
   const idempotencyKey = args.idempotencyKey?.trim();
   if (
     args.idempotencyKey !== undefined &&
@@ -481,6 +605,7 @@ function validatePrepareArguments(
 
   const normalized = {
     artifactId: artifactId?.success ? artifactId.data : undefined,
+    name,
     title,
     slug: slug?.success ? slug.data : undefined,
     kind: kind || undefined,
@@ -489,8 +614,10 @@ function validatePrepareArguments(
   };
   return {
     ...normalized,
+    name,
     title: title ?? "",
     draftAction: args.draftAction,
+    revision: args.revision,
     requestHash: sha256(JSON.stringify(normalized)),
   };
 }
@@ -571,7 +698,7 @@ type FinalizeArguments = {
 };
 
 interface FinalizeResult {
-  operation: "finalized";
+  operation: "finalized" | "reopened";
   projectId: string;
   artifactId: string;
   title: string;
@@ -842,7 +969,7 @@ function reactRuntimeFor(preview: PreviewEntry) {
 function finalizeToolResult(result: FinalizeResult) {
   const metadata = { ...result };
   return {
-    title: `Finalized ${result.title} v${result.version}`,
+    title: `${result.operation === "reopened" ? "Reopened" : "Finalized"} ${result.title} v${result.version}`,
     output: JSON.stringify(metadata),
     metadata,
   };
@@ -851,6 +978,269 @@ function finalizeToolResult(result: FinalizeResult) {
 interface LocalArtifact {
   artifactDirectory: string;
   manifest: ArtifactManifest;
+}
+
+async function discoverArtifacts(
+  args: { query?: string | undefined },
+  context: ToolContext,
+) {
+  const query = args.query?.trim();
+  if (args.query !== undefined && (!query || query.length > 200)) {
+    throw validationError(
+      "Artifact query must be between 1 and 200 characters",
+    );
+  }
+  const project = await resolveLocalProject(context, false);
+  const artifacts = await scanLocalArtifacts(project.artifactRoot);
+  const matches = query ? resolveArtifactMatches(artifacts, query) : artifacts;
+  const resolution = query
+    ? matches.length === 0
+      ? "none"
+      : matches.length === 1
+        ? "single"
+        : "ambiguous"
+    : "all";
+  const visible = matches.map((artifact) => artifact.discovery);
+  const metadata = {
+    operation: "discovered" as const,
+    projectId: project.projectId,
+    artifactRoot: project.artifactRoot,
+    resolution,
+    ...(resolution === "ambiguous" ? { choices: visible } : {}),
+    artifacts: visible,
+  };
+  return {
+    title: "Discovered local artifacts",
+    output: JSON.stringify(metadata),
+    metadata,
+  };
+}
+
+async function reopenArtifact(
+  args: ReopenArguments,
+  context: ToolContext,
+  previewServer: LocalPreviewServer,
+  locks: Map<string, Promise<void>>,
+) {
+  const artifactId = args.artifactId;
+  if (
+    artifactId !== undefined &&
+    !artifactIdSchema.safeParse(artifactId).success
+  ) {
+    throw validationError("Artifact ID is invalid");
+  }
+  const name = args.name?.trim();
+  if (args.name !== undefined && (!name || name.length > 200)) {
+    throw validationError("Artifact name must be between 1 and 200 characters");
+  }
+  if (
+    args.revision !== undefined &&
+    !revisionNumberSchema.safeParse(args.revision).success
+  ) {
+    throw validationError("Revision must be a positive integer");
+  }
+  if (!artifactId && !name) {
+    throw validationError(
+      "An artifactId or name is required to reopen an artifact",
+    );
+  }
+  if (args.draftAction !== undefined && args.draftAction !== "discard") {
+    throw validationError("Draft action must be discard");
+  }
+  const project = await resolveLocalProject(context, false);
+  const existing = await resolveArtifact(
+    project.artifactRoot,
+    artifactId,
+    name,
+  );
+  if (!existing) {
+    throw new Error(
+      `No local artifact matching ${JSON.stringify(artifactId ?? name)} was found under ${project.artifactRoot}.`,
+    );
+  }
+  return withArtifactLock(locks, existing.artifactDirectory, () =>
+    reopenExistingArtifact(
+      existing,
+      args.revision,
+      args.draftAction,
+      previewServer,
+    ),
+  );
+}
+
+async function reopenExistingArtifact(
+  existing: LocalArtifact,
+  version: number | undefined,
+  draftAction: "discard" | "resume" | undefined,
+  previewServer: LocalPreviewServer,
+) {
+  await recoverFinalization(existing);
+  const artifact = await readArtifactDirectory(existing.artifactDirectory);
+  if (!artifact)
+    throw new Error("The local artifact disappeared during recovery.");
+  await verifyFinalizedRevisions(artifact);
+
+  const draftDirectory = join(artifact.artifactDirectory, "draft");
+  const draftMetadata = join(artifact.artifactDirectory, "draft.json");
+  const prepareState = join(
+    artifact.artifactDirectory,
+    PREPARE_STATE_FILE_NAME,
+  );
+  if (
+    (await pathExists(draftDirectory)) ||
+    (await pathExists(draftMetadata)) ||
+    (await pathExists(prepareState))
+  ) {
+    if (draftAction !== "discard") {
+      throw new Error(
+        `Draft already exists for artifact ${artifact.manifest.artifactId}. Choose draftAction "discard" to reopen without it, or resume it with artifact_prepare.`,
+      );
+    }
+    await rm(draftDirectory, { recursive: true, force: true });
+    await removeDraftMetadata(artifact.artifactDirectory);
+  }
+
+  const revision =
+    version === undefined
+      ? artifact.manifest.revisions.at(-1)
+      : artifact.manifest.revisions.find(
+          (candidate) => candidate.version === version,
+        );
+  if (!revision) {
+    throw new Error(
+      version === undefined
+        ? `Artifact ${artifact.manifest.artifactId} has no finalized Revisions to reopen.`
+        : `Revision v${version} does not exist for artifact ${artifact.manifest.artifactId}.`,
+    );
+  }
+  const revisionPath = join(artifact.artifactDirectory, `v${revision.version}`);
+  await verifyRevisionFiles(revisionPath, revision.files);
+  const token = await previewServer.register({
+    artifactId: artifact.manifest.artifactId,
+    artifactDirectory: artifact.artifactDirectory,
+    version: revision.version,
+    root: revisionPath,
+    files: revision.files,
+    preview: revision.preview,
+    reactRuntime: await reactRuntimeFor(revision.preview),
+    manifest: artifact.manifest,
+  });
+  try {
+    await previewServer.probe(token, revision.preview.entryPath);
+  } catch (error) {
+    previewServer.remove(token);
+    throw error;
+  }
+  return finalizeToolResult({
+    operation: "reopened",
+    projectId: artifact.manifest.projectId,
+    artifactId: artifact.manifest.artifactId,
+    title: artifact.manifest.title,
+    version: revision.version,
+    revisionPath,
+    manifestPath: join(artifact.artifactDirectory, "artifact.json"),
+    preview: revision.preview,
+    previewUrl: previewServer.url(token, revision.preview.entryPath),
+  });
+}
+
+async function scanLocalArtifacts(artifactRoot: string) {
+  let entries;
+  try {
+    entries = await readdir(artifactRoot, { withFileTypes: true });
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return [];
+    throw error;
+  }
+  const artifacts: Array<{
+    artifact: LocalArtifact;
+    discovery: DiscoveredArtifact;
+  }> = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    try {
+      const artifact = await readArtifactDirectory(
+        join(artifactRoot, entry.name),
+      );
+      if (!artifact) continue;
+      const hasDraft =
+        (await pathExists(join(artifact.artifactDirectory, "draft"))) ||
+        (await pathExists(join(artifact.artifactDirectory, "draft.json"))) ||
+        (await pathExists(
+          join(artifact.artifactDirectory, PREPARE_STATE_FILE_NAME),
+        ));
+      const hasFinalizationJournal = await pathExists(
+        join(artifact.artifactDirectory, FINALIZE_JOURNAL_FILE_NAME),
+      );
+      let integrity: DiscoveredArtifact["integrity"] = hasFinalizationJournal
+        ? "needs-recovery"
+        : "valid";
+      if (!hasFinalizationJournal) {
+        try {
+          await verifyFinalizedRevisions(artifact);
+        } catch {
+          integrity = "modified";
+        }
+      }
+      const revisions = artifact.manifest.revisions.map(
+        (revision) => revision.version,
+      );
+      artifacts.push({
+        artifact,
+        discovery: {
+          projectId: artifact.manifest.projectId,
+          artifactId: artifact.manifest.artifactId,
+          slug: artifact.manifest.slug,
+          title: artifact.manifest.title,
+          ...(artifact.manifest.kind ? { kind: artifact.manifest.kind } : {}),
+          artifactPath: artifact.artifactDirectory,
+          revisions,
+          latestRevision: revisions.at(-1) ?? null,
+          hasDraft,
+          hasFinalizationJournal,
+          integrity,
+        },
+      });
+    } catch {
+      // Discovery reports valid manifests only. A malformed or unsafe entry is
+      // left untouched for the creator to inspect or restore from Git.
+    }
+  }
+  return artifacts;
+}
+
+function resolveArtifactMatches(
+  artifacts: Array<{ artifact: LocalArtifact; discovery: DiscoveredArtifact }>,
+  query: string,
+) {
+  const exact = artifacts.filter(
+    ({ discovery }) =>
+      discovery.artifactId === query || discovery.slug === query,
+  );
+  if (exact.length > 0) return exact;
+  const folded = query.toLocaleLowerCase();
+  return artifacts.filter(
+    ({ discovery }) => discovery.title.toLocaleLowerCase() === folded,
+  );
+}
+
+async function resolveArtifact(
+  artifactRoot: string,
+  artifactId?: string,
+  name?: string,
+) {
+  const artifacts = await scanLocalArtifacts(artifactRoot);
+  const matches = resolveArtifactMatches(artifacts, artifactId ?? name ?? "");
+  if (matches.length > 1) {
+    const choices = matches.map(
+      ({ discovery }) =>
+        `${discovery.title} (${discovery.artifactId}, ${discovery.slug})`,
+    );
+    throw new Error(
+      `Artifact name ${JSON.stringify(name)} is ambiguous. Choose one of: ${choices.join(", ")}.`,
+    );
+  }
+  return matches[0]?.artifact;
 }
 
 async function findArtifact(artifactRoot: string, artifactId: string) {
@@ -1202,12 +1592,133 @@ async function withArtifactLock<T>(
   const queued = previous.then(() => current);
   locks.set(artifactDirectory, queued);
   await previous;
+  let fileLock: ArtifactFileLock | undefined;
   try {
+    fileLock = await acquireArtifactFileLock(artifactDirectory);
     return await operation();
   } finally {
-    release();
-    if (locks.get(artifactDirectory) === queued)
-      locks.delete(artifactDirectory);
+    try {
+      if (fileLock) await fileLock.release();
+    } finally {
+      release();
+      if (locks.get(artifactDirectory) === queued)
+        locks.delete(artifactDirectory);
+    }
+  }
+}
+
+interface ArtifactFileLock {
+  release: () => Promise<void>;
+}
+
+async function acquireArtifactFileLock(
+  artifactDirectory: string,
+): Promise<ArtifactFileLock> {
+  const path = join(artifactDirectory, ARTIFACT_LOCK_FILE_NAME);
+  const lock = {
+    schemaVersion: 1,
+    pid: process.pid,
+    ownerId: PROCESS_OWNER_ID,
+    createdAt: new Date().toISOString(),
+  };
+  for (;;) {
+    try {
+      const handle = await open(path, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify(lock)}\n`, {
+          encoding: "utf8",
+        });
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      return {
+        release: async () => {
+          let current: unknown;
+          try {
+            current = JSON.parse(await readFile(path, "utf8"));
+          } catch (error) {
+            if (isNodeError(error) && error.code === "ENOENT") return;
+            throw error;
+          }
+          if (isArtifactLock(current, lock)) await unlink(path);
+        },
+      };
+    } catch (error) {
+      if (!(isNodeError(error) && error.code === "EEXIST")) throw error;
+      const current = await readArtifactLock(path);
+      if (isArtifactLockLive(current)) {
+        throw new Error(
+          `Artifact ${artifactDirectory} is locked by a live Panes process. Retry after that operation completes.`,
+        );
+      }
+      await unlink(path).catch((unlinkError) => {
+        if (!(isNodeError(unlinkError) && unlinkError.code === "ENOENT"))
+          throw unlinkError;
+      });
+    }
+  }
+}
+
+async function readArtifactLock(path: string) {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw new Error(`Artifact lock at ${path} is malformed.`);
+  }
+  if (!isArtifactLock(value))
+    throw new Error(`Artifact lock at ${path} is invalid.`);
+  return value;
+}
+
+function isArtifactLock(
+  value: unknown,
+  expected?: {
+    schemaVersion: number;
+    pid: number;
+    ownerId: string;
+    createdAt: string;
+  },
+): value is {
+  schemaVersion: 1;
+  pid: number;
+  ownerId: string;
+  createdAt: string;
+} {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const lock = value as Record<string, unknown>;
+  return (
+    Object.keys(lock).length === 4 &&
+    lock.schemaVersion === 1 &&
+    typeof lock.pid === "number" &&
+    Number.isInteger(lock.pid) &&
+    lock.pid > 0 &&
+    typeof lock.ownerId === "string" &&
+    lock.ownerId.length > 0 &&
+    typeof lock.createdAt === "string" &&
+    (expected === undefined ||
+      (lock.pid === expected.pid && lock.ownerId === expected.ownerId))
+  );
+}
+
+function isArtifactLockLive(
+  lock:
+    | {
+        schemaVersion: 1;
+        pid: number;
+        ownerId: string;
+        createdAt: string;
+      }
+    | undefined,
+) {
+  if (!lock) return false;
+  try {
+    process.kill(lock.pid, 0);
+    return true;
+  } catch (error) {
+    return isNodeError(error) && error.code === "EPERM";
   }
 }
 
@@ -1820,7 +2331,10 @@ async function pathExists(path: string) {
   }
 }
 
-async function resolveLocalProject(context: ToolContext) {
+async function resolveLocalProject(
+  context: ToolContext,
+  createIdentity = true,
+) {
   const git = await inspectGit(context.directory);
   const artifactRoot = join(
     git ? context.worktree : context.directory,
@@ -1828,13 +2342,36 @@ async function resolveLocalProject(context: ToolContext) {
   );
   const projectId = git?.remote
     ? normalizeGitRemote(git.remote)
-    : await readOrCreateProjectId(artifactRoot);
+    : createIdentity
+      ? await readOrCreateProjectId(artifactRoot)
+      : await readProjectId(artifactRoot);
   if (!artifactIdSchema.safeParse(projectId).success) {
     throw new Error(
       "The project identity is not a valid local artifact identifier.",
     );
   }
   return { artifactRoot, projectId };
+}
+
+async function readProjectId(artifactRoot: string) {
+  try {
+    const value = JSON.parse(
+      await readFile(join(artifactRoot, PROJECT_ID_FILE_NAME), "utf8"),
+    );
+    if (
+      !value ||
+      typeof value !== "object" ||
+      typeof value.projectId !== "string"
+    ) {
+      throw new Error(`Project identity at ${artifactRoot} is invalid.`);
+    }
+    return value.projectId;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return `project-unregistered-${sha256(resolve(artifactRoot))}`;
+    }
+    throw error;
+  }
 }
 
 async function inspectGit(directory: string) {
