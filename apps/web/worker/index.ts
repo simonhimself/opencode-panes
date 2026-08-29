@@ -31,6 +31,7 @@ import {
   rotateInventoryCreator,
 } from "./inventory";
 import { getLegacyArtifact, LEGACY_PRIVATE_TTL_MS } from "./legacy";
+import { issueLegacyAdoptionCode, redeemLegacyAdoption } from "./adoption";
 
 // JSON can encode one UTF-8 source byte as a six-byte Unicode escape.
 export const MAX_JSON_BODY_BYTES = MAX_ARTIFACT_SOURCE_BYTES * 6 + 16 * 1024;
@@ -147,6 +148,24 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
   if (pathname === "/api/inventory") {
     if (request.method !== "GET") return methodNotAllowed(["GET"]);
     return inventoryResponse(await loadInventory(request, env));
+  }
+
+  const adoptionIssue = pathname.match(
+    /^\/api\/inventory\/legacy\/artifacts\/([^/]+)\/adoption-code$/u,
+  );
+  if (adoptionIssue) {
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    const artifactId = parseArtifactId(adoptionIssue[1]);
+    if (artifactId instanceof Response) return artifactId;
+    return issueLegacyAdoptionCode(env, artifactId);
+  }
+
+  const adoptionRedeem = pathname.match(/^\/api\/adopt\/legacy\/([^/]+)$/u);
+  if (adoptionRedeem) {
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    const artifactId = parseArtifactId(adoptionRedeem[1]);
+    if (artifactId instanceof Response) return artifactId;
+    return redeemLegacyAdoption(request, env, artifactId);
   }
 
   const inventoryCreatorRotation = pathname.match(
@@ -1092,6 +1111,16 @@ function routeTemplate(pathname: string): string {
   }
   if (/^\/api\/inventory\/legacy\/artifacts\/[^/]+$/u.test(pathname)) {
     return "/api/inventory/legacy/artifacts/:artifactId";
+  }
+  if (
+    /^\/api\/inventory\/legacy\/artifacts\/[^/]+\/adoption-code$/u.test(
+      pathname,
+    )
+  ) {
+    return "/api/inventory/legacy/artifacts/:artifactId/adoption-code";
+  }
+  if (/^\/api\/adopt\/legacy\/[^/]+$/u.test(pathname)) {
+    return "/api/adopt/legacy/:artifactId";
   }
   if (pathname === "/api/inventory") return "/api/inventory";
   return "unmatched";

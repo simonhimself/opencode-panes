@@ -34,6 +34,7 @@ import {
   getStoredPublicUrl,
   includeRevision,
   issueInventoryReconnectCode,
+  issueLegacyAdoptionCode,
   deleteInventoryArtifact,
   deleteLegacyInventoryArtifact,
   extendInventoryPublication,
@@ -266,6 +267,12 @@ function LegacyInventoryArtifactCard({
   onRefresh: () => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
+  const [adoption, setAdoption] = useState<{
+    code: string;
+    expiresAt: string;
+    revisionVersion: number;
+    type: InventoryLegacyArtifact["type"];
+  }>();
   const [confirmation, setConfirmation] = useState("");
   const deletionConfirmation = `DELETE CLOUD COPY OF ${artifact.title}`;
   const expired = artifact.status === "expired";
@@ -349,6 +356,50 @@ function LegacyInventoryArtifactCard({
           {busy ? "Deleting…" : "Delete Legacy artifact"}
         </button>
       </div>
+      <div className="inventory-adoption-action">
+        <button
+          disabled={busy || expired}
+          onClick={() => {
+            setBusy(true);
+            void issueLegacyAdoptionCode(artifact.artifactId)
+              .then((issued) => {
+                setAdoption({
+                  code: issued.code,
+                  expiresAt: issued.expiresAt,
+                  revisionVersion: issued.source.revisionVersion,
+                  type: issued.source.type,
+                });
+                onNotice(`${artifact.title}: adoption code issued`);
+              })
+              .catch((error: unknown) =>
+                onNotice(`${artifact.title}: ${apiErrorMessage(error)}`),
+              )
+              .finally(() => setBusy(false));
+          }}
+          type="button"
+        >
+          {busy ? "Issuing…" : "Export / adopt locally"}
+        </button>
+        {adoption ? (
+          <p>
+            Current {adoption.type} v{adoption.revisionVersion}. Expires{" "}
+            {formatInventoryTime(adoption.expiresAt)}.
+            <br />
+            <code>{adoption.code}</code>
+            <button
+              onClick={() => {
+                void copyText(adoption.code).then(
+                  () => onNotice(`${artifact.title}: adoption code copied`),
+                  () => onNotice("Clipboard access is unavailable"),
+                );
+              }}
+              type="button"
+            >
+              Copy code
+            </button>
+          </p>
+        ) : null}
+      </div>
     </article>
   );
 }
@@ -427,7 +478,9 @@ function InventoryArtifactCard({
     <article className="inventory-card">
       <header className="inventory-card-header">
         <div>
-          <span className="eyebrow">ARTIFACT</span>
+          <span className="eyebrow">
+            {artifact.legacyProvenance ? "ADOPTED LOCALLY" : "ARTIFACT"}
+          </span>
           <h3>{artifact.title}</h3>
           <code>{artifact.slug}</code>
         </div>
@@ -437,6 +490,14 @@ function InventoryArtifactCard({
           {deleting ? "deleting" : publication.status}
         </span>
       </header>
+      {artifact.legacyProvenance ? (
+        <p className="inventory-warning">
+          Adopted from Legacy artifact{" "}
+          <code>{artifact.legacyProvenance.legacyArtifactId}</code>, source v
+          {artifact.legacyProvenance.legacyRevisionVersion}. The Legacy source
+          remains separate and read-only.
+        </p>
+      ) : null}
       <dl className="inventory-facts">
         <div>
           <dt>Revisions</dt>

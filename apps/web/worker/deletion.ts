@@ -115,9 +115,27 @@ export async function deleteLegacyInventoryArtifact(
     return errorResponse(400, "The cloud deletion confirmation is not exact");
   }
 
-  await env.DB.prepare("DELETE FROM artifacts WHERE id = ?")
-    .bind(artifactId)
-    .run();
+  const adoptionTable = await env.DB.prepare(
+    "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'legacy_adoption_grants'",
+  ).first<{ present: number }>();
+  if (adoptionTable) {
+    await env.DB.batch([
+      env.DB.prepare(
+        // A consumed, bound grant may be needed to finish its local-first
+        // Sync after the Legacy source disappears. Its expiry remains the
+        // bound on that in-progress handoff.
+        `UPDATE legacy_adoption_grants
+            SET revoked_at = ?
+          WHERE legacy_artifact_id = ? AND consumed_at IS NULL
+            AND revoked_at IS NULL`,
+      ).bind(new Date().toISOString(), artifactId),
+      env.DB.prepare("DELETE FROM artifacts WHERE id = ?").bind(artifactId),
+    ]);
+  } else {
+    await env.DB.prepare("DELETE FROM artifacts WHERE id = ?")
+      .bind(artifactId)
+      .run();
+  }
   return new Response(null, { status: 204 });
 }
 
@@ -360,6 +378,9 @@ async function finalizeDeletion(
     ),
     env.DB.prepare(
       "DELETE FROM sync_artifacts WHERE cloud_artifact_id = ?",
+    ).bind(artifact.cloud_artifact_id),
+    env.DB.prepare(
+      "DELETE FROM legacy_adoption_provenance WHERE cloud_artifact_id = ?",
     ).bind(artifact.cloud_artifact_id),
     env.DB.prepare(
       `DELETE FROM projects WHERE id = ?

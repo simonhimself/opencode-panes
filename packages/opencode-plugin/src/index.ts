@@ -67,6 +67,9 @@ import {
   syncRevisionCommitResponseSchema,
   syncCreatorRotateResponseSchema,
   reconnectCodeSchema,
+  legacyAdoptionCodeSchema,
+  legacyAdoptionProvenanceSchema,
+  legacyAdoptionRedeemResponseSchema,
   syncReconnectResponseSchema,
   type ArtifactManifest,
   type ArtifactFile,
@@ -150,6 +153,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
   const options = resolveOptions(pluginOptions);
   const previewServer = new LocalPreviewServer();
   const locks = new Map<string, Promise<void>>();
+  const adoptionLocks = new Map<string, Promise<void>>();
   const originApprovals = new Map<string, OriginApproval>();
   const importReceipts = new Map<string, ImportReceipt>();
 
@@ -354,6 +358,43 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
         },
         async execute(args, context) {
           return importArtifact(args, context, locks, importReceipts);
+        },
+      }),
+      artifact_adopt_legacy: tool({
+        description:
+          "Adopt one authenticated Legacy artifact into the current project as a local finalized v1. The code is single-use, source bytes are copied unchanged, and no Owner credential is stored.",
+        args: {
+          artifactId: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^\S+$/)
+            .describe(
+              "Legacy artifact ID shown by the authenticated inventory.",
+            ),
+          adoptionCode: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .describe("Short-lived adoption code copied from the inventory."),
+          slug: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(128)
+            .describe(
+              "Safe local artifact directory slug. It must not already exist.",
+            ),
+        },
+        async execute(args, context) {
+          return adoptLegacyArtifact(
+            args,
+            context,
+            locks,
+            adoptionLocks,
+            previewServer,
+            options,
+          );
         },
       }),
       artifact_discover: tool({
@@ -564,6 +605,27 @@ type ImportArguments = {
   confirmDeletion?: boolean | undefined;
 };
 
+type AdoptLegacyArguments = {
+  artifactId: string;
+  adoptionCode: string;
+  slug: string;
+};
+
+interface AdoptionCheckpoint {
+  schemaVersion: 1;
+  codeDigest: string;
+  apiOrigin: string;
+  projectId: string;
+  legacyArtifactId: string;
+  artifactId: string;
+  slug: string;
+  phase: "planned" | "redeemed" | "completed";
+  title?: string;
+  type?: ArtifactType;
+  preview?: PreviewEntry;
+  provenance?: NonNullable<ArtifactManifest["legacyProvenance"]>;
+}
+
 interface ImportReceipt {
   token: string;
   sourcePath: string;
@@ -730,6 +792,312 @@ async function prepareArtifact(
     });
     return prepareToolResult(result);
   });
+}
+
+async function adoptLegacyArtifact(
+  args: AdoptLegacyArguments,
+  context: ToolContext,
+  locks: Map<string, Promise<void>>,
+  adoptionLocks: Map<string, Promise<void>>,
+  previewServer: LocalPreviewServer,
+  options: ResolvedOptions,
+) {
+  const artifactId = artifactIdSchema.safeParse(args.artifactId);
+  if (!artifactId.success)
+    throw validationError("Legacy artifact ID is invalid");
+  const adoptionCode = legacyAdoptionCodeSchema.safeParse(args.adoptionCode);
+  if (!adoptionCode.success) throw validationError("Adoption code is invalid");
+  const slug = artifactSlugSchema.safeParse(args.slug.trim());
+  if (!slug.success)
+    throw validationError(
+      "Slug must use lowercase safe words separated by hyphens",
+    );
+
+  const codeDigest = sha256(adoptionCode.data);
+  const git = await inspectGit(context.directory);
+  const artifactRoot = join(
+    git ? context.worktree : context.directory,
+    "artifacts",
+  );
+  const operationKey = `${resolve(artifactRoot)}:${codeDigest}`;
+  return withOperationLock(
+    adoptionLocks,
+    operationKey,
+    adoptionOperationLockPath(
+      options.apiBaseUrl.origin,
+      resolve(artifactRoot),
+      codeDigest,
+    ),
+    async () => {
+      const project = await resolveLocalProject(context);
+      await mkdir(project.artifactRoot, { recursive: true });
+      const checkpointPath = adoptionCheckpointPath(
+        options.apiBaseUrl.origin,
+        codeDigest,
+      );
+      let checkpoint = await readAdoptionCheckpoint(checkpointPath);
+      if (checkpoint) {
+        if (
+          checkpoint.apiOrigin !== options.apiBaseUrl.origin ||
+          checkpoint.projectId !== project.projectId ||
+          checkpoint.legacyArtifactId !== artifactId.data ||
+          checkpoint.slug !== slug.data
+        ) {
+          throw new Error(
+            "This adoption code is already bound to another local destination.",
+          );
+        }
+      } else {
+        checkpoint = {
+          schemaVersion: 1,
+          codeDigest,
+          apiOrigin: options.apiBaseUrl.origin,
+          projectId: project.projectId,
+          legacyArtifactId: artifactId.data,
+          artifactId: `artifact-${randomUUID()}`,
+          slug: slug.data,
+          phase: "planned",
+        };
+      }
+
+      const artifactDirectory = join(project.artifactRoot, checkpoint.slug);
+      let createdDirectory = false;
+      try {
+        try {
+          await mkdir(artifactDirectory);
+          createdDirectory = true;
+        } catch (error) {
+          if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+        }
+
+        return await withArtifactLock(locks, artifactDirectory, async () => {
+          if (await pathExists(checkpointPath)) {
+            await recoverAdoptionManifestTemps(artifactDirectory, codeDigest);
+          }
+          let artifact = await readArtifactDirectory(artifactDirectory);
+          if (!checkpoint) throw new Error("Adoption state is missing.");
+          if (artifact) {
+            await recoverFinalization(artifact);
+            await recoverImport(artifact, {
+              orphanPrefix: `.panes-import-adopt-${codeDigest}-`,
+            });
+            artifact = await readArtifactDirectory(artifactDirectory);
+            if (!artifact)
+              throw new Error("Adoption Artifact disappeared during recovery.");
+            if (
+              !checkpoint.provenance ||
+              !sameAdoptionIdentity(artifact.manifest, checkpoint)
+            ) {
+              throw new Error(
+                "Adoption destination does not match its checkpoint.",
+              );
+            }
+            if (artifact.manifest.revisions.length > 0) {
+              await verifyFinalizedRevisions(artifact);
+              checkpoint = { ...checkpoint, phase: "completed" };
+              await writeProtectedJson(checkpointPath, checkpoint);
+              return reopenExistingArtifact(
+                artifact,
+                undefined,
+                undefined,
+                previewServer,
+              );
+            }
+          } else if (!createdDirectory) {
+            const entries = await readdir(artifactDirectory);
+            if (entries.some((entry) => entry !== ARTIFACT_LOCK_FILE_NAME)) {
+              throw new Error(
+                `Artifact slug ${JSON.stringify(checkpoint.slug)} already exists. Choose a different slug.`,
+              );
+            }
+          }
+
+          const draftExists = artifact
+            ? await pathExists(join(artifactDirectory, "draft"))
+            : false;
+          if (checkpoint.phase === "planned" || !draftExists) {
+            await writeProtectedJson(checkpointPath, checkpoint);
+            const response = await fetchPanes(
+              new URL(
+                `/api/adopt/legacy/${encodeURIComponent(checkpoint.legacyArtifactId)}`,
+                options.apiBaseUrl,
+              ),
+              {
+                method: "POST",
+                headers: jsonHeaders(),
+                body: JSON.stringify({
+                  apiOrigin: options.apiBaseUrl.origin,
+                  code: adoptionCode.data,
+                  localProjectId: checkpoint.projectId,
+                  localArtifactId: checkpoint.artifactId,
+                  slug: checkpoint.slug,
+                }),
+              },
+              context.abort,
+              options.requestTimeoutMs,
+            );
+            const payload = await parseApiResponse(
+              response,
+              legacyAdoptionRedeemResponseSchema,
+              [adoptionCode.data],
+            );
+            if (
+              payload.apiOrigin !== options.apiBaseUrl.origin ||
+              payload.localProjectId !== checkpoint.projectId ||
+              payload.localArtifactId !== checkpoint.artifactId ||
+              payload.slug !== checkpoint.slug ||
+              payload.provenance.localProjectId !== checkpoint.projectId ||
+              payload.provenance.localArtifactId !== checkpoint.artifactId ||
+              payload.provenance.localSlug !== checkpoint.slug ||
+              payload.provenance.legacyArtifactId !==
+                checkpoint.legacyArtifactId ||
+              payload.provenance.legacyRevisionId.length === 0 ||
+              payload.provenance.legacyRevisionVersion < 1 ||
+              payload.provenance.legacyTitle !== payload.title ||
+              payload.provenance.legacyType !== payload.type
+            ) {
+              throw malformedSuccessResponse();
+            }
+            if (
+              new TextEncoder().encode(payload.source).byteLength >
+              MAX_ARTIFACT_SOURCE_BYTES
+            ) {
+              throw new Error(
+                "The adopted Legacy source exceeds the local size limit.",
+              );
+            }
+            checkpoint = {
+              ...checkpoint,
+              phase: "redeemed",
+              title: payload.title,
+              type: payload.type,
+              preview: legacyPreviewFor(
+                payload.type,
+                legacyEntryFor(payload.type),
+              ),
+              provenance: payload.provenance,
+            };
+            await writeProtectedJson(checkpointPath, checkpoint);
+            injectFailure(options, "adopt-after-redeem");
+
+            const manifest = artifactManifestSchema.parse({
+              schemaVersion: 1,
+              projectId: checkpoint.projectId,
+              artifactId: checkpoint.artifactId,
+              slug: checkpoint.slug,
+              title: payload.title,
+              kind: payload.type,
+              revisions: [],
+              legacyProvenance: payload.provenance,
+            });
+            await writeJson(
+              join(artifactDirectory, "artifact.json"),
+              manifest,
+              {
+                temporaryTag: `adopt-${codeDigest}`,
+                afterTempWrite: () =>
+                  injectFailure(options, "adopt-after-manifest-temp-write"),
+              },
+            );
+            artifact = { artifactDirectory, manifest };
+            const entry = legacyEntryFor(payload.type);
+            await installImportedDraft({
+              artifact,
+              sourceText: payload.source,
+              destinationPath: entry,
+              collision: "error",
+              receipts: new Map(),
+              stagingTag: `adopt-${codeDigest}`,
+            });
+            await assertAdoptedSourceBytes(
+              join(artifactDirectory, "draft", entry),
+              payload.source,
+            );
+          }
+
+          if (
+            !checkpoint.provenance ||
+            !checkpoint.preview ||
+            !checkpoint.title ||
+            !checkpoint.type
+          ) {
+            throw new Error("Adoption checkpoint is incomplete.");
+          }
+          artifact = await readArtifactDirectory(artifactDirectory);
+          if (
+            !artifact ||
+            !sameAdoptionIdentity(artifact.manifest, checkpoint)
+          ) {
+            throw new Error("Adoption Artifact does not match its checkpoint.");
+          }
+          const finalized = await finalizeArtifactLocked(
+            validateFinalizeArguments({
+              artifactId: checkpoint.artifactId,
+              entryPath: checkpoint.preview.entryPath,
+              adapter: checkpoint.preview.adapter,
+              ...(checkpoint.preview.adapter === "renderer"
+                ? { renderer: checkpoint.preview.renderer }
+                : {}),
+            }),
+            artifact,
+            previewServer,
+            new Map(),
+            options,
+          );
+          checkpoint = { ...checkpoint, phase: "completed" };
+          await writeProtectedJson(checkpointPath, checkpoint);
+          return finalized;
+        });
+      } catch (error) {
+        throw error;
+      }
+    },
+  );
+}
+
+async function assertAdoptedSourceBytes(path: string, source: string) {
+  const actual = await readFile(path);
+  const expected = Buffer.from(source, "utf8");
+  if (!actual.equals(expected)) {
+    throw new Error("Adopted Legacy source bytes changed during staging.");
+  }
+}
+
+function sameAdoptionIdentity(
+  manifest: ArtifactManifest,
+  checkpoint: AdoptionCheckpoint,
+): boolean {
+  return (
+    manifest.projectId === checkpoint.projectId &&
+    manifest.artifactId === checkpoint.artifactId &&
+    manifest.slug === checkpoint.slug &&
+    (!checkpoint.provenance ||
+      JSON.stringify(manifest.legacyProvenance) ===
+        JSON.stringify(checkpoint.provenance))
+  );
+}
+
+function legacyEntryFor(type: ArtifactType): string {
+  switch (type) {
+    case "html":
+      return "index.html";
+    case "svg":
+      return "index.svg";
+    case "react":
+      return "App.tsx";
+    case "markdown":
+      return "README.md";
+    case "mermaid":
+      return "diagram.mmd";
+    case "code":
+      return "source.txt";
+  }
+}
+
+function legacyPreviewFor(type: ArtifactType, entryPath: string): PreviewEntry {
+  return type === "html" || type === "svg"
+    ? { adapter: "browser", entryPath }
+    : { adapter: "renderer", entryPath, renderer: type };
 }
 
 async function importArtifact(
@@ -959,6 +1327,7 @@ async function installImportedDraft(input: {
   collision: "error" | "replace";
   receipts: Map<string, ImportReceipt>;
   createdAt?: string | undefined;
+  stagingTag?: string | undefined;
 }) {
   const { artifact } = input;
   const draftPath = join(artifact.artifactDirectory, "draft");
@@ -977,7 +1346,7 @@ async function installImportedDraft(input: {
 
   const stagingPath = join(
     artifact.artifactDirectory,
-    `.panes-import-${randomUUID()}.tmp`,
+    `.panes-import-${input.stagingTag ? `${input.stagingTag}-` : ""}${randomUUID()}.tmp`,
   );
   let installed = false;
   try {
@@ -1112,15 +1481,19 @@ function importRequestHash(input: {
   );
 }
 
-async function recoverImport(artifact: LocalArtifact) {
+async function recoverImport(
+  artifact: LocalArtifact,
+  options: { orphanPrefix?: string } = {},
+) {
   const journalPath = join(
     artifact.artifactDirectory,
     IMPORT_JOURNAL_FILE_NAME,
   );
   if (!(await pathExists(journalPath))) {
     const entries = await readdir(artifact.artifactDirectory);
+    const orphanPrefix = options.orphanPrefix ?? ".panes-import-";
     for (const entry of entries) {
-      if (entry.startsWith(".panes-import-") && entry.endsWith(".tmp")) {
+      if (entry.startsWith(orphanPrefix) && entry.endsWith(".tmp")) {
         await rm(join(artifact.artifactDirectory, entry), {
           recursive: true,
           force: true,
@@ -1132,6 +1505,12 @@ async function recoverImport(artifact: LocalArtifact) {
   const journal = await readImportJournal(journalPath);
   if (journal.artifactId !== artifact.manifest.artifactId) {
     throw new Error("Import journal belongs to another artifact.");
+  }
+  if (
+    options.orphanPrefix &&
+    !basename(journal.stagingPath).startsWith(options.orphanPrefix)
+  ) {
+    throw new Error("Import journal belongs to another operation.");
   }
   if (
     dirname(resolve(journal.stagingPath)) !==
@@ -2226,6 +2605,9 @@ async function syncLocalArtifact(
       slug: artifact.manifest.slug,
       title: artifact.manifest.title,
       ...(artifact.manifest.kind ? { kind: artifact.manifest.kind } : {}),
+      ...(artifact.manifest.legacyProvenance
+        ? { legacyProvenance: artifact.manifest.legacyProvenance }
+        : {}),
       idempotencyKey: checkpoint.creationIdempotencyKey,
       ownerCredential: checkpoint.ownerCredential,
       creatorToken: checkpoint.creatorToken,
@@ -2409,6 +2791,9 @@ async function syncLocalArtifact(
       slug: artifact.manifest.slug,
       title: artifact.manifest.title,
       ...(artifact.manifest.kind ? { kind: artifact.manifest.kind } : {}),
+      ...(artifact.manifest.legacyProvenance
+        ? { legacyProvenance: artifact.manifest.legacyProvenance }
+        : {}),
       revisions: [...previousRevisions, currentRevision],
     };
     for (const file of selectedFiles) {
@@ -2634,239 +3019,252 @@ async function finalizeArtifact(
     );
   }
 
-  return withArtifactLock(locks, existing.artifactDirectory, async () => {
-    const recoveredRevision = await recoverFinalization(existing);
-    await recoverImport(existing);
-    const artifact = await readArtifactDirectory(existing.artifactDirectory);
-    if (!artifact)
-      throw new Error("The local artifact disappeared during finalization.");
-
-    await verifyFinalizedRevisions(artifact);
-    const draftPath = join(artifact.artifactDirectory, "draft");
-    const draftMetadataPath = join(artifact.artifactDirectory, "draft.json");
-    if (!(await pathExists(draftPath))) {
-      if (request.approvalNonce && !recoveredRevision) {
-        throw new Error(
-          "The origin approval nonce is unknown or already consumed.",
-        );
-      }
-      if (recoveredRevision) {
-        if (request.approvalNonce) originApprovals.delete(request.artifactId);
-        await verifyRevisionFiles(
-          join(artifact.artifactDirectory, `v${recoveredRevision.version}`),
-          recoveredRevision.files,
-        );
-        const previewToken = await previewServer.register({
-          artifactId: artifact.manifest.artifactId,
-          artifactDirectory: artifact.artifactDirectory,
-          version: recoveredRevision.version,
-          root: join(
-            artifact.artifactDirectory,
-            `v${recoveredRevision.version}`,
-          ),
-          files: recoveredRevision.files,
-          preview: recoveredRevision.preview,
-          approvedOrigins: recoveredRevision.approvedOrigins,
-          reactRuntime: await reactRuntimeFor(recoveredRevision.preview),
-          manifest: artifact.manifest,
-        });
-        await previewServer.probe(
-          previewToken,
-          recoveredRevision.preview.entryPath,
-        );
-        return finalizeToolResult({
-          operation: "finalized",
-          projectId: artifact.manifest.projectId,
-          artifactId: artifact.manifest.artifactId,
-          title: artifact.manifest.title,
-          version: recoveredRevision.version,
-          revisionPath: join(
-            artifact.artifactDirectory,
-            `v${recoveredRevision.version}`,
-          ),
-          manifestPath: join(artifact.artifactDirectory, "artifact.json"),
-          preview: recoveredRevision.preview,
-          previewUrl: previewServer.url(
-            previewToken,
-            recoveredRevision.preview.entryPath,
-          ),
-        });
-      }
-      throw new Error(
-        `No writable Draft exists for artifact ${request.artifactId}. Prepare one before finalizing.`,
-      );
-    }
-    const draft = await readDraftMetadata(draftMetadataPath);
-    if (draft.artifactId !== request.artifactId) {
-      throw new Error("Draft metadata does not belong to this artifact.");
-    }
-    const latestRevision = artifact.manifest.revisions.at(-1);
-    if (draft.baseRevision !== (latestRevision?.version ?? null)) {
-      throw new Error(
-        "Draft is based on an older Revision. Prepare a new Draft before finalizing.",
-      );
-    }
-    const requestedOrigins = resolveFinalizeOrigins(
+  return withArtifactLock(locks, existing.artifactDirectory, () =>
+    finalizeArtifactLocked(
       request,
-      draft.requestedOrigins,
-    );
+      existing,
+      previewServer,
+      originApprovals,
+      options,
+    ),
+  );
+}
 
-    const draftStats = await lstat(draftPath);
-    if (!draftStats.isDirectory() || draftStats.isSymbolicLink()) {
-      throw new Error("Draft root must be a regular directory.");
-    }
-    const files = await scanRevisionFiles(draftPath, {
-      materializeSymlinks: true,
-    });
-    const draftFingerprint = fingerprintDraft(files);
-    const entryFile = files.find(
-      (file) => file.kind === "file" && file.path === request.preview.entryPath,
-    );
-    if (!entryFile || entryFile.kind !== "file") {
+async function finalizeArtifactLocked(
+  request: ReturnType<typeof validateFinalizeArguments>,
+  existing: LocalArtifact,
+  previewServer: LocalPreviewServer,
+  originApprovals: Map<string, OriginApproval>,
+  options: ResolvedOptions,
+) {
+  const recoveredRevision = await recoverFinalization(existing);
+  await recoverImport(existing);
+  const artifact = await readArtifactDirectory(existing.artifactDirectory);
+  if (!artifact)
+    throw new Error("The local artifact disappeared during finalization.");
+
+  await verifyFinalizedRevisions(artifact);
+  const draftPath = join(artifact.artifactDirectory, "draft");
+  const draftMetadataPath = join(artifact.artifactDirectory, "draft.json");
+  if (!(await pathExists(draftPath))) {
+    if (request.approvalNonce && !recoveredRevision) {
       throw new Error(
-        `Preview entry ${JSON.stringify(request.preview.entryPath)} must be an existing file in the Draft.`,
+        "The origin approval nonce is unknown or already consumed.",
       );
     }
-    validatePreviewFile(request.preview, entryFile);
-
-    const approval = originApprovals.get(request.artifactId);
-    if (requestedOrigins.length > 0) {
-      if (!request.approvalNonce) {
-        const validationToken = await previewServer.register({
-          artifactId: request.artifactId,
-          artifactDirectory: artifact.artifactDirectory,
-          version: (latestRevision?.version ?? 0) + 1,
-          root: draftPath,
-          files,
-          preview: request.preview,
-          approvedOrigins: [],
-          reactRuntime: await reactRuntimeFor(request.preview),
-        });
-        try {
-          await previewServer.probe(validationToken, request.preview.entryPath);
-        } finally {
-          previewServer.remove(validationToken);
-        }
-        const approvalNonce = randomUUID();
-        originApprovals.set(request.artifactId, {
-          schemaVersion: 1,
-          artifactId: request.artifactId,
-          approvalNonce,
-          draftFingerprint,
-          requestedOrigins,
-          preview: request.preview,
-        });
-        const result: OriginApprovalResult = {
-          operation: "approval-required",
-          projectId: artifact.manifest.projectId,
-          artifactId: artifact.manifest.artifactId,
-          title: artifact.manifest.title,
-          preview: request.preview,
-          requestedOrigins,
-          approvalNonce,
-        };
-        return originApprovalToolResult(result);
-      }
-      if (
-        !approval ||
-        approval.approvalNonce !== request.approvalNonce ||
-        approval.artifactId !== request.artifactId ||
-        approval.draftFingerprint !== draftFingerprint ||
-        !sameOriginSet(approval.requestedOrigins, requestedOrigins) ||
-        JSON.stringify(approval.preview) !== JSON.stringify(request.preview)
-      ) {
-        originApprovals.delete(request.artifactId);
-        throw new Error(
-          "The origin approval nonce is invalid because the Draft, Preview, or origin set changed.",
-        );
-      }
-    } else if (request.approvalNonce) {
-      throw new Error(
-        "An origin approval nonce requires the same non-empty approved origin set.",
+    if (recoveredRevision) {
+      if (request.approvalNonce) originApprovals.delete(request.artifactId);
+      await verifyRevisionFiles(
+        join(artifact.artifactDirectory, `v${recoveredRevision.version}`),
+        recoveredRevision.files,
       );
-    }
-
-    const targetVersion = (latestRevision?.version ?? 0) + 1;
-    const revisionPath = join(artifact.artifactDirectory, `v${targetVersion}`);
-    if (await pathExists(revisionPath)) {
-      throw new Error(`Revision v${targetVersion} already exists.`);
-    }
-    const revision: FinalizedRevision = {
-      id: `revision-${randomUUID()}`,
-      version: targetVersion,
-      preview: request.preview,
-      approvedOrigins: requestedOrigins,
-      files,
-      createdAt: new Date().toISOString(),
-    };
-    const manifest = artifact.manifest;
-    const nextManifest = artifactManifestSchema.parse({
-      ...manifest,
-      revisions: [...manifest.revisions, revision],
-    });
-    const journalPath = join(
-      artifact.artifactDirectory,
-      FINALIZE_JOURNAL_FILE_NAME,
-    );
-    const journal: FinalizationJournal = {
-      schemaVersion: 1,
-      phase: "prepared",
-      artifactId: request.artifactId,
-      targetVersion,
-      draftPath,
-      revisionPath,
-      revision,
-      manifest: nextManifest,
-    };
-
-    const previewToken = await previewServer.register({
-      artifactId: request.artifactId,
-      artifactDirectory: artifact.artifactDirectory,
-      version: targetVersion,
-      root: draftPath,
-      files,
-      preview: request.preview,
-      approvedOrigins: requestedOrigins,
-      reactRuntime: await reactRuntimeFor(request.preview),
-    });
-    try {
-      await previewServer.probe(previewToken, request.preview.entryPath);
-      await writeJsonDurable(journalPath, journal);
-      injectFailure(options, "before-rename");
-      await rename(draftPath, revisionPath);
-      injectFailure(options, "after-rename");
-      journal.phase = "renamed";
-      await writeJsonDurable(journalPath, journal);
-      await writeJsonDurable(
-        join(artifact.artifactDirectory, "artifact.json"),
-        nextManifest,
+      const previewToken = await previewServer.register({
+        artifactId: artifact.manifest.artifactId,
+        artifactDirectory: artifact.artifactDirectory,
+        version: recoveredRevision.version,
+        root: join(artifact.artifactDirectory, `v${recoveredRevision.version}`),
+        files: recoveredRevision.files,
+        preview: recoveredRevision.preview,
+        approvedOrigins: recoveredRevision.approvedOrigins,
+        reactRuntime: await reactRuntimeFor(recoveredRevision.preview),
+        manifest: artifact.manifest,
+      });
+      await previewServer.probe(
+        previewToken,
+        recoveredRevision.preview.entryPath,
       );
-      injectFailure(options, "after-manifest");
-      journal.phase = "manifest-replaced";
-      await writeJsonDurable(journalPath, journal);
-      injectFailure(options, "before-cleanup");
-      await unlink(journalPath);
-      await removeDraftMetadata(artifact.artifactDirectory);
-      originApprovals.delete(request.artifactId);
-      previewServer.updateRoot(previewToken, revisionPath, nextManifest);
       return finalizeToolResult({
         operation: "finalized",
-        projectId: nextManifest.projectId,
-        artifactId: nextManifest.artifactId,
-        title: nextManifest.title,
-        version: targetVersion,
-        revisionPath,
+        projectId: artifact.manifest.projectId,
+        artifactId: artifact.manifest.artifactId,
+        title: artifact.manifest.title,
+        version: recoveredRevision.version,
+        revisionPath: join(
+          artifact.artifactDirectory,
+          `v${recoveredRevision.version}`,
+        ),
         manifestPath: join(artifact.artifactDirectory, "artifact.json"),
-        preview: request.preview,
-        previewUrl: previewServer.url(previewToken, request.preview.entryPath),
+        preview: recoveredRevision.preview,
+        previewUrl: previewServer.url(
+          previewToken,
+          recoveredRevision.preview.entryPath,
+        ),
       });
-    } catch (error) {
-      if (!(error instanceof InjectedFailureError)) {
-        previewServer.remove(previewToken);
-      }
-      throw error;
     }
+    throw new Error(
+      `No writable Draft exists for artifact ${request.artifactId}. Prepare one before finalizing.`,
+    );
+  }
+  const draft = await readDraftMetadata(draftMetadataPath);
+  if (draft.artifactId !== request.artifactId) {
+    throw new Error("Draft metadata does not belong to this artifact.");
+  }
+  const latestRevision = artifact.manifest.revisions.at(-1);
+  if (draft.baseRevision !== (latestRevision?.version ?? null)) {
+    throw new Error(
+      "Draft is based on an older Revision. Prepare a new Draft before finalizing.",
+    );
+  }
+  const requestedOrigins = resolveFinalizeOrigins(
+    request,
+    draft.requestedOrigins,
+  );
+
+  const draftStats = await lstat(draftPath);
+  if (!draftStats.isDirectory() || draftStats.isSymbolicLink()) {
+    throw new Error("Draft root must be a regular directory.");
+  }
+  const files = await scanRevisionFiles(draftPath, {
+    materializeSymlinks: true,
   });
+  const draftFingerprint = fingerprintDraft(files);
+  const entryFile = files.find(
+    (file) => file.kind === "file" && file.path === request.preview.entryPath,
+  );
+  if (!entryFile || entryFile.kind !== "file") {
+    throw new Error(
+      `Preview entry ${JSON.stringify(request.preview.entryPath)} must be an existing file in the Draft.`,
+    );
+  }
+  validatePreviewFile(request.preview, entryFile);
+
+  const approval = originApprovals.get(request.artifactId);
+  if (requestedOrigins.length > 0) {
+    if (!request.approvalNonce) {
+      const validationToken = await previewServer.register({
+        artifactId: request.artifactId,
+        artifactDirectory: artifact.artifactDirectory,
+        version: (latestRevision?.version ?? 0) + 1,
+        root: draftPath,
+        files,
+        preview: request.preview,
+        approvedOrigins: [],
+        reactRuntime: await reactRuntimeFor(request.preview),
+      });
+      try {
+        await previewServer.probe(validationToken, request.preview.entryPath);
+      } finally {
+        previewServer.remove(validationToken);
+      }
+      const approvalNonce = randomUUID();
+      originApprovals.set(request.artifactId, {
+        schemaVersion: 1,
+        artifactId: request.artifactId,
+        approvalNonce,
+        draftFingerprint,
+        requestedOrigins,
+        preview: request.preview,
+      });
+      const result: OriginApprovalResult = {
+        operation: "approval-required",
+        projectId: artifact.manifest.projectId,
+        artifactId: artifact.manifest.artifactId,
+        title: artifact.manifest.title,
+        preview: request.preview,
+        requestedOrigins,
+        approvalNonce,
+      };
+      return originApprovalToolResult(result);
+    }
+    if (
+      !approval ||
+      approval.approvalNonce !== request.approvalNonce ||
+      approval.artifactId !== request.artifactId ||
+      approval.draftFingerprint !== draftFingerprint ||
+      !sameOriginSet(approval.requestedOrigins, requestedOrigins) ||
+      JSON.stringify(approval.preview) !== JSON.stringify(request.preview)
+    ) {
+      originApprovals.delete(request.artifactId);
+      throw new Error(
+        "The origin approval nonce is invalid because the Draft, Preview, or origin set changed.",
+      );
+    }
+  } else if (request.approvalNonce) {
+    throw new Error(
+      "An origin approval nonce requires the same non-empty approved origin set.",
+    );
+  }
+
+  const targetVersion = (latestRevision?.version ?? 0) + 1;
+  const revisionPath = join(artifact.artifactDirectory, `v${targetVersion}`);
+  if (await pathExists(revisionPath)) {
+    throw new Error(`Revision v${targetVersion} already exists.`);
+  }
+  const revision: FinalizedRevision = {
+    id: `revision-${randomUUID()}`,
+    version: targetVersion,
+    preview: request.preview,
+    approvedOrigins: requestedOrigins,
+    files,
+    createdAt: new Date().toISOString(),
+  };
+  const manifest = artifact.manifest;
+  const nextManifest = artifactManifestSchema.parse({
+    ...manifest,
+    revisions: [...manifest.revisions, revision],
+  });
+  const journalPath = join(
+    artifact.artifactDirectory,
+    FINALIZE_JOURNAL_FILE_NAME,
+  );
+  const journal: FinalizationJournal = {
+    schemaVersion: 1,
+    phase: "prepared",
+    artifactId: request.artifactId,
+    targetVersion,
+    draftPath,
+    revisionPath,
+    revision,
+    manifest: nextManifest,
+  };
+
+  const previewToken = await previewServer.register({
+    artifactId: request.artifactId,
+    artifactDirectory: artifact.artifactDirectory,
+    version: targetVersion,
+    root: draftPath,
+    files,
+    preview: request.preview,
+    approvedOrigins: requestedOrigins,
+    reactRuntime: await reactRuntimeFor(request.preview),
+  });
+  try {
+    await previewServer.probe(previewToken, request.preview.entryPath);
+    await writeJsonDurable(journalPath, journal);
+    injectFailure(options, "before-rename");
+    await rename(draftPath, revisionPath);
+    injectFailure(options, "after-rename");
+    journal.phase = "renamed";
+    await writeJsonDurable(journalPath, journal);
+    await writeJsonDurable(
+      join(artifact.artifactDirectory, "artifact.json"),
+      nextManifest,
+    );
+    injectFailure(options, "after-manifest");
+    journal.phase = "manifest-replaced";
+    await writeJsonDurable(journalPath, journal);
+    injectFailure(options, "before-cleanup");
+    await unlink(journalPath);
+    await removeDraftMetadata(artifact.artifactDirectory);
+    originApprovals.delete(request.artifactId);
+    previewServer.updateRoot(previewToken, revisionPath, nextManifest);
+    return finalizeToolResult({
+      operation: "finalized",
+      projectId: nextManifest.projectId,
+      artifactId: nextManifest.artifactId,
+      title: nextManifest.title,
+      version: targetVersion,
+      revisionPath,
+      manifestPath: join(artifact.artifactDirectory, "artifact.json"),
+      preview: request.preview,
+      previewUrl: previewServer.url(previewToken, request.preview.entryPath),
+    });
+  } catch (error) {
+    if (!(error instanceof InjectedFailureError)) {
+      previewServer.remove(previewToken);
+    }
+    throw error;
+  }
 }
 
 function validateFinalizeArguments(args: FinalizeArguments) {
@@ -3694,25 +4092,61 @@ async function withArtifactLock<T>(
   artifactDirectory: string,
   operation: () => Promise<T>,
 ) {
-  const previous = locks.get(artifactDirectory) ?? Promise.resolve();
+  return withQueuedFileLock(
+    locks,
+    artifactDirectory,
+    () =>
+      acquireExclusiveFileLock(
+        join(artifactDirectory, ARTIFACT_LOCK_FILE_NAME),
+        `Artifact ${artifactDirectory}`,
+      ),
+    operation,
+  );
+}
+
+async function withOperationLock<T>(
+  locks: Map<string, Promise<void>>,
+  operationKey: string,
+  lockPath: string,
+  operation: () => Promise<T>,
+) {
+  await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
+  await restrictPermissions(dirname(lockPath), 0o700);
+  return withQueuedFileLock(
+    locks,
+    operationKey,
+    () =>
+      acquireExclusiveFileLock(lockPath, `Adoption operation ${operationKey}`, {
+        waitForLive: true,
+      }),
+    operation,
+  );
+}
+
+async function withQueuedFileLock<T>(
+  locks: Map<string, Promise<void>>,
+  key: string,
+  acquire: () => Promise<ArtifactFileLock>,
+  operation: () => Promise<T>,
+) {
+  const previous = locks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
   const queued = previous.then(() => current);
-  locks.set(artifactDirectory, queued);
+  locks.set(key, queued);
   await previous;
   let fileLock: ArtifactFileLock | undefined;
   try {
-    fileLock = await acquireArtifactFileLock(artifactDirectory);
+    fileLock = await acquire();
     return await operation();
   } finally {
     try {
       if (fileLock) await fileLock.release();
     } finally {
       release();
-      if (locks.get(artifactDirectory) === queued)
-        locks.delete(artifactDirectory);
+      if (locks.get(key) === queued) locks.delete(key);
     }
   }
 }
@@ -3721,10 +4155,11 @@ interface ArtifactFileLock {
   release: () => Promise<void>;
 }
 
-async function acquireArtifactFileLock(
-  artifactDirectory: string,
+async function acquireExclusiveFileLock(
+  path: string,
+  description: string,
+  options: { waitForLive?: boolean } = {},
 ): Promise<ArtifactFileLock> {
-  const path = join(artifactDirectory, ARTIFACT_LOCK_FILE_NAME);
   const lock = {
     schemaVersion: 1,
     pid: process.pid,
@@ -3758,13 +4193,17 @@ async function acquireArtifactFileLock(
       if (!(isNodeError(error) && error.code === "EEXIST")) throw error;
       const current = await readArtifactLock(path);
       if (isArtifactLockLive(current)) {
+        if (options.waitForLive) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          continue;
+        }
         throw new Error(
-          `Artifact ${artifactDirectory} is locked by a live Panes process. Retry after that operation completes.`,
+          `${description} is locked by a live Panes process. Retry after that operation completes.`,
         );
       }
       const stalePath = join(
-        artifactDirectory,
-        `.${ARTIFACT_LOCK_FILE_NAME}.${randomUUID()}.stale`,
+        dirname(path),
+        `.${basename(path)}.${randomUUID()}.stale`,
       );
       try {
         await rename(path, stalePath);
@@ -4463,20 +4902,50 @@ async function readLockedPreviewFile(root: string, relativePath: string) {
   }
 }
 
-async function writeJson(path: string, value: unknown) {
+async function writeJson(
+  path: string,
+  value: unknown,
+  options: {
+    temporaryTag?: string;
+    afterTempWrite?: () => void;
+  } = {},
+) {
+  const temporaryTag = options.temporaryTag ? `${options.temporaryTag}.` : "";
   const temporary = join(
     dirname(path),
-    `.${basename(path)}.${randomUUID()}.tmp`,
+    `.${basename(path)}.${temporaryTag}${randomUUID()}.tmp`,
   );
-  await writeFile(temporary, `${JSON.stringify(value)}\n`, {
-    encoding: "utf8",
-    mode: 0o644,
-  });
+  const handle = await open(temporary, "wx", 0o644);
+  try {
+    await handle.writeFile(`${JSON.stringify(value)}\n`, { encoding: "utf8" });
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  options.afterTempWrite?.();
   try {
     await rename(temporary, path);
   } catch (error) {
     await unlink(temporary).catch(() => undefined);
     throw error;
+  }
+}
+
+async function recoverAdoptionManifestTemps(
+  artifactDirectory: string,
+  codeDigest: string,
+) {
+  if (await pathExists(join(artifactDirectory, "artifact.json"))) return;
+  const entries = await readdir(artifactDirectory);
+  const prefix = `.artifact.json.adopt-${codeDigest}.`;
+  for (const entry of entries) {
+    if (
+      entry.startsWith(prefix) &&
+      entry.endsWith(".tmp") &&
+      /^[0-9a-f-]{36}$/u.test(entry.slice(prefix.length, -4))
+    ) {
+      await unlink(join(artifactDirectory, entry));
+    }
   }
 }
 
@@ -5308,6 +5777,46 @@ async function readSyncCheckpoint(
   return value;
 }
 
+async function readAdoptionCheckpoint(
+  path: string,
+): Promise<AdoptionCheckpoint | undefined> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw new Error(`Adoption checkpoint at ${path} is malformed.`);
+  }
+  if (!isAdoptionCheckpoint(value))
+    throw new Error(`Adoption checkpoint at ${path} is invalid.`);
+  return value;
+}
+
+function isAdoptionCheckpoint(value: unknown): value is AdoptionCheckpoint {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const checkpoint = value as Record<string, unknown>;
+  return (
+    checkpoint.schemaVersion === 1 &&
+    typeof checkpoint.codeDigest === "string" &&
+    /^[a-f0-9]{64}$/u.test(checkpoint.codeDigest) &&
+    typeof checkpoint.apiOrigin === "string" &&
+    typeof checkpoint.projectId === "string" &&
+    typeof checkpoint.legacyArtifactId === "string" &&
+    typeof checkpoint.artifactId === "string" &&
+    typeof checkpoint.slug === "string" &&
+    (checkpoint.phase === "planned" ||
+      checkpoint.phase === "redeemed" ||
+      checkpoint.phase === "completed") &&
+    (checkpoint.title === undefined || typeof checkpoint.title === "string") &&
+    (checkpoint.type === undefined ||
+      artifactTypeSchema.safeParse(checkpoint.type).success) &&
+    (checkpoint.preview === undefined ||
+      previewEntrySchema.safeParse(checkpoint.preview).success) &&
+    (checkpoint.provenance === undefined ||
+      legacyAdoptionProvenanceSchema.safeParse(checkpoint.provenance).success)
+  );
+}
+
 function isStoredSyncState(
   value: unknown,
   apiOrigin: string,
@@ -5577,6 +6086,30 @@ function syncCheckpointPath(
     sha256(apiOrigin),
     "sync-checkpoints",
     `${sha256(`${projectId}:${artifactId}`)}.json`,
+  );
+}
+
+function adoptionCheckpointPath(apiOrigin: string, codeDigest: string) {
+  return join(
+    stateRootDirectory(),
+    "origins",
+    sha256(apiOrigin),
+    "adoptions",
+    `${codeDigest}.json`,
+  );
+}
+
+function adoptionOperationLockPath(
+  apiOrigin: string,
+  projectKey: string,
+  codeDigest: string,
+) {
+  return join(
+    stateRootDirectory(),
+    "origins",
+    sha256(apiOrigin),
+    "adoptions",
+    `${sha256(projectKey)}-${codeDigest}.lock`,
   );
 }
 

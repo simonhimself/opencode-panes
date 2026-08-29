@@ -8,6 +8,7 @@ import {
   type InventoryResponse,
   type InventoryCreatorRotateResponse,
   type InventoryReconnectCodeResponse,
+  type LegacyAdoptionIssueResponse,
   type LegacyArtifactPresentation,
   type PublicPublicationResponse,
   type Revision,
@@ -448,6 +449,21 @@ export function issueInventoryReconnectCode(
     `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/reconnect-code`,
     {
       body: JSON.stringify({ confirmation }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function issueLegacyAdoptionCode(
+  artifactId: string,
+  fetcher: Fetcher = fetch,
+): Promise<LegacyAdoptionIssueResponse> {
+  return requestJson<LegacyAdoptionIssueResponse>(
+    `/api/inventory/legacy/artifacts/${encodeURIComponent(artifactId)}/adoption-code`,
+    {
+      body: "{}",
       headers: { "Content-Type": "application/json" },
       method: "POST",
     },

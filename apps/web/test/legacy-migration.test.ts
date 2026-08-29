@@ -12,6 +12,8 @@ const ARTIFACT_IDS = ["ticket18-legacy-one", "ticket18-legacy-two"];
 const SHARE_TOKENS = ["1".repeat(64), "2".repeat(64), "3".repeat(64)];
 
 const DROP_TABLES = [
+  "legacy_adoption_provenance",
+  "legacy_adoption_grants",
   "legacy_shares",
   "legacy_artifacts",
   "legacy_migration_state",
@@ -233,9 +235,12 @@ describe("legacy migration classification", () => {
       .run();
     const publicResponse = await api("/api/public/legacy-public-token");
     expect(publicResponse.status).toBe(200);
-    expect(await publicResponse.clone().json()).toMatchObject({
+    const publicPayload = await publicResponse.clone().json();
+    expect(publicPayload).toMatchObject({
       legacy: { readOnly: true },
     });
+    expect(publicPayload).not.toHaveProperty("legacyProvenance");
+    expect(publicPayload).not.toHaveProperty("grantId");
 
     await env.DB.prepare(
       "UPDATE legacy_shares SET public_expires_at = ? WHERE token_hash = ?",

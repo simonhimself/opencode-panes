@@ -16,8 +16,10 @@ import {
   syncCreatorRotateResponseSchema,
   syncReconnectRequestSchema,
   syncReconnectResponseSchema,
+  legacyAdoptionProvenanceSchema,
   type ApiErrorCode,
   type CloudManifest,
+  type LegacyAdoptionProvenance,
   type ErrorIssue,
 } from "@opencode-panes/contracts";
 import {
@@ -270,6 +272,22 @@ async function createSyncArtifact(
     SYNC_BODY_LIMIT,
   );
   if (!body.ok) return body.response;
+  if (
+    body.data.legacyProvenance &&
+    !(await adoptionProvenanceMatchesRequest(
+      env.DB,
+      body.data.projectId,
+      body.data.artifactId,
+      body.data.slug,
+      body.data.legacyProvenance,
+    ))
+  ) {
+    return errorResponse(
+      409,
+      "CONFLICT",
+      "Legacy adoption provenance does not match this local Artifact",
+    );
+  }
 
   const existing = await env.DB.prepare(
     `SELECT cloud_artifact_id, cloud_project_id, local_project_id,
@@ -284,7 +302,14 @@ async function createSyncArtifact(
   if (existing) {
     if (existing.lifecycle_state === "deleting")
       return errorResponse(409, "CONFLICT", "Sync Artifact is being deleted");
-    if (!(await sameCreationRequest(existing, body.data))) {
+    if (
+      !(await sameCreationRequest(existing, body.data)) ||
+      !(await adoptionProvenanceMatchesCloudArtifact(
+        env.DB,
+        existing.cloud_artifact_id,
+        body.data.legacyProvenance,
+      ))
+    ) {
       return errorResponse(
         409,
         "CONFLICT",
@@ -314,6 +339,33 @@ async function createSyncArtifact(
   const creatorTokenHash = await hashToken(body.data.creatorToken);
   try {
     await env.DB.batch([
+      ...(body.data.legacyProvenance
+        ? [
+            env.DB.prepare(
+              `INSERT INTO legacy_adoption_provenance
+                (grant_id, cloud_artifact_id, local_project_id, local_artifact_id,
+                 legacy_artifact_id, legacy_revision_id, legacy_revision_version,
+                 legacy_title, legacy_type, local_slug, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ).bind(
+              body.data.legacyProvenance.grantId,
+              cloudArtifactId,
+              body.data.projectId,
+              body.data.artifactId,
+              body.data.legacyProvenance.legacyArtifactId,
+              body.data.legacyProvenance.legacyRevisionId,
+              body.data.legacyProvenance.legacyRevisionVersion,
+              body.data.legacyProvenance.legacyTitle,
+              body.data.legacyProvenance.legacyType,
+              body.data.legacyProvenance.localSlug,
+              createdAt,
+            ),
+            env.DB.prepare(
+              `DELETE FROM legacy_adoption_grants
+                WHERE id = ? AND consumed_at IS NOT NULL`,
+            ).bind(body.data.legacyProvenance.grantId),
+          ]
+        : []),
       env.DB.prepare(
         `INSERT INTO projects (id, created_at, updated_at)
          VALUES (?, ?, ?)
@@ -381,7 +433,15 @@ async function createSyncArtifact(
     )
       .bind(body.data.idempotencyKey)
       .first<SyncArtifactRow>();
-    if (replay && (await sameCreationRequest(replay, body.data))) {
+    if (
+      replay &&
+      (await sameCreationRequest(replay, body.data)) &&
+      (await adoptionProvenanceMatchesCloudArtifact(
+        env.DB,
+        replay.cloud_artifact_id,
+        body.data.legacyProvenance,
+      ))
+    ) {
       if (replay.lifecycle_state === "deleting")
         return errorResponse(409, "CONFLICT", "Sync Artifact is being deleted");
       const leaseError = await acquireSyncLease(
@@ -809,6 +869,155 @@ async function sameCreationRequest(
   );
 }
 
+async function adoptionProvenanceMatchesRequest(
+  db: D1Database,
+  localProjectId: string,
+  localArtifactId: string,
+  localSlug: string,
+  provenance: LegacyAdoptionProvenance,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT id, legacy_artifact_id, legacy_revision_id,
+              legacy_revision_version, legacy_title, legacy_type,
+              consumed_at, revoked_at, local_project_id, local_artifact_id,
+              local_slug
+         FROM legacy_adoption_grants
+        WHERE id = ?`,
+    )
+    .bind(provenance.grantId)
+    .first<{
+      id: string;
+      legacy_artifact_id: string;
+      legacy_revision_id: string;
+      legacy_revision_version: number;
+      legacy_title: string;
+      legacy_type: LegacyAdoptionProvenance["legacyType"];
+      consumed_at: string | null;
+      revoked_at: string | null;
+      local_project_id: string | null;
+      local_artifact_id: string | null;
+      local_slug: string | null;
+    }>();
+  return (
+    Boolean(
+      row &&
+      row.consumed_at &&
+      !row.revoked_at &&
+      provenance.localProjectId === localProjectId &&
+      provenance.localArtifactId === localArtifactId &&
+      provenance.localSlug === localSlug &&
+      row.local_project_id === localProjectId &&
+      row.local_artifact_id === localArtifactId &&
+      row.local_slug === localSlug &&
+      row.legacy_artifact_id === provenance.legacyArtifactId &&
+      row.legacy_revision_id === provenance.legacyRevisionId &&
+      row.legacy_revision_version === provenance.legacyRevisionVersion &&
+      row.legacy_title === provenance.legacyTitle &&
+      row.legacy_type === provenance.legacyType,
+    ) ||
+    adoptionStandaloneProvenanceMatchesRequest(
+      db,
+      localProjectId,
+      localArtifactId,
+      localSlug,
+      provenance,
+    )
+  );
+}
+
+async function adoptionStandaloneProvenanceMatchesRequest(
+  db: D1Database,
+  localProjectId: string,
+  localArtifactId: string,
+  localSlug: string,
+  expected: LegacyAdoptionProvenance,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT grant_id, cloud_artifact_id, local_project_id, local_artifact_id,
+              local_slug, legacy_artifact_id, legacy_revision_id,
+              legacy_revision_version, legacy_title, legacy_type
+         FROM legacy_adoption_provenance
+        WHERE local_project_id = ? AND local_artifact_id = ? AND local_slug = ?`,
+    )
+    .bind(localProjectId, localArtifactId, localSlug)
+    .first<{
+      grant_id: string;
+      cloud_artifact_id: string;
+      local_project_id: string;
+      local_artifact_id: string;
+      local_slug: string;
+      legacy_artifact_id: string;
+      legacy_revision_id: string;
+      legacy_revision_version: number;
+      legacy_title: string;
+      legacy_type: LegacyAdoptionProvenance["legacyType"];
+    }>();
+  if (!row) return false;
+  const parsed = legacyAdoptionProvenanceSchema.safeParse({
+    grantId: row.grant_id,
+    localProjectId: row.local_project_id,
+    localArtifactId: row.local_artifact_id,
+    localSlug: row.local_slug,
+    legacyArtifactId: row.legacy_artifact_id,
+    legacyRevisionId: row.legacy_revision_id,
+    legacyRevisionVersion: row.legacy_revision_version,
+    legacyTitle: row.legacy_title,
+    legacyType: row.legacy_type,
+  });
+  return (
+    parsed.success && JSON.stringify(parsed.data) === JSON.stringify(expected)
+  );
+}
+
+async function adoptionProvenanceMatchesCloudArtifact(
+  db: D1Database,
+  cloudArtifactId: string,
+  expected: LegacyAdoptionProvenance | undefined,
+): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT grant_id, local_project_id, local_artifact_id, local_slug,
+              legacy_artifact_id, legacy_revision_id, legacy_revision_version,
+              legacy_title, legacy_type
+         FROM legacy_adoption_provenance
+        WHERE cloud_artifact_id = ?`,
+    )
+    .bind(cloudArtifactId)
+    .first<{
+      grant_id: string;
+      local_project_id: string;
+      local_artifact_id: string;
+      local_slug: string;
+      legacy_artifact_id: string;
+      legacy_revision_id: string;
+      legacy_revision_version: number;
+      legacy_title: string;
+      legacy_type: LegacyAdoptionProvenance["legacyType"];
+    }>();
+  if (!expected) return !row;
+  if (!row) return false;
+  const parsed = legacyAdoptionProvenanceSchema.safeParse({
+    grantId: row.grant_id,
+    localProjectId: row.local_project_id,
+    localArtifactId: row.local_artifact_id,
+    localSlug: row.local_slug,
+    legacyArtifactId: row.legacy_artifact_id,
+    legacyRevisionId: row.legacy_revision_id,
+    legacyRevisionVersion: row.legacy_revision_version,
+    legacyTitle: row.legacy_title,
+    legacyType: row.legacy_type,
+  });
+  return (
+    parsed.success && JSON.stringify(parsed.data) === JSON.stringify(expected)
+  );
+}
+
+function parseAdoptionProvenance(value: string): LegacyAdoptionProvenance {
+  return legacyAdoptionProvenanceSchema.parse(JSON.parse(value));
+}
+
 function syncCreateResponse(
   request: Request,
   row: SyncArtifactRow,
@@ -1000,6 +1209,19 @@ async function commitSyncRevision(
       409,
       "CONFLICT",
       "Cloud manifest does not match the Sync Artifact",
+    );
+  }
+  if (
+    !(await adoptionProvenanceMatchesCloudArtifact(
+      env.DB,
+      artifactId,
+      manifest.legacyProvenance,
+    ))
+  ) {
+    return errorResponse(
+      409,
+      "CONFLICT",
+      "Cloud manifest adoption provenance does not match the Sync Artifact",
     );
   }
   if (
@@ -1398,6 +1620,7 @@ interface CreatorCapabilityRow {
   kind: string | null;
   expires_at: string;
   revoked_at: string | null;
+  legacy_provenance: string | null;
 }
 
 interface CreatorRevisionRow {
@@ -1464,6 +1687,9 @@ async function readCreatorCapability(
       slug: row.slug,
       title: row.title,
       ...(row.kind ? { kind: row.kind } : {}),
+      ...(row.legacy_provenance
+        ? { legacyProvenance: parseAdoptionProvenance(row.legacy_provenance) }
+        : {}),
       creatorExpiresAt: row.expires_at,
       revisions: workspaceRevisions,
       ...(await getPublicationSnapshot(env, row.cloud_artifact_id)),
@@ -1480,9 +1706,22 @@ async function loadCreatorCapability(
   const row = await db
     .prepare(
       `SELECT a.cloud_artifact_id, a.cloud_project_id, a.slug, a.title, a.kind,
-              l.expires_at, l.revoked_at
+              l.expires_at, l.revoked_at,
+              CASE WHEN adoption.grant_id IS NULL THEN NULL ELSE json_object(
+                'grantId', adoption.grant_id,
+                'localProjectId', adoption.local_project_id,
+                'localArtifactId', adoption.local_artifact_id,
+                'localSlug', adoption.local_slug,
+                'legacyArtifactId', adoption.legacy_artifact_id,
+                'legacyRevisionId', adoption.legacy_revision_id,
+                'legacyRevisionVersion', adoption.legacy_revision_version,
+                'legacyTitle', adoption.legacy_title,
+                'legacyType', adoption.legacy_type
+              ) END AS legacy_provenance
          FROM creator_links l
          JOIN sync_artifacts a ON a.cloud_artifact_id = l.artifact_id
+         LEFT JOIN legacy_adoption_provenance adoption
+           ON adoption.cloud_artifact_id = a.cloud_artifact_id
         WHERE l.token_hash = ?`,
     )
     .bind(await hashToken(token))

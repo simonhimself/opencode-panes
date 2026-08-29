@@ -142,6 +142,12 @@ export function CreatorWorkspace({
           <div className="title-block">
             <span className="eyebrow">CREATOR WORKSPACE</span>
             <h1>{currentWorkspace.title}</h1>
+            {currentWorkspace.legacyProvenance ? (
+              <span className="workspace-source-label">
+                ADOPTED FROM LEGACY{" "}
+                {currentWorkspace.legacyProvenance.legacyArtifactId}
+              </span>
+            ) : null}
           </div>
           <span className="type-readout">PRIVATE</span>
         </div>

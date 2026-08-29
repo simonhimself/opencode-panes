@@ -116,6 +116,470 @@ describe("artifact tool", () => {
     }
   });
 
+  it("adopts a Legacy payload into an unchanged finalized local v1", async () => {
+    const repository = await gitRepository();
+    const source = "\uFEFF<html>\r\n\0café</html>\r\n";
+    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        apiOrigin: string;
+        localProjectId: string;
+        localArtifactId: string;
+        slug: string;
+      };
+      return jsonResponse({
+        operation: "legacy-adopted",
+        apiOrigin: request.apiOrigin,
+        localProjectId: request.localProjectId,
+        localArtifactId: request.localArtifactId,
+        slug: request.slug,
+        title: "Adopted example",
+        type: "html",
+        source,
+        provenance: {
+          grantId: "adoption-grant-1",
+          localProjectId: request.localProjectId,
+          localArtifactId: request.localArtifactId,
+          localSlug: request.slug,
+          legacyArtifactId: "legacy-artifact-1",
+          legacyRevisionId: "legacy-revision-1",
+          legacyRevisionVersion: 1,
+          legacyTitle: "Adopted example",
+          legacyType: "html",
+        },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { context } = toolContext({
+      directory: repository,
+      worktree: repository,
+    });
+    const plugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const definition = plugin.tool?.artifact_adopt_legacy as
+      ToolDefinition | undefined;
+    if (!definition) throw new Error("Legacy adoption tool was not registered");
+
+    const result = await definition.execute(
+      {
+        artifactId: "legacy-artifact-1",
+        adoptionCode: "panes-adopt-legacy-" + "a".repeat(32),
+        slug: "adopted-example",
+      },
+      context,
+    );
+
+    const artifact = JSON.parse(
+      await readFile(
+        join(repository, "artifacts", "adopted-example", "artifact.json"),
+        "utf8",
+      ),
+    ) as ReturnType<typeof artifactManifestSchema.parse>;
+    expect(artifact.revisions).toHaveLength(1);
+    expect(artifact.legacyProvenance?.legacyArtifactId).toBe(
+      "legacy-artifact-1",
+    );
+    expect(
+      await readFile(
+        join(repository, "artifacts", "adopted-example", "v1", "index.html"),
+        "utf8",
+      ),
+    ).toBe(source);
+    expect(structuredResult(result).metadata).toMatchObject({
+      operation: "finalized",
+      version: 1,
+    });
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      `${LOCAL_API}/api/adopt/legacy/legacy-artifact-1`,
+    );
+  });
+
+  it("reuses a digest-only adoption checkpoint after an interrupted redemption", async () => {
+    const repository = await gitRepository();
+    const source = "\uFEFF<html>\r\n\0retry</html>\r\n";
+    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        apiOrigin: string;
+        localProjectId: string;
+        localArtifactId: string;
+        slug: string;
+      };
+      return jsonResponse({
+        operation: "legacy-adopted",
+        apiOrigin: request.apiOrigin,
+        localProjectId: request.localProjectId,
+        localArtifactId: request.localArtifactId,
+        slug: request.slug,
+        title: "Retry example",
+        type: "html",
+        source,
+        provenance: {
+          grantId: "adoption-grant-retry",
+          localProjectId: request.localProjectId,
+          localArtifactId: request.localArtifactId,
+          localSlug: request.slug,
+          legacyArtifactId: "legacy-artifact-retry",
+          legacyRevisionId: "legacy-revision-retry",
+          legacyRevisionVersion: 1,
+          legacyTitle: "Retry example",
+          legacyType: "html",
+        },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { context } = toolContext({
+      directory: repository,
+      worktree: repository,
+    });
+    const failureInjector = (phase: string) => {
+      if (phase === "adopt-after-redeem") {
+        throw new Error("simulated interruption");
+      }
+    };
+    const firstPlugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      { failureInjector },
+    );
+    const firstDefinition = firstPlugin.tool?.artifact_adopt_legacy as
+      ToolDefinition | undefined;
+    if (!firstDefinition)
+      throw new Error("Legacy adoption tool was not registered");
+
+    await expect(
+      firstDefinition.execute(
+        {
+          artifactId: "legacy-artifact-retry",
+          adoptionCode: "panes-adopt-legacy-" + "b".repeat(32),
+          slug: "retry-example",
+        },
+        context,
+      ),
+    ).rejects.toThrow("simulated interruption");
+    expect(
+      await stat(join(repository, "artifacts", "retry-example")),
+    ).toBeTruthy();
+
+    const checkpointFiles = await findFiles(join(stateHome, "opencode-panes"));
+    expect(checkpointFiles).toHaveLength(1);
+    const checkpointContents = await readFile(
+      checkpointFiles[0] as string,
+      "utf8",
+    );
+    expect(checkpointContents).not.toContain("panes-adopt-legacy-");
+
+    const retryPlugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const retryDefinition = retryPlugin.tool?.artifact_adopt_legacy as
+      ToolDefinition | undefined;
+    if (!retryDefinition)
+      throw new Error("Legacy adoption tool was not registered");
+    await retryDefinition.execute(
+      {
+        artifactId: "legacy-artifact-retry",
+        adoptionCode: "panes-adopt-legacy-" + "b".repeat(32),
+        slug: "retry-example",
+      },
+      context,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstRequest = JSON.parse(
+      String(fetchMock.mock.calls[0]?.[1]?.body),
+    ) as { localArtifactId: string };
+    const secondRequest = JSON.parse(
+      String(fetchMock.mock.calls[1]?.[1]?.body),
+    ) as { localArtifactId: string };
+    expect(secondRequest.localArtifactId).toBe(firstRequest.localArtifactId);
+    expect(
+      await readFile(
+        join(repository, "artifacts", "retry-example", "v1", "index.html"),
+        "utf8",
+      ),
+    ).toBe(source);
+  });
+
+  it("recovers an orphaned adoption manifest temp file after interruption", async () => {
+    const repository = await gitRepository();
+    const source = "\uFEFF<html>\r\n\0manifest-retryé</html>\r\n";
+    const fetchMock = mockLegacyAdoptionFetch(source, "manifest-retry");
+    let interrupted = true;
+    const context = toolContext({
+      directory: repository,
+      worktree: repository,
+    }).context;
+    const firstPlugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {
+        failureInjector: (phase: string) => {
+          if (phase === "adopt-after-manifest-temp-write" && interrupted) {
+            interrupted = false;
+            throw new Error("simulated manifest interruption");
+          }
+        },
+      },
+    );
+    const firstDefinition = firstPlugin.tool?.artifact_adopt_legacy as
+      ToolDefinition | undefined;
+    if (!firstDefinition)
+      throw new Error("Legacy adoption tool was not registered");
+    const args = {
+      artifactId: "legacy-manifest-retry",
+      adoptionCode: "panes-adopt-legacy-" + "c".repeat(32),
+      slug: "manifest-retry",
+    };
+
+    await expect(firstDefinition.execute(args, context)).rejects.toThrow(
+      "simulated manifest interruption",
+    );
+    const artifactDirectory = join(repository, "artifacts", "manifest-retry");
+    const interruptedEntries = await readdir(artifactDirectory);
+    expect(
+      interruptedEntries.some(
+        (entry) =>
+          entry.startsWith(".artifact.json.adopt-") && entry.endsWith(".tmp"),
+      ),
+    ).toBe(true);
+
+    const retryPlugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const retryDefinition = retryPlugin.tool?.artifact_adopt_legacy as
+      ToolDefinition | undefined;
+    if (!retryDefinition)
+      throw new Error("Legacy adoption tool was not registered");
+    const result = await retryDefinition.execute(args, context);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      (await readdir(artifactDirectory)).filter(
+        (entry) =>
+          entry.startsWith(".artifact.json.adopt-") ||
+          entry.includes("journal"),
+      ),
+    ).toEqual([]);
+    expect(
+      await readFile(join(artifactDirectory, "v1", "index.html"), "utf8"),
+    ).toBe(source);
+    expect(structuredResult(result).metadata?.version).toBe(1);
+  });
+
+  it("serializes concurrent same-code adoption calls onto one local binding", async () => {
+    const repository = await gitRepository();
+    const fetchMock = mockLegacyAdoptionFetch(
+      "<h1>concurrent</h1>\r\n",
+      "concurrent",
+    );
+    const context = toolContext({
+      directory: repository,
+      worktree: repository,
+    }).context;
+    const plugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
+    const args = {
+      artifactId: "legacy-concurrent",
+      adoptionCode: "panes-adopt-legacy-" + "d".repeat(32),
+      slug: "concurrent",
+    };
+
+    const [first, second] = await Promise.all([
+      definition.execute(args, context),
+      definition.execute(args, context),
+    ]);
+    const firstMetadata = structuredResult(first).metadata;
+    const secondMetadata = structuredResult(second).metadata;
+    expect(firstMetadata?.artifactId).toBe(secondMetadata?.artifactId);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(
+      await readFile(
+        join(repository, "artifacts", "concurrent", "v1", "index.html"),
+        "utf8",
+      ),
+    ).toBe("<h1>concurrent</h1>\r\n");
+  });
+
+  it("maps every Legacy renderer to a finalized exact-byte local v1 preview", async () => {
+    const repository = await gitRepository();
+    const cases = [
+      {
+        type: "html" as const,
+        filename: "index.html",
+        source: "\uFEFF<html>\r\n\0café</html>\r\n",
+        adapter: "browser" as const,
+      },
+      {
+        type: "svg" as const,
+        filename: "index.svg",
+        source: "\uFEFF<svg>\r\n\0café</svg>\r\n",
+        adapter: "browser" as const,
+      },
+      {
+        type: "react" as const,
+        filename: "App.tsx",
+        source: "\uFEFFexport default function App(){return <p>café</p>}\r\n",
+        adapter: "renderer" as const,
+        renderer: "react" as const,
+      },
+      {
+        type: "markdown" as const,
+        filename: "README.md",
+        source: "\uFEFF# café\r\n\0\r\n",
+        adapter: "renderer" as const,
+        renderer: "markdown" as const,
+      },
+      {
+        type: "mermaid" as const,
+        filename: "diagram.mmd",
+        source: "\uFEFFflowchart TD\r\nA[café] --> B\r\n",
+        adapter: "renderer" as const,
+        renderer: "mermaid" as const,
+      },
+      {
+        type: "code" as const,
+        filename: "source.txt",
+        source: "\uFEFFconst café = '\0';\r\n",
+        adapter: "renderer" as const,
+        renderer: "code" as const,
+      },
+    ];
+    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        apiOrigin: string;
+        localProjectId: string;
+        localArtifactId: string;
+        slug: string;
+        code: string;
+      };
+      const selected = cases.find(({ type }) => request.slug === `all-${type}`);
+      if (!selected) throw new Error("unknown adoption test case");
+      return jsonResponse({
+        operation: "legacy-adopted",
+        apiOrigin: request.apiOrigin,
+        localProjectId: request.localProjectId,
+        localArtifactId: request.localArtifactId,
+        slug: request.slug,
+        title: `Legacy ${selected.type}`,
+        type: selected.type,
+        source: selected.source,
+        provenance: {
+          grantId: `adoption-grant-all-${selected.type}`,
+          localProjectId: request.localProjectId,
+          localArtifactId: request.localArtifactId,
+          localSlug: request.slug,
+          legacyArtifactId: `legacy-all-${selected.type}`,
+          legacyRevisionId: `revision-all-${selected.type}`,
+          legacyRevisionVersion: 1,
+          legacyTitle: `Legacy ${selected.type}`,
+          legacyType: selected.type,
+        },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const plugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
+    const results: Array<{
+      result: ToolResult;
+      code: string;
+      previewUrl: string;
+    }> = [];
+    for (const [index, selected] of cases.entries()) {
+      const code = `panes-adopt-legacy-${index.toString(16)}${"e".repeat(31)}`;
+      const result = await definition.execute(
+        {
+          artifactId: `legacy-all-${selected.type}`,
+          adoptionCode: code,
+          slug: `all-${selected.type}`,
+        },
+        toolContext({ directory: repository, worktree: repository }).context,
+      );
+      const metadata = structuredResult(result).metadata as {
+        artifactId: string;
+        preview: { adapter: string; renderer?: string };
+        previewUrl: string;
+      };
+      expect(metadata.preview.adapter).toBe(selected.adapter);
+      expect(metadata.preview.renderer).toBe(selected.renderer);
+      results.push({ result, code, previewUrl: metadata.previewUrl });
+
+      const manifest = JSON.parse(
+        await readFile(
+          join(
+            repository,
+            "artifacts",
+            `all-${selected.type}`,
+            "artifact.json",
+          ),
+          "utf8",
+        ),
+      ) as ReturnType<typeof artifactManifestSchema.parse>;
+      expect(manifest.revisions).toHaveLength(1);
+      expect(manifest.revisions[0]?.preview).toEqual({
+        adapter: selected.adapter,
+        entryPath: selected.filename,
+        ...(selected.renderer ? { renderer: selected.renderer } : {}),
+      });
+      expect(
+        await readFile(
+          join(
+            repository,
+            "artifacts",
+            `all-${selected.type}`,
+            "v1",
+            selected.filename,
+          ),
+        ),
+      ).toEqual(Buffer.from(selected.source, "utf8"));
+      const serialized = JSON.stringify({ manifest, result });
+      expect(serialized).not.toContain(code);
+      expect(serialized).not.toContain("owner-secret");
+    }
+    vi.unstubAllGlobals();
+    for (const { previewUrl } of results) {
+      expect((await fetch(previewUrl)).status).toBe(200);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(cases.length);
+
+    const adoptedArtifactId = structuredResult(results[0]!.result).metadata
+      ?.artifactId as string;
+    const prepared = await (
+      plugin.tool?.artifact_prepare as ToolDefinition
+    ).execute(
+      { artifactId: adoptedArtifactId, requestedOrigins: [] },
+      toolContext({ directory: repository, worktree: repository }).context,
+    );
+    const draftPath = structuredResult(prepared).metadata?.draftPath as string;
+    await writeFile(join(draftPath, "index.html"), "<h1>v2</h1>\r\n");
+    const finalized = await (
+      plugin.tool?.artifact_finalize as ToolDefinition
+    ).execute(
+      {
+        artifactId: adoptedArtifactId,
+        entryPath: "index.html",
+        adapter: "browser",
+      },
+      toolContext({ directory: repository, worktree: repository }).context,
+    );
+    expect(structuredResult(finalized).metadata).toMatchObject({
+      artifactId: adoptedArtifactId,
+      version: 2,
+    });
+    expect(
+      await readFile(
+        join(repository, "artifacts", "all-html", "v2", "index.html"),
+        "utf8",
+      ),
+    ).toBe("<h1>v2</h1>\r\n");
+  });
+
   it("updates with the persisted token and never exposes that token", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
@@ -867,6 +1331,40 @@ function jsonResponse(body: unknown, status = 200) {
   });
 }
 
+function mockLegacyAdoptionFetch(source: string, suffix: string) {
+  const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+    const request = JSON.parse(String(init?.body)) as {
+      apiOrigin: string;
+      localProjectId: string;
+      localArtifactId: string;
+      slug: string;
+    };
+    return jsonResponse({
+      operation: "legacy-adopted",
+      apiOrigin: request.apiOrigin,
+      localProjectId: request.localProjectId,
+      localArtifactId: request.localArtifactId,
+      slug: request.slug,
+      title: suffix,
+      type: "html",
+      source,
+      provenance: {
+        grantId: `adoption-grant-${suffix}`,
+        localProjectId: request.localProjectId,
+        localArtifactId: request.localArtifactId,
+        localSlug: request.slug,
+        legacyArtifactId: `legacy-${suffix}`,
+        legacyRevisionId: `revision-${suffix}`,
+        legacyRevisionVersion: 1,
+        legacyTitle: suffix,
+        legacyType: "html",
+      },
+    });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
 function createResponse(origin = LOCAL_API) {
   return {
     artifact: {
@@ -928,4 +1426,15 @@ async function onlyStateFile() {
   const files = await readdir(directory);
   expect(files).toHaveLength(1);
   return join(directory, files[0] as string);
+}
+
+async function findFiles(root: string): Promise<string[]> {
+  const entries = await readdir(root, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) files.push(...(await findFiles(path)));
+    else if (entry.isFile()) files.push(path);
+  }
+  return files;
 }

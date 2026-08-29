@@ -6,10 +6,14 @@ import { clearAccessJwksCache } from "../worker/access";
 import {
   cloudDeletionConfirmation,
   deleteInventoryArtifact,
+  deleteLegacyInventoryArtifact,
 } from "../worker/deletion";
 import {
   inventoryReconnectCodeResponseSchema,
   inventoryCreatorRotateResponseSchema,
+  legacyAdoptionIssueResponseSchema,
+  legacyAdoptionRedeemResponseSchema,
+  creatorWorkspaceResponseSchema,
   inventoryResponseSchema,
   publicationSchema,
   syncReconnectResponseSchema,
@@ -37,7 +41,11 @@ beforeEach(async () => {
   clearAccessJwksCache();
   vi.unstubAllGlobals();
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM artifacts WHERE id LIKE 'inventory-legacy-%'"),
+    env.DB.prepare("DELETE FROM legacy_adoption_provenance"),
+    env.DB.prepare("DELETE FROM legacy_adoption_grants"),
+    env.DB.prepare(
+      "DELETE FROM artifacts WHERE id LIKE 'inventory-legacy-%' OR id LIKE 'legacy-adoption-%'",
+    ),
     env.DB.prepare("DELETE FROM artifact_deletion_objects"),
     env.DB.prepare("DELETE FROM artifact_deletion_tombstones"),
     env.DB.prepare("DELETE FROM publications"),
@@ -51,6 +59,388 @@ beforeEach(async () => {
 });
 
 describe("authenticated cloud inventory", () => {
+  it("issues an Access-gated adoption code and redeems it once for the current Legacy revision", async () => {
+    const material = await accessMaterial("adoption");
+    stubJwks(material);
+    const source = "\uFEFF<html>\r\n\0café</html>\r\n";
+    const shareHash = await sha256Text("legacy-adoption-share");
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO artifacts (id, owner_token_hash, workspace_token_hash, opencode_session_id, title, type, current_revision_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(
+        "legacy-adoption-one",
+        "a".repeat(64),
+        "b".repeat(64),
+        "legacy-session",
+        "Adopt me",
+        "html",
+        "legacy-adoption-revision-2",
+        "2026-08-29T12:00:00.000Z",
+        "2026-08-29T12:00:00.000Z",
+      ),
+      env.DB.prepare(
+        "INSERT INTO revisions (id, artifact_id, version, source, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).bind(
+        "legacy-adoption-revision-1",
+        "legacy-adoption-one",
+        1,
+        "<html>old</html>",
+        "2026-08-29T12:00:00.000Z",
+      ),
+      env.DB.prepare(
+        "INSERT INTO revisions (id, artifact_id, version, source, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).bind(
+        "legacy-adoption-revision-2",
+        "legacy-adoption-one",
+        2,
+        source,
+        "2026-08-29T12:00:00.000Z",
+      ),
+      env.DB.prepare(
+        "INSERT INTO shares (token_hash, artifact_id, revision_id, created_at) VALUES (?, ?, ?, ?)",
+      ).bind(
+        shareHash,
+        "legacy-adoption-one",
+        "legacy-adoption-revision-1",
+        "2026-08-29T12:00:00.000Z",
+      ),
+      env.DB.prepare(
+        "INSERT INTO legacy_shares (token_hash, artifact_id, migrated_at, public_expires_at) VALUES (?, ?, ?, ?)",
+      ).bind(
+        shareHash,
+        "legacy-adoption-one",
+        "2026-08-29T12:00:00.000Z",
+        "2099-08-29T12:00:00.000Z",
+      ),
+      env.DB.prepare(
+        "INSERT INTO legacy_artifacts (artifact_id, migrated_at, private_expires_at) VALUES (?, ?, ?)",
+      ).bind(
+        "legacy-adoption-one",
+        "2026-08-29T12:00:00.000Z",
+        "2099-08-29T12:00:00.000Z",
+      ),
+    ]);
+    const accessHeaders = {
+      "Cf-Access-Jwt-Assertion": await accessToken(material, {
+        email: "simonhimself@gmail.com",
+      }),
+    };
+    const staleIssue = await api(
+      "/api/inventory/legacy/artifacts/legacy-adoption-one/adoption-code",
+      { method: "POST", headers: accessHeaders },
+      accessEnv(material),
+    );
+    const staleCode = legacyAdoptionIssueResponseSchema.parse(
+      await staleIssue.json(),
+    ).code;
+    await env.DB.prepare(
+      "UPDATE artifacts SET current_revision_id = ? WHERE id = ?",
+    )
+      .bind("legacy-adoption-revision-1", "legacy-adoption-one")
+      .run();
+    const staleRedeem = await api(
+      "/api/adopt/legacy/legacy-adoption-one",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          code: staleCode,
+          localProjectId: "stale-project",
+          localArtifactId: "stale-artifact",
+          slug: "stale-artifact",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(staleRedeem.status).toBe(403);
+    await env.DB.prepare(
+      "UPDATE artifacts SET current_revision_id = ? WHERE id = ?",
+    )
+      .bind("legacy-adoption-revision-2", "legacy-adoption-one")
+      .run();
+    const issue = await api(
+      "/api/inventory/legacy/artifacts/legacy-adoption-one/adoption-code",
+      { method: "POST", headers: accessHeaders },
+      accessEnv(material),
+    );
+    expect(issue.status).toBe(200);
+    const issued = legacyAdoptionIssueResponseSchema.parse(await issue.json());
+    expect(issued.source).toEqual({
+      title: "Adopt me",
+      type: "html",
+      revisionVersion: 2,
+    });
+    expect(issued.code).toMatch(/^panes-adopt-legacy-[a-f0-9]{32}$/u);
+
+    const redeem = await api(
+      "/api/adopt/legacy/legacy-adoption-one",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          code: issued.code,
+          localProjectId: "local-project-adopted",
+          localArtifactId: "local-artifact-adopted",
+          slug: "adopted-artifact",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(redeem.status).toBe(200);
+    const adopted = legacyAdoptionRedeemResponseSchema.parse(
+      await redeem.json(),
+    );
+    expect(adopted.source).toBe(source);
+    expect(adopted.provenance.legacyRevisionId).toBe(
+      "legacy-adoption-revision-2",
+    );
+
+    const syncEnv = {
+      ...accessEnv(material),
+      PANES_CREATE_API_KEY: "sync-key",
+    };
+    const syncBody = {
+      projectId: "local-project-adopted",
+      artifactId: "local-artifact-adopted",
+      slug: "adopted-artifact",
+      title: "Adopt me",
+      kind: "html",
+      idempotencyKey: "adoption-sync-1",
+      ownerCredential: "owner-adopted",
+      creatorToken: "creator-adopted",
+      legacyProvenance: adopted.provenance,
+    };
+    const provenanceMismatchCases = [
+      {
+        label: "project",
+        body: {
+          ...syncBody,
+          projectId: "forged-project",
+        },
+      },
+      {
+        label: "artifact",
+        body: {
+          ...syncBody,
+          artifactId: "forged-artifact",
+        },
+      },
+      {
+        label: "slug",
+        body: {
+          ...syncBody,
+          slug: "forged-slug",
+        },
+      },
+      {
+        label: "revision",
+        body: {
+          ...syncBody,
+          legacyProvenance: {
+            ...adopted.provenance,
+            legacyRevisionVersion: adopted.provenance.legacyRevisionVersion + 1,
+          },
+        },
+      },
+      {
+        label: "revision-id",
+        body: {
+          ...syncBody,
+          legacyProvenance: {
+            ...adopted.provenance,
+            legacyRevisionId: "forged-revision",
+          },
+        },
+      },
+      {
+        label: "source-artifact",
+        body: {
+          ...syncBody,
+          legacyProvenance: {
+            ...adopted.provenance,
+            legacyArtifactId: "forged-source-artifact",
+          },
+        },
+      },
+      {
+        label: "title",
+        body: {
+          ...syncBody,
+          legacyProvenance: {
+            ...adopted.provenance,
+            legacyTitle: "Forged title",
+          },
+        },
+      },
+      {
+        label: "type",
+        body: {
+          ...syncBody,
+          legacyProvenance: {
+            ...adopted.provenance,
+            legacyType: "svg" as const,
+          },
+        },
+      },
+      {
+        label: "grant",
+        body: {
+          ...syncBody,
+          legacyProvenance: {
+            ...adopted.provenance,
+            grantId: "missing-adoption-grant",
+          },
+        },
+      },
+    ];
+    for (const mismatch of provenanceMismatchCases) {
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}/api/sync/artifacts`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Panes-Create-Key": "sync-key",
+          },
+          body: JSON.stringify({
+            ...mismatch.body,
+            idempotencyKey: `adoption-sync-mismatch-${mismatch.label}`,
+          }),
+        }),
+        syncEnv,
+      );
+      expect(response.status, mismatch.label).toBe(409);
+    }
+    const forgedSync = await worker.fetch(
+      new Request(`${ORIGIN}/api/sync/artifacts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Panes-Create-Key": "sync-key",
+        },
+        body: JSON.stringify({
+          ...syncBody,
+          idempotencyKey: "adoption-sync-forged",
+          legacyProvenance: {
+            ...adopted.provenance,
+            localSlug: "forged-slug",
+          },
+        }),
+      }),
+      syncEnv,
+    );
+    expect(forgedSync.status).toBe(409);
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM sync_artifacts WHERE local_artifact_id = ?",
+      )
+        .bind("local-artifact-adopted")
+        .first(),
+    ).toBeNull();
+    const syncRequest = () =>
+      worker.fetch(
+        new Request(`${ORIGIN}/api/sync/artifacts`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Panes-Create-Key": "sync-key",
+          },
+          body: JSON.stringify(syncBody),
+        }),
+        syncEnv,
+      );
+    const synced = await syncRequest();
+    expect(synced.status).toBe(201);
+    const syncedBody = (await synced.json()) as {
+      cloudArtifactId: string;
+    };
+    expect(syncedBody.cloudArtifactId).not.toBe("legacy-adoption-one");
+    const retriedSync = await syncRequest();
+    expect(retriedSync.status).toBe(200);
+    expect(
+      ((await retriedSync.json()) as { cloudArtifactId: string })
+        .cloudArtifactId,
+    ).toBe(syncedBody.cloudArtifactId);
+
+    const inventory = inventoryResponseSchema.parse(
+      await (
+        await api("/api/inventory", { headers: accessHeaders }, syncEnv)
+      ).json(),
+    );
+    const cloud = inventory.projects
+      .flatMap((project) => project.artifacts)
+      .find((candidate) => candidate.artifactId === syncedBody.cloudArtifactId);
+    expect(cloud?.legacyProvenance).toEqual(adopted.provenance);
+    const creator = creatorWorkspaceResponseSchema.parse(
+      await (
+        await worker.fetch(
+          new Request(`${ORIGIN}/api/creator/creator-adopted`),
+          syncEnv,
+        )
+      ).json(),
+    );
+    expect(creator.legacyProvenance).toEqual(adopted.provenance);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM legacy_adoption_grants WHERE id = ?")
+        .bind(adopted.provenance.grantId)
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT current_revision_id FROM artifacts WHERE id = ?",
+      )
+        .bind("legacy-adoption-one")
+        .first(),
+    ).toEqual({ current_revision_id: "legacy-adoption-revision-2" });
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM revisions WHERE artifact_id = ?",
+      )
+        .bind("legacy-adoption-one")
+        .first<{ count: number }>(),
+    ).toEqual({ count: 2 });
+    expect(
+      await env.DB.prepare("SELECT 1 FROM legacy_shares WHERE artifact_id = ?")
+        .bind("legacy-adoption-one")
+        .first(),
+    ).not.toBeNull();
+
+    const reused = await api(
+      "/api/adopt/legacy/legacy-adoption-one",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          code: issued.code,
+          localProjectId: "other-project",
+          localArtifactId: "other-artifact",
+          slug: "other-artifact",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(reused.status).toBe(403);
+
+    const changedSlug = await api(
+      "/api/adopt/legacy/legacy-adoption-one",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          code: issued.code,
+          localProjectId: "local-project-adopted",
+          localArtifactId: "local-artifact-adopted",
+          slug: "changed-artifact",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(changedSlug.status).toBe(403);
+  });
+
   it("issues one-time hashed reconnect codes with a bounded TTL and replaces only the Owner credential", async () => {
     const material = await accessMaterial("reconnect");
     stubJwks(material);
@@ -453,6 +843,172 @@ describe("authenticated cloud inventory", () => {
     expect(concurrentResults.some((result) => result.status !== 200)).toBe(
       true,
     );
+  });
+
+  it("deletes adopted cloud provenance with the confirmed cloud Artifact", async () => {
+    await seedInventory();
+    await env.DB.prepare(
+      `INSERT INTO legacy_adoption_provenance
+        (grant_id, cloud_artifact_id, local_project_id, local_artifact_id,
+         local_slug, legacy_artifact_id, legacy_revision_id,
+         legacy_revision_version, legacy_title, legacy_type, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        "adoption-grant-cloud-delete",
+        "cloud-artifact-one",
+        "local-project-one",
+        "local-artifact-one",
+        "inventory-one",
+        "legacy-source-one",
+        "legacy-source-revision-one",
+        1,
+        "Legacy source",
+        "html",
+        "2026-08-29T12:00:00.000Z",
+      )
+      .run();
+    const response = await deleteInventoryArtifact(
+      new Request(`${ORIGIN}/api/inventory/artifacts/cloud-artifact-one`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirmation: cloudDeletionConfirmation("Inventory one"),
+        }),
+      }),
+      accessEnv(await accessMaterial("cloud-delete")),
+      "cloud-artifact-one",
+    );
+    expect(response.status).toBe(204);
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 FROM legacy_adoption_provenance WHERE cloud_artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first(),
+    ).toBeNull();
+  });
+
+  it("preserves completed provenance while revoking only unconsumed Legacy grants", async () => {
+    const originalId = "legacy-adoption-preserve";
+    const originalRevisionId = "legacy-adoption-preserve-revision";
+    const now = "2026-08-29T12:00:00.000Z";
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO artifacts (id, owner_token_hash, workspace_token_hash, opencode_session_id, title, type, current_revision_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).bind(
+        originalId,
+        "a".repeat(64),
+        "b".repeat(64),
+        "preserve-session",
+        "Preserve me",
+        "html",
+        originalRevisionId,
+        now,
+        now,
+      ),
+      env.DB.prepare(
+        "INSERT INTO revisions (id, artifact_id, version, source, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).bind(originalRevisionId, originalId, 1, "<h1>preserve</h1>", now),
+      env.DB.prepare(
+        "INSERT INTO legacy_artifacts (artifact_id, migrated_at, private_expires_at) VALUES (?, ?, ?)",
+      ).bind(originalId, now, "2099-08-29T12:00:00.000Z"),
+      env.DB.prepare(
+        `INSERT INTO legacy_adoption_grants
+          (id, legacy_artifact_id, legacy_revision_id, legacy_revision_version,
+           legacy_title, legacy_type, code_hash, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        "adoption-grant-unconsumed",
+        originalId,
+        originalRevisionId,
+        1,
+        "Preserve me",
+        "html",
+        "1".repeat(64),
+        now,
+        "2099-08-29T12:00:00.000Z",
+      ),
+      env.DB.prepare(
+        `INSERT INTO legacy_adoption_grants
+          (id, legacy_artifact_id, legacy_revision_id, legacy_revision_version,
+           legacy_title, legacy_type, code_hash, created_at, expires_at,
+           consumed_at, local_project_id, local_artifact_id, local_slug)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        "adoption-grant-consumed",
+        originalId,
+        originalRevisionId,
+        1,
+        "Preserve me",
+        "html",
+        "2".repeat(64),
+        now,
+        "2099-08-29T12:00:00.000Z",
+        now,
+        "local-project-preserve",
+        "local-artifact-preserve",
+        "preserved-artifact",
+      ),
+      env.DB.prepare(
+        `INSERT INTO legacy_adoption_provenance
+          (grant_id, cloud_artifact_id, local_project_id, local_artifact_id,
+           local_slug, legacy_artifact_id, legacy_revision_id,
+           legacy_revision_version, legacy_title, legacy_type, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        "adoption-grant-consumed",
+        "cloud-artifact-preserved",
+        "local-project-preserve",
+        "local-artifact-preserve",
+        "preserved-artifact",
+        originalId,
+        originalRevisionId,
+        1,
+        "Preserve me",
+        "html",
+        now,
+      ),
+    ]);
+
+    const response = await deleteLegacyInventoryArtifact(
+      new Request(`${ORIGIN}/api/inventory/legacy/artifacts/${originalId}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirmation: cloudDeletionConfirmation("Preserve me"),
+        }),
+      }),
+      env,
+      originalId,
+    );
+    expect(response.status).toBe(204);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM artifacts WHERE id = ?")
+        .bind(originalId)
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT revoked_at FROM legacy_adoption_grants WHERE id = ?",
+      )
+        .bind("adoption-grant-unconsumed")
+        .first<{ revoked_at: string | null }>(),
+    ).toMatchObject({ revoked_at: expect.any(String) });
+    expect(
+      await env.DB.prepare(
+        "SELECT revoked_at FROM legacy_adoption_grants WHERE id = ?",
+      )
+        .bind("adoption-grant-consumed")
+        .first<{ revoked_at: string | null }>(),
+    ).toEqual({ revoked_at: null });
+    expect(
+      await env.DB.prepare(
+        "SELECT local_slug FROM legacy_adoption_provenance WHERE cloud_artifact_id = ?",
+      )
+        .bind("cloud-artifact-preserved")
+        .first<{ local_slug: string }>(),
+    ).toEqual({ local_slug: "preserved-artifact" });
   });
 
   it("rejects recovery confirmation and deleting Artifacts without disclosing metadata", async () => {

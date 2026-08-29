@@ -36,6 +36,8 @@ export const DEFAULT_PUBLICATION_DURATION = 7;
 export const SYNC_STATES = ["pending", "syncing", "synced", "failed"] as const;
 export const RECONNECT_CODE_TTL_MS = 10 * 60 * 1000;
 export const RECONNECT_CODE_PREFIX = "panes-reconnect-";
+export const LEGACY_ADOPTION_CODE_TTL_MS = 5 * 60 * 1000;
+export const LEGACY_ADOPTION_CODE_PREFIX = "panes-adopt-legacy-";
 
 export const artifactTypeSchema = z.enum(ARTIFACT_TYPES);
 
@@ -159,6 +161,11 @@ export const requestedOriginsSchema = originListSchema();
 export const approvedOriginsSchema = originListSchema();
 export const httpOriginSchema = originValueSchema;
 
+export const legacyAdoptionCodeSchema = z
+  .string()
+  .length(LEGACY_ADOPTION_CODE_PREFIX.length + 32)
+  .regex(new RegExp(`^${LEGACY_ADOPTION_CODE_PREFIX}[a-f0-9]{32}$`, "u"));
+
 const normalizedPathCollisionKey = (path: string) =>
   path
     .normalize("NFC")
@@ -226,6 +233,50 @@ export const artifactSlugSchema = z
   .max(MAX_ARTIFACT_SLUG_LENGTH)
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u);
 export const revisionNumberSchema = versionSchema;
+
+export const legacyAdoptionProvenanceSchema = z.strictObject({
+  grantId: identifierSchema,
+  localProjectId: artifactIdSchema,
+  localArtifactId: artifactIdSchema,
+  localSlug: artifactSlugSchema,
+  legacyArtifactId: artifactIdSchema,
+  legacyRevisionId: revisionIdSchema,
+  legacyRevisionVersion: revisionNumberSchema,
+  legacyTitle: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
+  legacyType: artifactTypeSchema,
+});
+
+export const legacyAdoptionIssueResponseSchema = z.strictObject({
+  operation: z.literal("adoption-code-issued"),
+  artifactId: artifactIdSchema,
+  code: legacyAdoptionCodeSchema,
+  expiresAt: timestampSchema,
+  source: z.strictObject({
+    title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
+    type: artifactTypeSchema,
+    revisionVersion: revisionNumberSchema,
+  }),
+});
+
+export const legacyAdoptionRedeemRequestSchema = z.strictObject({
+  apiOrigin: httpOriginSchema,
+  code: legacyAdoptionCodeSchema,
+  localProjectId: artifactIdSchema,
+  localArtifactId: artifactIdSchema,
+  slug: artifactSlugSchema,
+});
+
+export const legacyAdoptionRedeemResponseSchema = z.strictObject({
+  operation: z.literal("legacy-adopted"),
+  apiOrigin: httpOriginSchema,
+  localProjectId: artifactIdSchema,
+  localArtifactId: artifactIdSchema,
+  slug: artifactSlugSchema,
+  title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
+  type: artifactTypeSchema,
+  source: z.string(),
+  provenance: legacyAdoptionProvenanceSchema,
+});
 
 const previewEntryBaseSchema = z.strictObject({
   entryPath: relativePathSchema,
@@ -326,6 +377,7 @@ export const artifactManifestSchema = z
     kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).optional(),
     revisions: z.array(finalizedRevisionSchema),
     cloud: cloudArtifactMappingSchema.optional(),
+    legacyProvenance: legacyAdoptionProvenanceSchema.optional(),
   })
   .superRefine((manifest, context) => {
     for (const [index, revision] of manifest.revisions.entries()) {
@@ -411,6 +463,7 @@ export const cloudManifestSchema = z.strictObject({
   title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
   kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).optional(),
   revisions: z.array(finalizedRevisionSchema),
+  legacyProvenance: legacyAdoptionProvenanceSchema.optional(),
 });
 
 export const cloudManifestSelectionSchema = z.strictObject({
@@ -440,6 +493,7 @@ export const syncCreateRequestSchema = z.strictObject({
   idempotencyKey: z.string().min(1).max(256),
   ownerCredential: ownerTokenSchema,
   creatorToken: ownerTokenSchema,
+  legacyProvenance: legacyAdoptionProvenanceSchema.optional(),
 });
 
 export const syncCreateResponseSchema = z.strictObject({
@@ -478,6 +532,7 @@ export const creatorWorkspaceResponseSchema = z.strictObject({
   slug: artifactSlugSchema,
   title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
   kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).optional(),
+  legacyProvenance: legacyAdoptionProvenanceSchema.optional(),
   creatorExpiresAt: timestampSchema,
   revisions: z.array(creatorWorkspaceRevisionSchema),
   publication: publicationSchema.nullable().optional(),
@@ -554,6 +609,7 @@ export const inventoryArtifactSchema = z.strictObject({
   publication: inventoryPublicationSchema,
   revisions: z.array(inventoryRevisionSchema),
   warnings: z.array(z.string().min(1).max(256)),
+  legacyProvenance: legacyAdoptionProvenanceSchema.optional(),
 });
 
 export const inventoryProjectSchema = z.strictObject({
@@ -708,6 +764,18 @@ export type InventoryLegacyArtifact = z.infer<
   typeof inventoryLegacyArtifactSchema
 >;
 export type InventoryResponse = z.infer<typeof inventoryResponseSchema>;
+export type LegacyAdoptionProvenance = z.infer<
+  typeof legacyAdoptionProvenanceSchema
+>;
+export type LegacyAdoptionIssueResponse = z.infer<
+  typeof legacyAdoptionIssueResponseSchema
+>;
+export type LegacyAdoptionRedeemRequest = z.infer<
+  typeof legacyAdoptionRedeemRequestSchema
+>;
+export type LegacyAdoptionRedeemResponse = z.infer<
+  typeof legacyAdoptionRedeemResponseSchema
+>;
 export type InventoryCreatorRotateResponse = z.infer<
   typeof inventoryCreatorRotateResponseSchema
 >;
@@ -773,6 +841,9 @@ export const deriveCloudManifest = (
     slug: canonicalManifest.slug,
     title: canonicalManifest.title,
     ...(canonicalManifest.kind ? { kind: canonicalManifest.kind } : {}),
+    ...(canonicalManifest.legacyProvenance
+      ? { legacyProvenance: canonicalManifest.legacyProvenance }
+      : {}),
     revisions,
   });
 };

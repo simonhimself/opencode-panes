@@ -25,6 +25,12 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 9. Panes stores an immutable revision and refreshes the creator view.
 10. The creator can copy, download, or publish a selected revision.
 
+Legacy adoption is an explicit inventory-to-plugin handoff. The creator issues a
+short-lived, single-use adoption code for the current Legacy Revision, then the
+plugin redeems it into a project-local finalized v1 without changing source
+bytes. The original Legacy history stays separate and read-only. The first
+local-first Sync creates a new cloud identity and records the Legacy provenance.
+
 Legacy compatibility is bounded. The legacy `artifact` route may create one v1
 cloud artifact for pre-Ticket-20 compatibility, but it immediately classifies
 that artifact as Legacy. Legacy reads remain available through their expiry;
@@ -74,6 +80,7 @@ New iteration uses the local-first workflow above.
 - [x] Document project and global installation
 - [x] Bundle and install a global plugin file with no repository dependency
 - [x] Recover a lost Owner credential with an authenticated, short-lived, single-use reconnect code
+- [x] Adopt a Legacy Revision into a project-local finalized v1 with retry-safe provenance
 
 ## OpenCode Plugin Contract
 

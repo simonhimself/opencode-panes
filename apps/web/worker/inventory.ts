@@ -10,6 +10,7 @@ import {
   syncCreatorRotateRequestSchema,
   type InventoryResponse,
   type InventoryLegacyArtifact,
+  legacyAdoptionProvenanceSchema,
 } from "@opencode-panes/contracts";
 import { decryptPublicationToken } from "./publication";
 import {
@@ -44,6 +45,7 @@ interface InventoryRow {
   publication_token_nonce: string | null;
   publication_encryption_key_version: number | null;
   revision_metadata: string | null;
+  legacy_provenance: string | null;
 }
 
 interface PublicationCiphertext {
@@ -170,10 +172,23 @@ export async function loadInventory(
          WHERE latest.artifact_id = a.cloud_artifact_id
          ORDER BY latest.created_at DESC
          LIMIT 1
-       ) AS publication_encryption_key_version
-     FROM sync_artifacts a
-     LEFT JOIN local_revisions r ON r.artifact_id = a.cloud_artifact_id
-     LEFT JOIN revision_files f ON f.revision_id = r.id
+        ) AS publication_encryption_key_version
+         ,CASE WHEN adoption.grant_id IS NULL THEN NULL ELSE json_object(
+           'grantId', adoption.grant_id,
+           'localProjectId', adoption.local_project_id,
+           'localArtifactId', adoption.local_artifact_id,
+           'localSlug', adoption.local_slug,
+           'legacyArtifactId', adoption.legacy_artifact_id,
+          'legacyRevisionId', adoption.legacy_revision_id,
+          'legacyRevisionVersion', adoption.legacy_revision_version,
+          'legacyTitle', adoption.legacy_title,
+          'legacyType', adoption.legacy_type
+        ) END AS legacy_provenance
+      FROM sync_artifacts a
+      LEFT JOIN local_revisions r ON r.artifact_id = a.cloud_artifact_id
+      LEFT JOIN revision_files f ON f.revision_id = r.id
+      LEFT JOIN legacy_adoption_provenance adoption
+        ON adoption.cloud_artifact_id = a.cloud_artifact_id
       GROUP BY a.cloud_project_id, a.cloud_artifact_id, a.slug, a.title, a.kind,
         a.lifecycle_state
      ORDER BY a.cloud_project_id ASC, a.slug ASC`,
@@ -235,6 +250,13 @@ export async function loadInventory(
           }>)
         : [],
       warnings,
+      ...(row.legacy_provenance
+        ? {
+            legacyProvenance: legacyAdoptionProvenanceSchema.parse(
+              JSON.parse(row.legacy_provenance),
+            ),
+          }
+        : {}),
     });
   }
 
