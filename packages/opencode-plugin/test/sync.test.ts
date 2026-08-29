@@ -29,6 +29,7 @@ let project: string;
 let stateHome: string;
 let server: ReturnType<typeof createServer>;
 let apiOrigin: string;
+let verifiedProbe: boolean;
 let requests: Array<{
   method: string;
   path: string;
@@ -40,6 +41,7 @@ beforeEach(async () => {
   project = await mkdtemp(join(tmpdir(), "opencode-panes-sync-project-"));
   stateHome = await mkdtemp(join(tmpdir(), "opencode-panes-sync-state-"));
   requests = [];
+  verifiedProbe = false;
   vi.stubEnv("XDG_STATE_HOME", stateHome);
   server = createServer(
     (request, response) => void handleRequest(request, response),
@@ -62,6 +64,65 @@ afterEach(async () => {
 });
 
 describe("artifact_sync tool", () => {
+  it.each([
+    "sync-after-checkpoint",
+    "sync-after-create",
+    "sync-after-ownership",
+    "sync-after-mapping",
+  ])("recovers the same identity after %s", async (phase) => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Checkpoint matrix", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    await expect(
+      executeSync({ artifactId: prepared.artifactId }, context, {
+        failureInjector: (failurePhase) => {
+          if (failurePhase === phase) throw new Error("simulated crash");
+        },
+      }),
+    ).rejects.toThrow("simulated crash");
+    requests = [];
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    const creations = requests.filter(
+      ({ path }) => path === "/api/sync/artifacts",
+    );
+    expect(creations).toHaveLength(
+      phase === "sync-after-checkpoint" || phase === "sync-after-create"
+        ? 1
+        : 0,
+    );
+  });
+
+  it("does not send bytes when the Worker verifies a matching temporary upload", async () => {
+    verifiedProbe = true;
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Verified resume", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    expect(requests.filter(({ method }) => method === "HEAD")).not.toHaveLength(
+      0,
+    );
+    expect(requests.filter(({ method }) => method === "PUT")).toHaveLength(0);
+  });
+
+  it("passes explicit Creator-link rotation through the registered Sync tool", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Rotate Creator", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    const result = await executeSync(
+      { artifactId: prepared.artifactId, rotateCreatorLink: true },
+      context,
+    );
+    expect(String(resultMetadata(result).creatorUrl)).toContain(
+      "/creator/creator-rotated",
+    );
+    expect(
+      requests.filter(({ path }) => path.endsWith("/creator/rotate")),
+    ).toHaveLength(1);
+  });
+
   it("uploads every finalized Revision, commits exact bytes, and reports complete history", async () => {
     const context = toolContext();
     const first = await prepareAndFinalize(context, "Sync me", {
@@ -479,6 +540,24 @@ async function handleRequest(
         creatorUrl: `${apiOrigin}/creator/${encodeURIComponent(payload.creatorToken)}`,
         inventoryUrl: `${apiOrigin}/inventory`,
         creatorExpiresAt: "2026-09-28T12:00:00.000Z",
+      }),
+    );
+    return;
+  }
+  if (request.method === "HEAD") {
+    if (verifiedProbe) response.setHeader("x-panes-upload-verified", "true");
+    response.statusCode = 204;
+    response.end();
+    return;
+  }
+  if (path.endsWith("/creator/rotate")) {
+    response.statusCode = 200;
+    response.end(
+      JSON.stringify({
+        cloudArtifactId: "cloud-artifact-1",
+        creatorToken: "creator-rotated",
+        creatorUrl: `${apiOrigin}/creator/creator-rotated`,
+        creatorExpiresAt: "2026-10-28T12:00:00.000Z",
       }),
     );
     return;

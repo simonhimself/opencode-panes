@@ -5,8 +5,16 @@ import {
   syncCreateResponseSchema,
   syncRevisionCommitResponseSchema,
 } from "@opencode-panes/contracts";
-import { SELF, env } from "cloudflare:test";
+import {
+  SELF,
+  createExecutionContext,
+  createScheduledController,
+  env,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+
+import worker from "../worker/index";
 
 const ORIGIN = "https://panes.example";
 const PROJECT_ID = "project-sync-test";
@@ -31,6 +39,257 @@ async function api(path: string, init?: RequestInit) {
 }
 
 describe("first private Sync Worker HTTP seam", () => {
+  it("reuses valid Creator links, rotates explicitly, and distinguishes 404 from 410", async () => {
+    const create = await api(
+      "/api/sync/artifacts",
+      jsonRequest(
+        {
+          projectId: "project-creator-lifecycle",
+          artifactId: "artifact-creator-lifecycle",
+          slug: "creator-lifecycle",
+          title: "Creator lifecycle",
+          idempotencyKey: "creator-lifecycle-1",
+          ownerCredential: "owner-creator-lifecycle",
+          creatorToken: "creator-creator-lifecycle",
+        },
+        undefined,
+        { "X-Panes-Sync-Session": "creator-rotation-session" },
+      ),
+    );
+    const first = syncCreateResponseSchema.parse(await create.json());
+    const token = first.creatorUrl.split("/").at(-1);
+    expect(token).toBe("creator-creator-lifecycle");
+    const active = await api(`/api/creator/${token}`);
+    expect(active.status).toBe(200);
+    expect(active.headers.get("Cache-Control")).toBe("no-store");
+    expect(active.headers.get("Referrer-Policy")).toBe("no-referrer");
+
+    const replay = syncCreateResponseSchema.parse(
+      await (
+        await api(
+          "/api/sync/artifacts",
+          jsonRequest(
+            {
+              projectId: "project-creator-lifecycle",
+              artifactId: "artifact-creator-lifecycle",
+              slug: "creator-lifecycle",
+              title: "Creator lifecycle",
+              idempotencyKey: "creator-lifecycle-1",
+              ownerCredential: "owner-creator-lifecycle",
+              creatorToken: "creator-creator-lifecycle",
+            },
+            undefined,
+            { "X-Panes-Sync-Session": "creator-rotation-session" },
+          ),
+        )
+      ).json(),
+    );
+    expect(replay.creatorExpiresAt).toBe(first.creatorExpiresAt);
+
+    const rotated = await api(
+      `/api/sync/artifacts/${first.cloudArtifactId}/creator/rotate`,
+      jsonRequest({}, "owner-creator-lifecycle", {
+        "X-Panes-Sync-Session": "creator-rotation-session",
+      }),
+    );
+    expect(rotated.status).toBe(200);
+    const rotatedBody = (await rotated.json()) as {
+      creatorToken: string;
+      creatorExpiresAt: string;
+    };
+    expect(rotatedBody.creatorToken).not.toBe(token);
+    expect(Date.parse(rotatedBody.creatorExpiresAt)).toBeGreaterThan(
+      Date.parse(first.creatorExpiresAt),
+    );
+    expect((await api(`/api/creator/${token}`)).status).toBe(410);
+    expect(
+      (
+        await api(`/api/creator/${token}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        })
+      ).status,
+    ).toBe(410);
+    expect((await api(`/api/creator/${rotatedBody.creatorToken}`)).status).toBe(
+      200,
+    );
+    await env.DB.prepare(
+      "UPDATE creator_links SET expires_at = ? WHERE artifact_id = ? AND revoked_at IS NULL",
+    )
+      .bind("2020-01-01T00:00:00.000Z", first.cloudArtifactId)
+      .run();
+    expect((await api(`/api/creator/${rotatedBody.creatorToken}`)).status).toBe(
+      410,
+    );
+    expect((await api("/api/creator/unknown-creator-token")).status).toBe(404);
+  });
+
+  it("tracks temporary uploads, skips matching retries, and serializes sessions", async () => {
+    const create = await api(
+      "/api/sync/artifacts",
+      jsonRequest(
+        {
+          projectId: "project-temp-upload",
+          artifactId: "artifact-temp-upload",
+          slug: "temp-upload",
+          title: "Temporary upload",
+          idempotencyKey: "temp-upload-1",
+          ownerCredential: "owner-temp-upload",
+          creatorToken: "creator-temp-upload",
+        },
+        undefined,
+        { "X-Panes-Sync-Session": "session-one" },
+      ),
+    );
+    const artifact = syncCreateResponseSchema.parse(await create.json());
+    const bytes = new TextEncoder().encode("temporary");
+    const hash = await sha256(bytes);
+    const path = `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/files/index.html`;
+    expect(
+      (
+        await uploadFileWithSession(
+          path,
+          bytes,
+          "text/html",
+          "owner-temp-upload",
+          "session-one",
+        )
+      ).status,
+    ).toBe(204);
+    const matching = await api(path, {
+      method: "HEAD",
+      headers: {
+        Authorization: "Bearer owner-temp-upload",
+        "Content-Type": "text/html",
+        "X-Panes-File-SHA256": hash,
+        "X-Panes-File-Byte-Size": String(bytes.byteLength),
+        "X-Panes-Sync-Session": "session-one",
+      },
+    });
+    expect(matching.status).toBe(204);
+    expect(matching.headers.get("X-Panes-Upload-Verified")).toBe("true");
+    expect(
+      (
+        await uploadFileWithSession(
+          path,
+          new TextEncoder().encode("different"),
+          "text/html",
+          "owner-temp-upload",
+          "session-one",
+        )
+      ).status,
+    ).toBe(409);
+    const blocked = await uploadFileWithSession(
+      path,
+      bytes,
+      "text/html",
+      "owner-temp-upload",
+      "session-two",
+    );
+    expect(blocked.status).toBe(409);
+  });
+
+  it("runs bounded scheduled cleanup without deleting committed references", async () => {
+    const create = await api(
+      "/api/sync/artifacts",
+      jsonRequest({
+        projectId: "project-cleanup",
+        artifactId: "artifact-cleanup",
+        slug: "cleanup",
+        title: "Cleanup",
+        idempotencyKey: "cleanup-1",
+        ownerCredential: "owner-cleanup",
+        creatorToken: "creator-cleanup",
+      }),
+    );
+    const artifact = syncCreateResponseSchema.parse(await create.json());
+    const bytes = new TextEncoder().encode("orphan");
+    const uploaded = await uploadFile(
+      artifact.cloudArtifactId,
+      1,
+      "index.html",
+      bytes,
+      "text/html",
+      "owner-cleanup",
+    );
+    expect(uploaded.status).toBe(204);
+    const referencedUpload = await uploadFile(
+      artifact.cloudArtifactId,
+      1,
+      "keep.html",
+      new TextEncoder().encode("keep"),
+      "text/html",
+      "owner-cleanup",
+    );
+    expect(referencedUpload.status).toBe(204);
+    const uploadRows = await env.DB.prepare(
+      "SELECT path, object_key FROM sync_uploads WHERE artifact_id = ? ORDER BY path",
+    )
+      .bind(artifact.cloudArtifactId)
+      .all<{ path: string; object_key: string }>();
+    const keepRow = uploadRows.results.find((row) => row.path === "keep.html");
+    const orphanRow = uploadRows.results.find(
+      (row) => row.path === "index.html",
+    );
+    if (!keepRow) throw new Error("expected tracked keep upload");
+    if (!orphanRow) throw new Error("expected tracked orphan upload");
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO local_revisions
+          (id, artifact_id, version, preview_entry, approved_origins,
+           created_at, committed_at, cloud_manifest_key)
+         VALUES (?, ?, 1, ?, ?, ?, ?, ?)`,
+      ).bind(
+        "cleanup-committed-revision",
+        artifact.cloudArtifactId,
+        JSON.stringify({ adapter: "browser", entryPath: "keep.html" }),
+        "[]",
+        "2020-01-01T00:00:00.000Z",
+        "2020-01-01T00:00:00.000Z",
+        "private/manifests/cleanup.json",
+      ),
+      env.DB.prepare(
+        `INSERT INTO revision_files
+          (revision_id, path, sha256, byte_size, media_type, object_key)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        "cleanup-committed-revision",
+        "keep.html",
+        await sha256(new TextEncoder().encode("keep")),
+        4,
+        "text/html",
+        keepRow.object_key,
+      ),
+      env.DB.prepare(
+        "UPDATE sync_uploads SET created_at = ? WHERE artifact_id = ?",
+      ).bind("2020-01-01T00:00:00.000Z", artifact.cloudArtifactId),
+    ]);
+    const executionContext = createExecutionContext();
+    await worker.scheduled(
+      createScheduledController({
+        scheduledTime: Date.parse("2026-08-29T12:00:00.000Z"),
+      }),
+      env,
+      executionContext,
+    );
+    await waitOnExecutionContext(executionContext);
+    const row = await env.DB.prepare(
+      "SELECT object_key FROM sync_uploads WHERE artifact_id = ? AND path = ?",
+    )
+      .bind(artifact.cloudArtifactId, "index.html")
+      .first<{ object_key: string }>();
+    expect(row).toBeNull();
+    expect(await env.PRIVATE_ARTIFACTS.head(orphanRow.object_key)).toBeNull();
+    const kept = await env.DB.prepare(
+      "SELECT object_key FROM sync_uploads WHERE artifact_id = ? AND path = ?",
+    )
+      .bind(artifact.cloudArtifactId, "keep.html")
+      .first<{ object_key: string }>();
+    expect(kept?.object_key).toBe(keepRow.object_key);
+    expect(await env.PRIVATE_ARTIFACTS.head(keepRow.object_key)).not.toBeNull();
+  });
+
   it("commits complete history one Revision at a time and retrieves each committed Revision", async () => {
     const create = await api(
       "/api/sync/artifacts",
@@ -410,6 +669,26 @@ async function uploadFile(
       body: bytes.buffer as ArrayBuffer,
     },
   );
+}
+
+async function uploadFileWithSession(
+  path: string,
+  bytes: Uint8Array,
+  mediaType: string,
+  token: string,
+  session: string,
+) {
+  return api(path, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": mediaType,
+      "X-Panes-File-SHA256": await sha256(bytes),
+      "X-Panes-File-Byte-Size": String(bytes.byteLength),
+      "X-Panes-Sync-Session": session,
+    },
+    body: bytes.buffer as ArrayBuffer,
+  });
 }
 
 async function sha256(bytes: Uint8Array) {

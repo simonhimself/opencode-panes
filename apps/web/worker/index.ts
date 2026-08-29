@@ -17,7 +17,7 @@ import {
   type ErrorIssue,
   type Revision,
 } from "@opencode-panes/contracts";
-import { routeSyncRequest } from "./sync";
+import { cleanupTemporarySyncUploads, routeSyncRequest } from "./sync";
 
 // JSON can encode one UTF-8 source byte as a six-byte Unicode escape.
 export const MAX_JSON_BODY_BYTES = MAX_ARTIFACT_SOURCE_BYTES * 6 + 16 * 1024;
@@ -97,6 +97,13 @@ export default {
         errorResponse(500, "INTERNAL_ERROR", "An internal error occurred"),
       );
     }
+  },
+  async scheduled(
+    controller: ScheduledController,
+    env: Env,
+    _ctx: ExecutionContext,
+  ): Promise<void> {
+    await cleanupTemporarySyncUploads(env, new Date(controller.scheduledTime));
   },
 } satisfies ExportedHandler<Env>;
 
@@ -877,6 +884,13 @@ export function logUnexpectedError(request: Request, error: unknown): void {
 function routeTemplate(pathname: string): string {
   if (pathname === "/api/artifacts") return "/api/artifacts";
   if (pathname === "/api/sync/artifacts") return "/api/sync/artifacts";
+  if (/^\/api\/creator\/[^/]+$/.test(pathname)) return "/api/creator/:token";
+  if (/^\/api\/sync\/artifacts\/[^/]+\/creator\/rotate$/u.test(pathname)) {
+    return "/api/sync/artifacts/:artifactId/creator/rotate";
+  }
+  if (/^\/api\/sync\/artifacts\/[^/]+\/lease\/release$/u.test(pathname)) {
+    return "/api/sync/artifacts/:artifactId/lease/release";
+  }
   if (
     /^\/api\/sync\/artifacts\/[^/]+\/revisions\/\d+\/files\/.+$/u.test(pathname)
   ) {

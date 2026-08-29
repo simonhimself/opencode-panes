@@ -9,22 +9,24 @@ import {
   cloudManifestSchema,
   syncRevisionCommitRequestSchema,
   syncRevisionCommitResponseSchema,
+  syncCreatorRotateRequestSchema,
+  syncCreatorRotateResponseSchema,
   type ApiErrorCode,
   type CloudManifest,
   type ErrorIssue,
 } from "@opencode-panes/contracts";
 
-import {
-  getCommittedRevisionFile,
-  putPrivateRevisionFile,
-  privateRevisionObjectKey,
-} from "./storage";
+import { getCommittedRevisionFile, privateRevisionObjectKey } from "./storage";
 
 const SYNC_CREATE_KEY_HEADER = "X-Panes-Create-Key";
 const FILE_HASH_HEADER = "X-Panes-File-SHA256";
 const FILE_SIZE_HEADER = "X-Panes-File-Byte-Size";
+const SYNC_SESSION_HEADER = "X-Panes-Sync-Session";
 const SYNC_BODY_LIMIT = 16 * 1024 * 1024;
 const CREATOR_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SYNC_LEASE_TTL_MS = 60 * 1000;
+export const TEMP_UPLOAD_GRACE_MS = 24 * 60 * 60 * 1000;
+const CLEANUP_BATCH_SIZE = 100;
 const JSON_HEADERS = {
   "Cache-Control": "no-store",
   "Content-Type": "application/json; charset=utf-8",
@@ -43,6 +45,20 @@ interface SyncArtifactRow {
   creator_token_hash: string;
   creator_created_at: string;
   creator_expires_at: string;
+  sync_lease_owner?: string | null;
+  sync_lease_expires_at?: string | null;
+}
+
+interface SyncUploadRow {
+  artifact_id: string;
+  revision_version: number;
+  session_id: string;
+  path: string;
+  expected_sha256: string;
+  expected_byte_size: number;
+  expected_media_type: string;
+  object_key: string;
+  created_at: string;
 }
 
 interface CommittedRevisionRow {
@@ -72,6 +88,34 @@ export async function routeSyncRequest(
     return createSyncArtifact(request, env);
   }
 
+  const creatorMatch = pathname.match(/^\/api\/creator\/([^/]+)$/u);
+  if (creatorMatch) {
+    const token = decodePathSegment(creatorMatch[1]);
+    if (!token || !ownerTokenSchema.safeParse(token).success)
+      return errorResponse(404, "NOT_FOUND", "Creator link not found");
+    return readCreatorCapability(request, env, token);
+  }
+
+  const rotateMatch = pathname.match(
+    /^\/api\/sync\/artifacts\/([^/]+)\/creator\/rotate$/u,
+  );
+  if (rotateMatch) {
+    const artifactId = parseArtifactId(rotateMatch[1]);
+    if (artifactId instanceof Response) return artifactId;
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    return rotateCreatorLink(request, env, artifactId);
+  }
+
+  const releaseMatch = pathname.match(
+    /^\/api\/sync\/artifacts\/([^/]+)\/lease\/release$/u,
+  );
+  if (releaseMatch) {
+    const artifactId = parseArtifactId(releaseMatch[1]);
+    if (artifactId instanceof Response) return artifactId;
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    return releaseSyncLease(request, env.DB, artifactId);
+  }
+
   const fileMatch = pathname.match(
     /^\/api\/sync\/artifacts\/([^/]+)\/revisions\/(\d+)\/files\/(.+)$/u,
   );
@@ -83,13 +127,13 @@ export async function routeSyncRequest(
     if (version instanceof Response) return version;
     if (!path)
       return errorResponse(400, "VALIDATION_ERROR", "File path is invalid");
-    if (request.method === "PUT") {
+    if (request.method === "PUT" || request.method === "HEAD") {
       return uploadSyncFile(request, env, artifactId, version, path);
     }
     if (request.method === "GET") {
       return readSyncFile(request, env, artifactId, version, path);
     }
-    return methodNotAllowed(["GET", "PUT"]);
+    return methodNotAllowed(["GET", "HEAD", "PUT"]);
   }
 
   const commitMatch = pathname.match(
@@ -141,6 +185,12 @@ async function createSyncArtifact(
         "The Sync creation idempotency key already belongs to different content",
       );
     }
+    const leaseError = await acquireSyncLease(
+      request,
+      env.DB,
+      existing.cloud_artifact_id,
+    );
+    if (leaseError) return leaseError;
     return syncCreateResponse(
       request,
       existing,
@@ -181,8 +231,9 @@ async function createSyncArtifact(
           (cloud_artifact_id, cloud_project_id, local_project_id,
            local_artifact_id, slug, title, kind, owner_token_hash,
            creation_idempotency_key, creator_token_hash, creator_created_at,
-           creator_expires_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            creator_expires_at, created_at, updated_at,
+            sync_lease_owner, sync_lease_expires_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).bind(
         cloudArtifactId,
         cloudProjectId,
@@ -198,6 +249,19 @@ async function createSyncArtifact(
         expiresAt,
         createdAt,
         createdAt,
+        sessionId(request),
+        new Date(Date.now() + SYNC_LEASE_TTL_MS).toISOString(),
+      ),
+      env.DB.prepare(
+        `INSERT INTO creator_links
+          (id, artifact_id, token_hash, created_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).bind(
+        `creator_link_${cloudArtifactId}`,
+        cloudArtifactId,
+        creatorTokenHash,
+        createdAt,
+        expiresAt,
       ),
     ]);
   } catch (error) {
@@ -212,6 +276,12 @@ async function createSyncArtifact(
       .bind(body.data.idempotencyKey)
       .first<SyncArtifactRow>();
     if (replay && (await sameCreationRequest(replay, body.data))) {
+      const leaseError = await acquireSyncLease(
+        request,
+        env.DB,
+        replay.cloud_artifact_id,
+      );
+      if (leaseError) return leaseError;
       return syncCreateResponse(
         request,
         replay,
@@ -290,7 +360,7 @@ function syncCreateResponse(
     inventoryUrl: new URL("/inventory", request.url).toString(),
     creatorExpiresAt: row.creator_expires_at,
   });
-  return jsonResponse(response, status);
+  return jsonResponse(response, status, { "Referrer-Policy": "no-referrer" });
 }
 
 async function uploadSyncFile(
@@ -302,6 +372,8 @@ async function uploadSyncFile(
 ): Promise<Response> {
   const artifact = await authenticateSyncOwner(request, env.DB, artifactId);
   if (artifact instanceof Response) return artifact;
+  const leaseError = await acquireSyncLease(request, env.DB, artifactId);
+  if (leaseError) return leaseError;
   const path = relativePathSchema.safeParse(pathInput);
   if (!path.success)
     return errorResponse(400, "VALIDATION_ERROR", "File path is invalid");
@@ -313,11 +385,59 @@ async function uploadSyncFile(
     );
   }
 
+  const declaredSize = Number(request.headers.get(FILE_SIZE_HEADER));
+  const declaredHash = request.headers.get(FILE_HASH_HEADER) ?? "";
+  const mediaType =
+    request.headers.get("Content-Type") ?? "application/octet-stream";
+  const existing = await env.DB.prepare(
+    `SELECT artifact_id, revision_version, session_id, path,
+            expected_sha256, expected_byte_size, expected_media_type,
+            object_key, created_at
+       FROM sync_uploads
+      WHERE artifact_id = ? AND revision_version = ? AND path = ?`,
+  )
+    .bind(artifactId, version, path.data)
+    .first<SyncUploadRow>();
+  if (existing) {
+    const matches =
+      existing.expected_sha256 === declaredHash &&
+      existing.expected_byte_size === declaredSize &&
+      existing.expected_media_type === mediaType;
+    const object = matches
+      ? await env.PRIVATE_ARTIFACTS.head(existing.object_key)
+      : null;
+    if (
+      matches &&
+      object &&
+      object.size === declaredSize &&
+      object.customMetadata?.sha256 === declaredHash &&
+      object.customMetadata?.byteSize === String(declaredSize) &&
+      (object.httpMetadata?.contentType ?? "application/octet-stream") ===
+        mediaType
+    ) {
+      if (request.method === "HEAD") {
+        return new Response(null, {
+          status: 204,
+          headers: { "X-Panes-Upload-Verified": "true" },
+        });
+      }
+      return new Response(null, { status: 204 });
+    }
+    if (!matches || (request.method === "HEAD" && object)) {
+      return errorResponse(
+        409,
+        "CONFLICT",
+        "Revision file upload conflicts with existing content",
+      );
+    }
+  }
+  if (request.method === "HEAD") {
+    return errorResponse(404, "NOT_FOUND", "Temporary Revision file not found");
+  }
+
   const bytes = await readBoundedBody(request, MAX_REMOTE_FILE_BYTES);
   if (!bytes)
     return errorResponse(413, "FILE_TOO_LARGE", "Revision file is too large");
-  const declaredSize = Number(request.headers.get(FILE_SIZE_HEADER));
-  const declaredHash = request.headers.get(FILE_HASH_HEADER) ?? "";
   const actualHash = await hashBytes(bytes);
   if (
     !Number.isSafeInteger(declaredSize) ||
@@ -332,17 +452,52 @@ async function uploadSyncFile(
     );
   }
 
-  await putPrivateRevisionFile(env.PRIVATE_ARTIFACTS, {
-    projectId: artifact.cloud_project_id,
+  const objectKey = temporarySyncObjectKey(
+    artifact.cloud_project_id,
     artifactId,
-    revisionId: syncRevisionId(artifactId, version),
-    path: path.data,
-    bytes,
-    mediaType:
-      request.headers.get("Content-Type") ?? "application/octet-stream",
-    byteSize: declaredSize,
-    sha256: declaredHash,
+    version,
+    sessionId(request),
+    path.data,
+  );
+  await env.PRIVATE_ARTIFACTS.put(objectKey, bytes, {
+    httpMetadata: { contentType: mediaType },
+    customMetadata: {
+      sha256: declaredHash,
+      byteSize: String(declaredSize),
+      createdAt: new Date().toISOString(),
+      artifactId,
+      revisionVersion: String(version),
+      sessionId: sessionId(request),
+      path: path.data,
+    },
   });
+  const renewedLeaseError = await acquireSyncLease(request, env.DB, artifactId);
+  if (renewedLeaseError) return renewedLeaseError;
+  await env.DB.prepare(
+    `INSERT INTO sync_uploads
+      (artifact_id, revision_version, session_id, path, expected_sha256,
+       expected_byte_size, expected_media_type, object_key, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(artifact_id, revision_version, path) DO UPDATE SET
+       session_id = excluded.session_id,
+       expected_sha256 = excluded.expected_sha256,
+       expected_byte_size = excluded.expected_byte_size,
+       expected_media_type = excluded.expected_media_type,
+       object_key = excluded.object_key,
+       created_at = excluded.created_at`,
+  )
+    .bind(
+      artifactId,
+      version,
+      sessionId(request),
+      path.data,
+      declaredHash,
+      declaredSize,
+      mediaType,
+      objectKey,
+      new Date().toISOString(),
+    )
+    .run();
   return new Response(null, { status: 204 });
 }
 
@@ -354,6 +509,8 @@ async function commitSyncRevision(
 ): Promise<Response> {
   const artifact = await authenticateSyncOwner(request, env.DB, artifactId);
   if (artifact instanceof Response) return artifact;
+  const leaseError = await acquireSyncLease(request, env.DB, artifactId);
+  if (leaseError) return leaseError;
   const body = await parseJsonBody(
     request,
     syncRevisionCommitRequestSchema,
@@ -509,13 +666,23 @@ async function commitSyncRevision(
     );
   }
 
-  const objectFiles = await verifyUploadedFiles(
-    env.PRIVATE_ARTIFACTS,
-    artifact.cloud_project_id,
-    artifactId,
-    version,
-    fileEntries,
-  );
+  let objectFiles: Awaited<ReturnType<typeof verifyUploadedFiles>>;
+  try {
+    objectFiles = await verifyUploadedFiles(
+      env.DB,
+      env.PRIVATE_ARTIFACTS,
+      artifact.cloud_project_id,
+      artifactId,
+      version,
+      fileEntries,
+    );
+  } catch {
+    return errorResponse(
+      409,
+      "CONFLICT",
+      "Uploaded Revision files do not match the cloud manifest",
+    );
+  }
   const committedAt = new Date().toISOString();
   const manifestKey = syncManifestKey(
     artifact.cloud_project_id,
@@ -540,12 +707,29 @@ async function commitSyncRevision(
       file.objectKey,
     ),
   );
-  await env.DB.batch([
+  const commitResults = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE sync_artifacts
+          SET sync_lease_expires_at = ?, updated_at = ?
+        WHERE cloud_artifact_id = ? AND sync_lease_owner = ?
+          AND sync_lease_expires_at > ?`,
+    ).bind(
+      new Date(Date.now() + SYNC_LEASE_TTL_MS).toISOString(),
+      new Date().toISOString(),
+      artifactId,
+      sessionId(request),
+      new Date().toISOString(),
+    ),
     env.DB.prepare(
       `INSERT INTO local_revisions
         (id, artifact_id, version, preview_entry, approved_origins,
-         created_at, committed_at, cloud_manifest_key)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          created_at, committed_at, cloud_manifest_key)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM sync_artifacts
+           WHERE cloud_artifact_id = ? AND sync_lease_owner = ?
+             AND sync_lease_expires_at > ?
+        )`,
     ).bind(
       revisionId,
       artifactId,
@@ -555,9 +739,42 @@ async function commitSyncRevision(
       revision.createdAt,
       committedAt,
       manifestKey,
+      artifactId,
+      sessionId(request),
+      new Date().toISOString(),
     ),
     ...fileStatements,
+    env.DB.prepare(
+      `DELETE FROM sync_uploads
+        WHERE artifact_id = ? AND revision_version = ?
+          AND EXISTS (
+            SELECT 1 FROM sync_artifacts
+             WHERE cloud_artifact_id = ? AND sync_lease_owner = ?
+               AND sync_lease_expires_at > ?
+          )`,
+    ).bind(
+      artifactId,
+      version,
+      artifactId,
+      sessionId(request),
+      new Date().toISOString(),
+    ),
   ]);
+  if (
+    commitResults[0]?.meta.changes !== 1 ||
+    commitResults[1]?.meta.changes !== 1
+  ) {
+    return errorResponse(
+      409,
+      "CONFLICT",
+      "Sync Artifact lease expired; retry the Sync session",
+    );
+  }
+  const temporaryKeys = objectFiles.flatMap((file) =>
+    file.temporaryObjectKey ? [file.temporaryObjectKey] : [],
+  );
+  if (temporaryKeys.length > 0)
+    await env.PRIVATE_ARTIFACTS.delete(temporaryKeys);
   return jsonResponse(
     syncRevisionCommitResponseSchema.parse({
       cloudArtifactId: artifactId,
@@ -597,6 +814,7 @@ function canonicalJson(value: unknown): string {
 }
 
 async function verifyUploadedFiles(
+  db: D1Database,
   bucket: R2Bucket,
   projectId: string,
   artifactId: string,
@@ -610,24 +828,59 @@ async function verifyUploadedFiles(
 ) {
   const result = [];
   for (const file of files) {
-    const objectKey = privateRevisionObjectKey(
+    const committedObjectKey = privateRevisionObjectKey(
       projectId,
       artifactId,
       syncRevisionId(artifactId, version),
       file.path,
     );
-    const object = await bucket.head(objectKey);
+    const upload = await db
+      .prepare(
+        `SELECT artifact_id, revision_version, session_id, path,
+                expected_sha256, expected_byte_size, expected_media_type,
+                object_key, created_at
+           FROM sync_uploads
+          WHERE artifact_id = ? AND revision_version = ? AND path = ?`,
+      )
+      .bind(artifactId, version, file.path)
+      .first<SyncUploadRow>();
+    const sourceObjectKey = upload?.object_key ?? committedObjectKey;
+    if (
+      upload &&
+      (upload.expected_sha256 !== file.sha256 ||
+        upload.expected_byte_size !== file.byteSize ||
+        upload.expected_media_type !== file.mediaType)
+    ) {
+      throw new Error("Revision file upload conflicts with the cloud manifest");
+    }
+    const object = await bucket.head(sourceObjectKey);
     if (
       !object ||
       object.size !== file.byteSize ||
       object.customMetadata?.sha256 !== file.sha256 ||
-      object.customMetadata?.byteSize !== String(file.byteSize)
+      object.customMetadata?.byteSize !== String(file.byteSize) ||
+      (object.httpMetadata?.contentType ?? "application/octet-stream") !==
+        file.mediaType
     ) {
-      throw new Error(
-        `Uploaded bytes for ${file.path} do not match the cloud manifest`,
-      );
+      throw new Error("Uploaded bytes do not match the cloud manifest");
     }
-    result.push({ ...file, objectKey });
+    if (upload) {
+      const body = await bucket.get(sourceObjectKey);
+      if (!body || !body.body)
+        throw new Error("Uploaded bytes are unavailable");
+      await bucket.put(committedObjectKey, body.body, {
+        httpMetadata: { contentType: file.mediaType },
+        customMetadata: {
+          sha256: file.sha256,
+          byteSize: String(file.byteSize),
+        },
+      });
+    }
+    result.push({
+      ...file,
+      objectKey: committedObjectKey,
+      ...(upload ? { temporaryObjectKey: sourceObjectKey } : {}),
+    });
   }
   return result;
 }
@@ -654,6 +907,162 @@ async function readSyncFile(
   object.writeHttpMetadata(headers);
   headers.set("Cache-Control", "no-store");
   return new Response(object.body, { headers });
+}
+
+interface CreatorCapabilityRow {
+  cloud_artifact_id: string;
+  cloud_project_id: string;
+  slug: string;
+  title: string;
+  kind: string | null;
+  expires_at: string;
+  revoked_at: string | null;
+}
+
+async function readCreatorCapability(
+  request: Request,
+  env: Env,
+  token: string,
+): Promise<Response> {
+  const row = await env.DB.prepare(
+    `SELECT a.cloud_artifact_id, a.cloud_project_id, a.slug, a.title, a.kind,
+            l.expires_at, l.revoked_at
+       FROM creator_links l
+       JOIN sync_artifacts a ON a.cloud_artifact_id = l.artifact_id
+      WHERE l.token_hash = ?`,
+  )
+    .bind(await hashToken(token))
+    .first<CreatorCapabilityRow>();
+  if (!row) return errorResponse(404, "NOT_FOUND", "Creator link not found");
+  if (row.revoked_at || Date.parse(row.expires_at) <= Date.now()) {
+    return errorResponse(410, "NOT_FOUND", "Creator link is no longer active");
+  }
+  if (request.method !== "GET") return methodNotAllowed(["GET"]);
+  return jsonResponse(
+    {
+      cloudArtifactId: row.cloud_artifact_id,
+      cloudProjectId: row.cloud_project_id,
+      slug: row.slug,
+      title: row.title,
+      ...(row.kind ? { kind: row.kind } : {}),
+      creatorExpiresAt: row.expires_at,
+    },
+    200,
+    { "Referrer-Policy": "no-referrer" },
+  );
+}
+
+async function rotateCreatorLink(
+  request: Request,
+  env: Env,
+  artifactId: string,
+): Promise<Response> {
+  const artifact = await authenticateSyncOwner(request, env.DB, artifactId);
+  if (artifact instanceof Response) return artifact;
+  const leaseError = await acquireSyncLease(request, env.DB, artifactId);
+  if (leaseError) return leaseError;
+  const body = await parseJsonBody(
+    request,
+    syncCreatorRotateRequestSchema,
+    SYNC_BODY_LIMIT,
+  );
+  if (!body.ok) return body.response;
+  const creatorToken = `sync-creator-${crypto.randomUUID()}`;
+  const tokenHash = await hashToken(creatorToken);
+  const createdAt = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + CREATOR_TTL_MS).toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE creator_links
+          SET revoked_at = ?
+        WHERE artifact_id = ? AND revoked_at IS NULL`,
+    ).bind(createdAt, artifactId),
+    env.DB.prepare(
+      `INSERT INTO creator_links
+        (id, artifact_id, token_hash, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).bind(
+      `creator_link_${crypto.randomUUID()}`,
+      artifactId,
+      tokenHash,
+      createdAt,
+      expiresAt,
+    ),
+    env.DB.prepare(
+      `UPDATE sync_artifacts
+          SET creator_token_hash = ?, creator_created_at = ?,
+              creator_expires_at = ?, updated_at = ?
+        WHERE cloud_artifact_id = ?`,
+    ).bind(tokenHash, createdAt, expiresAt, createdAt, artifactId),
+  ]);
+  return jsonResponse(
+    syncCreatorRotateResponseSchema.parse({
+      cloudArtifactId: artifactId,
+      creatorToken,
+      creatorUrl: new URL(
+        `/creator/${encodeURIComponent(creatorToken)}`,
+        request.url,
+      ).toString(),
+      creatorExpiresAt: expiresAt,
+    }),
+    200,
+    { "Referrer-Policy": "no-referrer" },
+  );
+}
+
+async function acquireSyncLease(
+  request: Request,
+  db: D1Database,
+  artifactId: string,
+): Promise<Response | undefined> {
+  const owner = sessionId(request);
+  const now = new Date().toISOString();
+  const expires = new Date(Date.now() + SYNC_LEASE_TTL_MS).toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE sync_artifacts
+          SET sync_lease_owner = ?, sync_lease_expires_at = ?, updated_at = ?
+        WHERE cloud_artifact_id = ?
+          AND (sync_lease_owner IS NULL
+            OR sync_lease_expires_at <= ?
+            OR sync_lease_owner = ?)`,
+    )
+    .bind(owner, expires, now, artifactId, now, owner)
+    .run();
+  if (result.meta.changes === 1) return undefined;
+  return errorResponse(
+    409,
+    "CONFLICT",
+    "Sync Artifact is busy; retry after the current Sync session completes",
+  );
+}
+
+async function releaseSyncLease(
+  request: Request,
+  db: D1Database,
+  artifactId: string,
+): Promise<Response> {
+  const token = request.headers
+    .get("Authorization")
+    ?.match(/^Bearer ([^\s]+)$/u)?.[1];
+  if (!token || !ownerTokenSchema.safeParse(token).success) {
+    return errorResponse(
+      401,
+      "UNAUTHORIZED",
+      "A bearer owner credential is required",
+    );
+  }
+  const artifact = await authenticateSyncOwner(request, db, artifactId);
+  if (artifact instanceof Response) return artifact;
+  await db
+    .prepare(
+      `UPDATE sync_artifacts
+          SET sync_lease_owner = NULL, sync_lease_expires_at = NULL
+        WHERE cloud_artifact_id = ? AND sync_lease_owner = ?`,
+    )
+    .bind(artifactId, sessionId(request))
+    .run();
+  return new Response(null, { status: 204 });
 }
 
 async function authenticateSyncOwner(
@@ -812,6 +1221,96 @@ function mandatoryExclusion(path: string) {
 
 function syncRevisionId(artifactId: string, version: number) {
   return `sync_revision_${artifactId}_${version}`;
+}
+
+function temporarySyncObjectKey(
+  projectId: string,
+  artifactId: string,
+  version: number,
+  session: string,
+  path: string,
+) {
+  return [
+    "private",
+    "tmp",
+    encodeKey(projectId),
+    encodeKey(artifactId),
+    `v${version}`,
+    encodeKey(session),
+    encodeKey(path),
+  ].join("/");
+}
+
+function sessionId(request: Request) {
+  const value = request.headers.get(SYNC_SESSION_HEADER)?.trim();
+  return value && /^[A-Za-z0-9._-]{1,128}$/u.test(value) ? value : "legacy";
+}
+
+export async function cleanupTemporarySyncUploads(
+  env: Env,
+  now = new Date(),
+): Promise<number> {
+  const cutoff = new Date(now.getTime() - TEMP_UPLOAD_GRACE_MS).toISOString();
+  const tracked = await env.DB.prepare(
+    `SELECT u.artifact_id, u.revision_version, u.path, u.object_key,
+            u.created_at
+       FROM sync_uploads u
+      WHERE u.created_at < ?
+        AND NOT EXISTS (
+          SELECT 1 FROM revision_files f WHERE f.object_key = u.object_key
+        )
+      ORDER BY u.created_at ASC
+      LIMIT ?`,
+  )
+    .bind(cutoff, CLEANUP_BATCH_SIZE)
+    .all<
+      Pick<
+        SyncUploadRow,
+        | "artifact_id"
+        | "revision_version"
+        | "path"
+        | "object_key"
+        | "created_at"
+      >
+    >();
+  const keys = new Set(tracked.results.map((row) => row.object_key));
+
+  const listed = await env.PRIVATE_ARTIFACTS.list({
+    prefix: "private/tmp/",
+    limit: CLEANUP_BATCH_SIZE,
+    include: ["customMetadata"],
+  });
+  for (const object of listed.objects) {
+    const createdAt = object.customMetadata?.createdAt;
+    if (createdAt && createdAt < cutoff) {
+      const referenced = await env.DB.prepare(
+        "SELECT 1 AS found FROM revision_files WHERE object_key = ? LIMIT 1",
+      )
+        .bind(object.key)
+        .first<{ found: number }>();
+      if (!referenced) keys.add(object.key);
+    }
+  }
+  const boundedKeys = [...keys].slice(0, CLEANUP_BATCH_SIZE);
+  if (boundedKeys.length === 0) return 0;
+  await env.PRIVATE_ARTIFACTS.delete(boundedKeys);
+  const deleteStatements = tracked.results
+    .filter((row) => boundedKeys.includes(row.object_key))
+    .map((row) =>
+      env.DB.prepare(
+        `DELETE FROM sync_uploads
+          WHERE artifact_id = ? AND revision_version = ? AND path = ?
+            AND object_key = ? AND created_at < ?`,
+      ).bind(
+        row.artifact_id,
+        row.revision_version,
+        row.path,
+        row.object_key,
+        cutoff,
+      ),
+    );
+  if (deleteStatements.length > 0) await env.DB.batch(deleteStatements);
+  return boundedKeys.length;
 }
 
 function syncManifestKey(

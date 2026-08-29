@@ -12,6 +12,9 @@
     "enabled": true,
     "head_sampling_rate": 1,
   },
+  "triggers": {
+    "crons": ["17 * * * *"],
+  },
   "assets": {
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*"],

@@ -62,6 +62,7 @@ import {
   workspaceTokenSchema,
   syncCreateResponseSchema,
   syncRevisionCommitResponseSchema,
+  syncCreatorRotateResponseSchema,
   type ArtifactManifest,
   type ArtifactFile,
   type ArtifactType,
@@ -127,6 +128,7 @@ interface StoredSyncState {
   inventoryUrl: string;
   creatorExpiresAt: string;
   creationIdempotencyKey: string;
+  sessionId?: string;
   syncedRevisionVersions: number[];
   syncedRevisionManifests?: FinalizedRevision[];
 }
@@ -467,6 +469,12 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             .optional()
             .describe(
               "Open the returned 30-day Creator link after Sync succeeds.",
+            ),
+          rotateCreatorLink: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "Revoke the current Creator link and issue a replacement.",
             ),
         },
         async execute(args, context) {
@@ -1836,6 +1844,7 @@ interface OriginApproval {
 type SyncArguments = {
   artifactId: string;
   openCreatorAfterSuccess?: boolean | undefined;
+  rotateCreatorLink?: boolean | undefined;
 };
 
 interface SyncResult {
@@ -1875,6 +1884,12 @@ async function syncArtifact(
   ) {
     throw validationError("openCreatorAfterSuccess must be a boolean");
   }
+  if (
+    args.rotateCreatorLink !== undefined &&
+    typeof args.rotateCreatorLink !== "boolean"
+  ) {
+    throw validationError("rotateCreatorLink must be a boolean");
+  }
 
   const project = await resolveLocalProject(context);
   const existing = await findArtifact(project.artifactRoot, artifactId.data);
@@ -1883,14 +1898,21 @@ async function syncArtifact(
       `No local artifact with ID ${artifactId.data} was found under ${project.artifactRoot}.`,
     );
   }
-  return withArtifactLock(locks, existing.artifactDirectory, () =>
-    syncLocalArtifact(
-      existing,
-      context,
-      options,
-      args.openCreatorAfterSuccess ?? false,
-    ),
-  );
+  const syncSession = `sync-${randomUUID()}`;
+  return withArtifactLock(locks, existing.artifactDirectory, async () => {
+    try {
+      return await syncLocalArtifact(
+        existing,
+        context,
+        options,
+        args.openCreatorAfterSuccess ?? false,
+        args.rotateCreatorLink ?? false,
+        syncSession,
+      );
+    } finally {
+      await releaseLocalSyncLease(existing, options, syncSession);
+    }
+  });
 }
 
 async function syncLocalArtifact(
@@ -1898,6 +1920,8 @@ async function syncLocalArtifact(
   context: ToolContext,
   options: ResolvedOptions,
   openCreatorAfterSuccess: boolean,
+  rotateCreatorLink: boolean,
+  syncSession: string,
 ) {
   await recoverFinalization(existing);
   await recoverImport(existing);
@@ -1926,6 +1950,16 @@ async function syncLocalArtifact(
     artifact.manifest.artifactId,
   );
   let checkpoint = await readSyncCheckpoint(checkpointPath);
+  if (checkpoint?.sessionId) syncSession = checkpoint.sessionId;
+  else if (state?.sessionId) syncSession = state.sessionId;
+  if (checkpoint && !checkpoint.sessionId) {
+    checkpoint = { ...checkpoint, sessionId: syncSession };
+    await writeSyncCheckpoint(checkpointPath, checkpoint);
+  }
+  if (state && !state.sessionId) {
+    state = { ...state, sessionId: syncSession };
+    await writeSyncState(state);
+  }
   if (!state && artifact.manifest.cloud) {
     throw new Error(
       `Sync ownership state for artifact ${artifact.manifest.artifactId} is missing. Restore the protected Panes state before retrying.`,
@@ -1942,7 +1976,7 @@ async function syncLocalArtifact(
         throw new Error("Sync checkpoint does not match this local Artifact.");
       }
       if (checkpoint.phase === "identity") {
-        state = syncStateFromCheckpoint(checkpoint);
+        state = syncStateFromCheckpoint(checkpoint, syncSession);
         await writeSyncState(state);
       }
     }
@@ -1967,6 +2001,7 @@ async function syncLocalArtifact(
         inventoryUrl: "https://invalid.local/inventory",
         creatorExpiresAt: new Date(0).toISOString(),
         syncedRevisionVersions: [],
+        sessionId: syncSession,
         syncedRevisionManifests: [],
       };
       await writeSyncCheckpoint(checkpointPath, checkpoint);
@@ -1994,7 +2029,10 @@ async function syncLocalArtifact(
       new URL("/api/sync/artifacts", options.apiBaseUrl),
       {
         method: "POST",
-        headers: jsonHeaders(undefined, options.createApiKey),
+        headers: {
+          ...jsonHeaders(undefined, options.createApiKey),
+          "x-panes-sync-session": syncSession,
+        },
         body: JSON.stringify(createPayload),
       },
       context.abort,
@@ -2009,6 +2047,7 @@ async function syncLocalArtifact(
         checkpoint.creatorToken,
       ],
     );
+    injectFailure(options, "sync-after-create");
     const creatorUrl = validateCreatorUrl(
       created.creatorUrl,
       options.apiBaseUrl.origin,
@@ -2028,7 +2067,7 @@ async function syncLocalArtifact(
       creatorExpiresAt: created.creatorExpiresAt,
     };
     await writeSyncCheckpoint(checkpointPath, checkpoint);
-    state = syncStateFromCheckpoint(checkpoint);
+    state = syncStateFromCheckpoint(checkpoint, syncSession);
     injectFailure(options, "sync-after-ownership");
     await writeSyncState(state);
   } else if (checkpoint && checkpoint.apiOrigin !== options.apiBaseUrl.origin) {
@@ -2057,6 +2096,44 @@ async function syncLocalArtifact(
       }),
     );
     injectFailure(options, "sync-after-mapping");
+  }
+
+  if (
+    rotateCreatorLink ||
+    !Number.isFinite(Date.parse(state.creatorExpiresAt)) ||
+    Date.parse(state.creatorExpiresAt) <= Date.now()
+  ) {
+    const rotationResponse = await fetchPanes(
+      new URL(
+        `/api/sync/artifacts/${encodeURIComponent(state.cloudArtifactId)}/creator/rotate`,
+        options.apiBaseUrl,
+      ),
+      {
+        method: "POST",
+        headers: {
+          ...jsonHeaders(state.ownerCredential),
+          "x-panes-sync-session": syncSession,
+        },
+        body: "{}",
+      },
+      context.abort,
+      options.requestTimeoutMs,
+    );
+    const rotated = await parseApiResponse(
+      rotationResponse,
+      syncCreatorRotateResponseSchema,
+      [state.ownerCredential],
+    );
+    state = {
+      ...state,
+      creatorUrl: validateCreatorUrl(
+        rotated.creatorUrl,
+        options.apiBaseUrl.origin,
+        rotated.creatorToken,
+      ),
+      creatorExpiresAt: rotated.creatorExpiresAt,
+    };
+    await writeSyncState(state);
   }
 
   const synced = new Set(state.syncedRevisionVersions);
@@ -2129,6 +2206,36 @@ async function syncLocalArtifact(
     };
     for (const file of selectedFiles) {
       if (file.kind !== "file") continue;
+      const fileUrl = new URL(
+        `/api/sync/artifacts/${encodeURIComponent(state.cloudArtifactId)}/revisions/${revision.version}/files/${encodeURIComponent(file.path)}`,
+        options.apiBaseUrl,
+      );
+      const fileHeaders = {
+        ...jsonHeaders(state.ownerCredential),
+        "content-type": file.mediaType,
+        "x-panes-file-sha256": file.sha256,
+        "x-panes-file-byte-size": String(file.byteSize),
+        "x-panes-sync-session": syncSession,
+      };
+      const probeResponse = await fetchPanes(
+        fileUrl,
+        { method: "HEAD", headers: fileHeaders },
+        context.abort,
+        options.requestTimeoutMs,
+      );
+      if (
+        probeResponse.status === 204 &&
+        probeResponse.headers.get("x-panes-upload-verified") === "true"
+      ) {
+        continue;
+      }
+      if (probeResponse.status !== 404 && probeResponse.status !== 204) {
+        await parseApiResponse(
+          probeResponse,
+          syncRevisionCommitResponseSchema,
+          [state.ownerCredential],
+        );
+      }
       const bytes = await readFile(
         join(artifact.artifactDirectory, `v${revision.version}`, file.path),
       );
@@ -2139,18 +2246,10 @@ async function syncLocalArtifact(
         );
       }
       const uploadResponse = await fetchPanes(
-        new URL(
-          `/api/sync/artifacts/${encodeURIComponent(state.cloudArtifactId)}/revisions/${revision.version}/files/${encodeURIComponent(file.path)}`,
-          options.apiBaseUrl,
-        ),
+        fileUrl,
         {
           method: "PUT",
-          headers: {
-            ...jsonHeaders(state.ownerCredential),
-            "content-type": file.mediaType,
-            "x-panes-file-sha256": file.sha256,
-            "x-panes-file-byte-size": String(file.byteSize),
-          },
+          headers: fileHeaders,
           body: bytes,
         },
         context.abort,
@@ -2172,7 +2271,10 @@ async function syncLocalArtifact(
       ),
       {
         method: "POST",
-        headers: jsonHeaders(state.ownerCredential),
+        headers: {
+          ...jsonHeaders(state.ownerCredential),
+          "x-panes-sync-session": syncSession,
+        },
         body: JSON.stringify({ manifest: cloudManifest }),
       },
       context.abort,
@@ -2219,7 +2321,10 @@ async function syncLocalArtifact(
   });
 }
 
-function syncStateFromCheckpoint(checkpoint: SyncCheckpoint): StoredSyncState {
+function syncStateFromCheckpoint(
+  checkpoint: SyncCheckpoint,
+  fallbackSession: string,
+): StoredSyncState {
   return {
     schemaVersion: 1,
     apiOrigin: checkpoint.apiOrigin,
@@ -2232,6 +2337,7 @@ function syncStateFromCheckpoint(checkpoint: SyncCheckpoint): StoredSyncState {
     inventoryUrl: checkpoint.inventoryUrl,
     creatorExpiresAt: checkpoint.creatorExpiresAt,
     creationIdempotencyKey: checkpoint.creationIdempotencyKey,
+    sessionId: checkpoint.sessionId ?? fallbackSession,
     syncedRevisionVersions: checkpoint.syncedRevisionVersions,
     syncedRevisionManifests: checkpoint.syncedRevisionManifests ?? [],
   };
@@ -3447,10 +3553,17 @@ async function acquireArtifactFileLock(
           `Artifact ${artifactDirectory} is locked by a live Panes process. Retry after that operation completes.`,
         );
       }
-      await unlink(path).catch((unlinkError) => {
-        if (!(isNodeError(unlinkError) && unlinkError.code === "ENOENT"))
-          throw unlinkError;
-      });
+      const stalePath = join(
+        artifactDirectory,
+        `.${ARTIFACT_LOCK_FILE_NAME}.${randomUUID()}.stale`,
+      );
+      try {
+        await rename(path, stalePath);
+        await unlink(stalePath);
+      } catch (renameError) {
+        if (!(isNodeError(renameError) && renameError.code === "ENOENT"))
+          throw renameError;
+      }
     }
   }
 }
@@ -4578,6 +4691,64 @@ function jsonHeaders(ownerToken?: string, createApiKey?: string) {
   };
 }
 
+async function releaseLocalSyncLease(
+  existing: LocalArtifact,
+  options: ResolvedOptions,
+  syncSession: string,
+) {
+  let state: StoredSyncState | undefined;
+  try {
+    state = await readSyncState(
+      options.apiBaseUrl.origin,
+      existing.manifest.projectId,
+      existing.manifest.artifactId,
+    );
+  } catch {
+    state = undefined;
+  }
+  let cloudArtifactId = state?.cloudArtifactId;
+  let ownerCredential = state?.ownerCredential;
+  let leaseSession = state?.sessionId ?? syncSession;
+  if (!state) {
+    try {
+      const checkpoint = await readSyncCheckpoint(
+        syncCheckpointPath(
+          options.apiBaseUrl.origin,
+          existing.manifest.projectId,
+          existing.manifest.artifactId,
+        ),
+      );
+      cloudArtifactId = checkpoint?.cloudArtifactId;
+      ownerCredential = checkpoint?.ownerCredential;
+      leaseSession = checkpoint?.sessionId ?? syncSession;
+    } catch {
+      return;
+    }
+  }
+  if (!cloudArtifactId || cloudArtifactId === "pending" || !ownerCredential)
+    return;
+  try {
+    const response = await fetchPanes(
+      new URL(
+        `/api/sync/artifacts/${encodeURIComponent(cloudArtifactId)}/lease/release`,
+        options.apiBaseUrl,
+      ),
+      {
+        method: "POST",
+        headers: {
+          ...jsonHeaders(ownerCredential),
+          "x-panes-sync-session": leaseSession,
+        },
+      },
+      new AbortController().signal,
+      options.requestTimeoutMs,
+    );
+    if (!response.ok) return;
+  } catch {
+    // Lease expiry is the recovery path when a process cannot release cleanly.
+  }
+}
+
 async function fetchPanes(
   url: URL,
   init: RequestInit,
@@ -4898,7 +5069,8 @@ function isStoredSyncState(
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const state = value as Record<string, unknown>;
   return (
-    (Object.keys(state).length === 12 || Object.keys(state).length === 13) &&
+    Object.keys(state).length >= 12 &&
+    Object.keys(state).length <= 14 &&
     state.schemaVersion === 1 &&
     state.apiOrigin === apiOrigin &&
     state.projectId === projectId &&
@@ -4910,6 +5082,9 @@ function isStoredSyncState(
     typeof state.inventoryUrl === "string" &&
     typeof state.creatorExpiresAt === "string" &&
     typeof state.creationIdempotencyKey === "string" &&
+    (state.sessionId === undefined ||
+      (typeof state.sessionId === "string" &&
+        /^[A-Za-z0-9._-]{1,128}$/u.test(state.sessionId))) &&
     Array.isArray(state.syncedRevisionVersions) &&
     state.syncedRevisionVersions.every(
       (version) =>
@@ -4929,8 +5104,8 @@ function isSyncCheckpoint(value: unknown): value is SyncCheckpoint {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const checkpoint = value as Record<string, unknown>;
   return (
-    (Object.keys(checkpoint).length === 14 ||
-      Object.keys(checkpoint).length === 15) &&
+    Object.keys(checkpoint).length >= 14 &&
+    Object.keys(checkpoint).length <= 16 &&
     checkpoint.schemaVersion === 1 &&
     ["planned", "identity", "mapped"].includes(String(checkpoint.phase)) &&
     typeof checkpoint.apiOrigin === "string" &&
@@ -4944,6 +5119,9 @@ function isSyncCheckpoint(value: unknown): value is SyncCheckpoint {
     typeof checkpoint.inventoryUrl === "string" &&
     typeof checkpoint.creatorExpiresAt === "string" &&
     typeof checkpoint.creationIdempotencyKey === "string" &&
+    (checkpoint.sessionId === undefined ||
+      (typeof checkpoint.sessionId === "string" &&
+        /^[A-Za-z0-9._-]{1,128}$/u.test(checkpoint.sessionId))) &&
     Array.isArray(checkpoint.syncedRevisionVersions) &&
     (checkpoint.syncedRevisionManifests === undefined ||
       (Array.isArray(checkpoint.syncedRevisionManifests) &&
