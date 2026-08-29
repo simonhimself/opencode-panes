@@ -6,7 +6,6 @@ import {
   cloudDeletionConfirmation,
   deleteLegacyInventoryArtifact,
 } from "../worker/deletion";
-import { backfillLegacyClassification } from "../worker/legacy";
 
 const MIGRATED_AT = "2026-08-29T12:00:00.000Z";
 const ARTIFACT_IDS = ["ticket18-legacy-one", "ticket18-legacy-two"];
@@ -34,40 +33,23 @@ const DROP_TABLES = [
 ];
 
 beforeAll(async () => {
-  await env.DB.exec(
-    `PRAGMA foreign_keys = OFF;
-     ${DROP_TABLES.map((table) => `DROP TABLE IF EXISTS ${table};`).join("\n")}
-     PRAGMA foreign_keys = ON;`,
-  );
-  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS.slice(0, 2));
-  const migration = env.TEST_MIGRATIONS.find(({ name }) =>
-    name.includes("0009"),
-  );
-  if (!migration) throw new Error("0009 migration fixture is missing");
-  await applyD1Migrations(env.DB, [migration]);
+  await resetToLegacySchema();
 });
 
 afterAll(async () => {
-  await env.DB.exec(
-    `PRAGMA foreign_keys = OFF;
-     ${DROP_TABLES.map((table) => `DROP TABLE IF EXISTS ${table};`).join("\n")}
-     PRAGMA foreign_keys = ON;`,
-  );
+  await dropAllTables();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
 });
 
 beforeEach(async () => {
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM artifacts WHERE id LIKE 'ticket18-%'"),
-    env.DB.prepare("DELETE FROM legacy_migration_state"),
-  ]);
+  await resetToLegacySchema();
 });
 
 describe("legacy migration classification", () => {
   it("preserves source and share history and keeps one stable expiry anchor on backfill", async () => {
     await seedLegacyRows();
 
-    await backfillLegacyClassification(env.DB);
+    await applyLegacyMigration();
     const firstState = await env.DB.prepare(
       "SELECT migrated_at FROM legacy_migration_state WHERE id = 1",
     ).first<{ migrated_at: string }>();
@@ -97,7 +79,7 @@ describe("legacy migration classification", () => {
       Date.parse(firstState!.migrated_at) + 7 * 24 * 60 * 60 * 1000,
     );
 
-    await backfillLegacyClassification(env.DB);
+    await applyLegacyMigration("legacy_rerun_migrations");
     const secondState = await env.DB.prepare(
       "SELECT migrated_at FROM legacy_migration_state WHERE id = 1",
     ).first<{ migrated_at: string }>();
@@ -137,7 +119,7 @@ describe("legacy migration classification", () => {
 
   it("removes classification rows when source rows are explicitly deleted", async () => {
     await seedLegacyRows();
-    await backfillLegacyClassification(env.DB);
+    await applyLegacyMigration();
 
     await env.DB.prepare("DELETE FROM shares WHERE token_hash = ?")
       .bind(SHARE_TOKENS[0])
@@ -162,12 +144,19 @@ describe("legacy migration classification", () => {
 
   it("serves an active legacy artifact read-only and returns 410 at private expiry", async () => {
     await seedLegacyRows();
-    await backfillLegacyClassification(env.DB);
+    await applyLegacyMigration();
 
     const current = await api(`/api/artifacts/${ARTIFACT_IDS[0]}`, {
       headers: { Authorization: "Bearer legacy-owner-one" },
     });
     expect(current.status).toBe(200);
+    expect(await current.clone().json()).toMatchObject({
+      legacy: {
+        readOnly: true,
+        migratedAt: expect.any(String),
+        privateExpiresAt: expect.any(String),
+      },
+    });
     expect(
       ((await current.json()) as { revision: { source: string } }).revision
         .source,
@@ -195,6 +184,16 @@ describe("legacy migration classification", () => {
     )
       .bind("2020-01-01T00:00:00.000Z", ARTIFACT_IDS[0])
       .run();
+    const missingExpired = await api(`/api/artifacts/${ARTIFACT_IDS[0]}`);
+    expect(missingExpired.status).toBe(401);
+    const wrongExpired = await api(`/api/artifacts/${ARTIFACT_IDS[0]}`, {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(wrongExpired.status).toBe(403);
+    const unknownArtifact = await api("/api/artifacts/unknown-artifact", {
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    expect(unknownArtifact.status).toBe(404);
     const expired = await api(`/api/artifacts/${ARTIFACT_IDS[0]}`, {
       headers: { Authorization: "Bearer legacy-owner-one" },
     });
@@ -220,13 +219,29 @@ describe("legacy migration classification", () => {
         MIGRATED_AT,
       ),
     ]);
-    await backfillLegacyClassification(env.DB);
+    await applyLegacyMigration();
     await env.DB.prepare(
       "UPDATE legacy_shares SET public_expires_at = ? WHERE token_hash = ?",
     )
       .bind("2020-01-01T00:00:00.000Z", await sha256Text("legacy-public-token"))
       .run();
 
+    await env.DB.prepare(
+      "UPDATE legacy_shares SET public_expires_at = ? WHERE token_hash = ?",
+    )
+      .bind("2099-01-01T00:00:00.000Z", await sha256Text("legacy-public-token"))
+      .run();
+    const publicResponse = await api("/api/public/legacy-public-token");
+    expect(publicResponse.status).toBe(200);
+    expect(await publicResponse.clone().json()).toMatchObject({
+      legacy: { readOnly: true },
+    });
+
+    await env.DB.prepare(
+      "UPDATE legacy_shares SET public_expires_at = ? WHERE token_hash = ?",
+    )
+      .bind("2020-01-01T00:00:00.000Z", await sha256Text("legacy-public-token"))
+      .run();
     const expired = await api("/api/public/legacy-public-token");
     expect(expired.status).toBe(410);
     expect(await expired.text()).not.toContain("other artifact source");
@@ -247,7 +262,7 @@ describe("legacy migration classification", () => {
 
   it("deletes only the selected Legacy artifact after exact confirmation", async () => {
     await seedLegacyRows();
-    await backfillLegacyClassification(env.DB);
+    await applyLegacyMigration();
     const request = (confirmation: string) =>
       new Request("https://panes.example/api/inventory/legacy/artifacts", {
         method: "DELETE",
@@ -285,6 +300,29 @@ describe("legacy migration classification", () => {
     ).not.toBeNull();
   });
 });
+
+async function resetToLegacySchema(): Promise<void> {
+  await dropAllTables();
+  await applyD1Migrations(env.DB, env.TEST_MIGRATIONS.slice(0, 2));
+}
+
+async function dropAllTables(): Promise<void> {
+  await env.DB.exec(
+    `PRAGMA foreign_keys = OFF;
+     ${DROP_TABLES.map((table) => `DROP TABLE IF EXISTS ${table};`).join("\n")}
+     PRAGMA foreign_keys = ON;`,
+  );
+}
+
+async function applyLegacyMigration(
+  migrationsTableName = "d1_migrations",
+): Promise<void> {
+  const migration = env.TEST_MIGRATIONS.find(({ name }) =>
+    name.includes("0009"),
+  );
+  if (!migration) throw new Error("0009 migration fixture is missing");
+  await applyD1Migrations(env.DB, [migration], migrationsTableName);
+}
 
 async function api(path: string, init: RequestInit = {}): Promise<Response> {
   return worker.fetch(new Request(`https://panes.example${path}`, init), env);

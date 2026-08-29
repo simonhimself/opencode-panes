@@ -131,6 +131,11 @@ describe("viewer API requests", () => {
             artifact: ARTIFACT,
             revision: REVISIONS[0],
             viewerUrl: "https://panes.example/artifacts/artifact-1",
+            legacy: {
+              readOnly: true,
+              migratedAt: "2026-08-17T10:00:00.000Z",
+              privateExpiresAt: "2026-09-16T10:00:00.000Z",
+            },
           };
       return new Response(JSON.stringify(body), {
         headers: { "Content-Type": "application/json" },
@@ -154,6 +159,7 @@ describe("viewer API requests", () => {
       "revision-2",
       "revision-1",
     ]);
+    expect(workspace.current.legacy?.readOnly).toBe(true);
   });
 
   it("does not send private authorization to the public endpoint", async () => {

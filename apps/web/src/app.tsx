@@ -1,5 +1,6 @@
 import type {
   Artifact,
+  LegacyArtifactPresentation,
   InventoryLegacyArtifact,
   InventoryArtifact,
   Revision,
@@ -59,6 +60,7 @@ interface AppProps {
 interface WorkspaceProps {
   artifact: Pick<Artifact, "id" | "title" | "type">;
   isPublic: boolean;
+  legacy?: LegacyArtifactPresentation | { readOnly: true };
   onPublish?: (revision: Revision) => Promise<void>;
   onUnpublish?: () => Promise<void>;
   publishedAt?: string;
@@ -283,6 +285,14 @@ function LegacyInventoryArtifactCard({
         <div>
           <dt>Revisions</dt>
           <dd>{artifact.revisionCount}</dd>
+        </div>
+        <div>
+          <dt>Stored bytes</dt>
+          <dd>{formatBytes(artifact.storageBytes)}</dd>
+        </div>
+        <div>
+          <dt>Updated</dt>
+          <dd>{formatInventoryTime(artifact.updatedAt)}</dd>
         </div>
         <div>
           <dt>Private access</dt>
@@ -755,6 +765,7 @@ function PrivateArtifactView({
   const [artifact, setArtifact] = useState<Artifact>();
   const [revisions, setRevisions] = useState<Revision[]>([]);
   const [selection, setSelection] = useState<RevisionSelection>();
+  const [legacy, setLegacy] = useState<LegacyArtifactPresentation>();
   const [error, setError] = useState<unknown>();
   const [refreshError, setRefreshError] = useState<string>();
   const [notice, setNotice] = useState<Notice>();
@@ -778,6 +789,7 @@ function PrivateArtifactView({
           followLatest: true,
           revisionId: current.revision.id,
         });
+        setLegacy(current.legacy);
         setError(undefined);
       },
       (caught: unknown) => {
@@ -811,6 +823,7 @@ function PrivateArtifactView({
       }
       currentRevisionVersion.current = current.revision.version;
       setArtifact(current.artifact);
+      setLegacy(current.legacy);
       setSelection(
         followCurrentRevision(
           selection,
@@ -960,8 +973,10 @@ function PrivateArtifactView({
       <ArtifactWorkspace
         artifact={artifact}
         isPublic={false}
-        onPublish={handlePublish}
-        onUnpublish={handleUnpublish}
+        {...(legacy ? { legacy } : {})}
+        {...(legacy
+          ? {}
+          : { onPublish: handlePublish, onUnpublish: handleUnpublish })}
         revisions={revisions}
         selection={selection}
         setSelection={setSelection}
@@ -1018,6 +1033,7 @@ function PublicArtifactView({ token }: { token: string }) {
     <ArtifactWorkspace
       artifact={response.artifact}
       isPublic
+      {...(response.legacy ? { legacy: response.legacy } : {})}
       publishedAt={response.publishedAt}
       publicUrl={window.location.href}
       revisions={[response.revision]}
@@ -1079,6 +1095,7 @@ function PublishedArtifactView({ token }: { token: string }) {
 function ArtifactWorkspace({
   artifact,
   isPublic,
+  legacy,
   onPublish,
   onUnpublish,
   publishedAt,
@@ -1170,6 +1187,14 @@ function ArtifactWorkspace({
               {isPublic ? "PUBLIC ARTIFACT" : "CREATOR WORKSPACE"}
             </span>
             <h1>{artifact.title}</h1>
+            {legacy ? (
+              <span className="eyebrow" role="status">
+                LEGACY · READ-ONLY
+                {"privateExpiresAt" in legacy
+                  ? ` · EXPIRES ${formatTimestamp(legacy.privateExpiresAt)}`
+                  : ""}
+              </span>
+            ) : null}
           </div>
           <span className="type-readout">{artifact.type}</span>
         </div>
@@ -1238,7 +1263,7 @@ function ArtifactWorkspace({
               <button onClick={() => void handleCopyLink()} type="button">
                 Copy link
               </button>
-            ) : (
+            ) : legacy ? null : (
               <>
                 <button
                   disabled={Boolean(busyAction) || !onPublish}

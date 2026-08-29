@@ -1240,11 +1240,11 @@ describe("authenticated cloud inventory", () => {
         "html",
         revisionId,
         now,
-        now,
+        "2026-08-30T12:00:00.000Z",
       ),
       env.DB.prepare(
         "INSERT INTO revisions (id, artifact_id, version, source, created_at) VALUES (?, ?, 1, ?, ?)",
-      ).bind(revisionId, artifactId, "<h1>legacy</h1>", now),
+      ).bind(revisionId, artifactId, "<h1>héllo</h1>", now),
       env.DB.prepare(
         "INSERT INTO legacy_artifacts (artifact_id, migrated_at, private_expires_at) VALUES (?, ?, ?)",
       ).bind(artifactId, now, "2026-09-28T12:00:00.000Z"),
@@ -1261,7 +1261,9 @@ describe("authenticated cloud inventory", () => {
         title: "Inventory Legacy",
         type: "html",
         revisionCount: 1,
+        storageBytes: new TextEncoder().encode("<h1>héllo</h1>").byteLength,
         createdAt: now,
+        updatedAt: "2026-08-30T12:00:00.000Z",
         privateExpiresAt: "2026-09-28T12:00:00.000Z",
         status: "active",
         publicationStatus: "none",

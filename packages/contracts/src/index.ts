@@ -512,11 +512,16 @@ export const publicArtifactPresentationSchema = z.strictObject({
   kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).optional(),
 });
 
+export const publicLegacyPresentationSchema = z.strictObject({
+  readOnly: z.literal(true),
+});
+
 export const publicPublicationResponseSchema = z.strictObject({
   status: z.literal("active"),
   expiresAt: timestampSchema,
   artifact: publicArtifactPresentationSchema,
   revision: publicPublicationRevisionSchema,
+  legacy: publicLegacyPresentationSchema.optional(),
 });
 
 export const inventoryCreatorLinkSchema = z.strictObject({
@@ -561,7 +566,9 @@ export const inventoryLegacyArtifactSchema = z.strictObject({
   title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
   type: artifactTypeSchema,
   revisionCount: z.number().int().nonnegative().safe(),
+  storageBytes: z.number().int().nonnegative().safe(),
   createdAt: timestampSchema,
+  updatedAt: timestampSchema,
   privateExpiresAt: timestampSchema,
   status: z.enum(["active", "expired"]),
   publicationStatus: z.enum(["none", "active", "expired", "revoked"]),
@@ -689,6 +696,9 @@ export type PublicArtifactPresentation = z.infer<
 export type PublicPublicationResponse = z.infer<
   typeof publicPublicationResponseSchema
 >;
+export type PublicLegacyPresentation = z.infer<
+  typeof publicLegacyPresentationSchema
+>;
 export type InventoryCreatorLink = z.infer<typeof inventoryCreatorLinkSchema>;
 export type InventoryRevision = z.infer<typeof inventoryRevisionSchema>;
 export type InventoryPublication = z.infer<typeof inventoryPublicationSchema>;
@@ -784,10 +794,17 @@ export const revisionSchema = z.strictObject({
   createdAt: timestampSchema,
 });
 
+export const legacyArtifactPresentationSchema = z.strictObject({
+  readOnly: z.literal(true),
+  migratedAt: timestampSchema,
+  privateExpiresAt: timestampSchema,
+});
+
 export const artifactResponseSchema = z.strictObject({
   artifact: artifactSchema,
   revision: revisionSchema,
   viewerUrl: urlSchema,
+  legacy: legacyArtifactPresentationSchema.optional(),
 });
 
 export const createArtifactResponseSchema = z.strictObject({
@@ -846,6 +863,9 @@ export type CreateArtifactRequest = z.infer<typeof createArtifactRequestSchema>;
 export type CreateRevisionRequest = z.infer<typeof createRevisionRequestSchema>;
 export type Artifact = z.infer<typeof artifactSchema>;
 export type Revision = z.infer<typeof revisionSchema>;
+export type LegacyArtifactPresentation = z.infer<
+  typeof legacyArtifactPresentationSchema
+>;
 export type ArtifactResponse = z.infer<typeof artifactResponseSchema>;
 export type CreateArtifactResponse = z.infer<
   typeof createArtifactResponseSchema

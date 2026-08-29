@@ -445,12 +445,22 @@ async function getArtifact(
     .first<RevisionRow>();
 
   if (!revision) throw new Error("Current revision was not found");
+  const legacy = await getLegacyArtifact(db, artifactId);
 
   return jsonResponse(
     artifactResponseSchema.parse({
       artifact: toArtifact(artifact),
       revision: toRevision(revision),
       viewerUrl: viewerUrl(request, artifactId),
+      ...(legacy
+        ? {
+            legacy: {
+              readOnly: true,
+              migratedAt: legacy.migrated_at,
+              privateExpiresAt: legacy.private_expires_at,
+            },
+          }
+        : {}),
     }),
   );
 }
@@ -646,6 +656,7 @@ async function getPublicShare(
     },
     revision: toRevision(row),
     publishedAt: row.published_at,
+    ...(row.public_expires_at !== null ? { legacy: { readOnly: true } } : {}),
   });
 }
 
@@ -663,14 +674,6 @@ async function authenticateArtifact(
   artifactId: string,
   ownerOnly: boolean,
 ): Promise<ArtifactRow | Response> {
-  const legacyArtifact = await getLegacyArtifact(db, artifactId);
-  if (
-    legacyArtifact &&
-    legacyArtifact.private_expires_at <= new Date().toISOString()
-  ) {
-    return legacyGoneResponse("This legacy artifact has expired");
-  }
-
   const authorization = request.headers.get("Authorization");
   const match = authorization?.match(/^Bearer ([^\s]+)$/);
   const token = match?.[1];
@@ -716,6 +719,14 @@ async function authenticateArtifact(
         ? "The owner token is invalid"
         : "The owner or workspace token is invalid",
     );
+  }
+
+  const legacyArtifact = await getLegacyArtifact(db, artifactId);
+  if (
+    legacyArtifact &&
+    legacyArtifact.private_expires_at <= new Date().toISOString()
+  ) {
+    return legacyGoneResponse("This legacy artifact has expired");
   }
 
   return artifact;

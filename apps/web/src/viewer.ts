@@ -8,6 +8,7 @@ import {
   type InventoryResponse,
   type InventoryCreatorRotateResponse,
   type InventoryReconnectCodeResponse,
+  type LegacyArtifactPresentation,
   type PublicPublicationResponse,
   type Revision,
   type ShareResponse,
@@ -35,12 +36,14 @@ export interface PublicArtifactResponse {
   artifact: Pick<Artifact, "id" | "title" | "type">;
   revision: Revision;
   publishedAt: string;
+  legacy?: { readOnly: true };
 }
 
 export interface ArtifactResponse {
   artifact: Artifact;
   revision: Revision;
   viewerUrl: string;
+  legacy?: LegacyArtifactPresentation;
 }
 
 export interface RevisionListResponse {

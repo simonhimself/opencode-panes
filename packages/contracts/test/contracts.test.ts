@@ -604,6 +604,27 @@ describe("artifact response contracts", () => {
     ).toBe(true);
 
     expect(
+      artifactResponseSchema.safeParse({
+        artifact,
+        revision,
+        viewerUrl: "http://localhost:5173/artifacts/artifact-1",
+        legacy: {
+          readOnly: true,
+          migratedAt: "2026-08-17T10:00:00.000Z",
+          privateExpiresAt: "2026-09-16T10:00:00.000Z",
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      artifactResponseSchema.safeParse({
+        artifact,
+        revision,
+        viewerUrl: "http://localhost:5173/artifacts/artifact-1",
+        legacy: { readOnly: true, unexpected: "field" },
+      }).success,
+    ).toBe(false);
+
+    expect(
       createArtifactResponseSchema.safeParse({
         artifact,
         revision,

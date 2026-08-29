@@ -161,7 +161,9 @@ describe("artifact workspace", () => {
           title: "Archived artifact",
           type: "html",
           revisionCount: 3,
+          storageBytes: 128,
           createdAt: "2026-08-01T10:00:00.000Z",
+          updatedAt: "2026-08-03T10:00:00.000Z",
           privateExpiresAt: "2026-08-31T10:00:00.000Z",
           status: "active",
           publicationStatus: "none",
@@ -179,6 +181,8 @@ describe("artifact workspace", () => {
 
     expect(container.textContent).toContain("Read-only cloud history");
     expect(container.textContent).toContain("Archived artifact");
+    expect(container.textContent).toContain("128 B");
+    expect(container.textContent).toContain("Updated");
     expect(container.textContent).toContain(
       "cannot be edited, published, or extended",
     );
@@ -752,6 +756,7 @@ describe("artifact workspace", () => {
               },
               publishedAt: "2026-08-17T10:02:00.000Z",
               revision: REVISIONS[0],
+              legacy: { readOnly: true },
             }),
           ),
       ),
@@ -763,7 +768,49 @@ describe("artifact workspace", () => {
     });
 
     expect(container.textContent).toContain("User-generated content.");
+    expect(container.textContent).toContain("LEGACY · READ-ONLY");
     expect(container.textContent).toContain("Copy link");
+    expect(container.textContent).not.toContain("Publish v");
+    expect(container.textContent).not.toContain("Unpublish");
+  });
+
+  it("shows private Legacy metadata and omits publication controls", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/revisions")) {
+          return new Response(
+            JSON.stringify({ artifactId: ARTIFACT.id, revisions: REVISIONS }),
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            artifact: ARTIFACT,
+            revision: REVISIONS[0],
+            viewerUrl: "https://panes.example/artifacts/artifact-1",
+            legacy: {
+              readOnly: true,
+              migratedAt: "2026-08-17T10:00:00.000Z",
+              privateExpiresAt: "2026-09-16T10:00:00.000Z",
+            },
+          }),
+        );
+      }),
+    );
+
+    await act(async () => {
+      root.render(
+        <App
+          route={{ artifactId: ARTIFACT.id, kind: "artifact" }}
+          workspaceAccess={{ status: "ready", token: "workspace-token" }}
+        />,
+      );
+      await settle();
+    });
+
+    expect(container.textContent).toContain("LEGACY · READ-ONLY");
+    expect(container.textContent).toContain("EXPIRES");
     expect(container.textContent).not.toContain("Publish v");
     expect(container.textContent).not.toContain("Unpublish");
   });

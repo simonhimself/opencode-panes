@@ -242,12 +242,13 @@ export async function loadInventory(
   const legacyArtifacts = await Promise.all(
     legacyRows.map(async (legacy) => {
       const row = await env.DB.prepare(
-        `SELECT a.title, a.type, a.created_at,
-                COUNT(r.id) AS revision_count
+        `SELECT a.title, a.type, a.created_at, a.updated_at,
+                COUNT(r.id) AS revision_count,
+                COALESCE(SUM(length(CAST(r.source AS BLOB))), 0) AS storage_bytes
            FROM artifacts a
            LEFT JOIN revisions r ON r.artifact_id = a.id
           WHERE a.id = ?
-          GROUP BY a.id, a.title, a.type, a.created_at`,
+          GROUP BY a.id, a.title, a.type, a.created_at, a.updated_at`,
       )
         .bind(legacy.artifact_id)
         .first<{
@@ -255,6 +256,8 @@ export async function loadInventory(
           type: InventoryLegacyArtifact["type"];
           created_at: string;
           revision_count: number;
+          storage_bytes: number;
+          updated_at: string;
         }>();
       if (!row) return undefined;
       const publication = await env.DB.prepare(
@@ -282,7 +285,9 @@ export async function loadInventory(
         title: row.title,
         type: row.type,
         revisionCount: row.revision_count,
+        storageBytes: row.storage_bytes,
         createdAt: row.created_at,
+        updatedAt: row.updated_at,
         privateExpiresAt: legacy.private_expires_at,
         status:
           legacy.private_expires_at <= now
