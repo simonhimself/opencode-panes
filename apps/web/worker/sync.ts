@@ -361,9 +361,9 @@ async function commitSyncRevision(
   );
   if (!body.ok) return body.response;
   const manifest = body.data.manifest;
-  const revision = manifest.revisions[0];
+  const revision = manifest.revisions.at(-1);
   if (
-    manifest.revisions.length !== 1 ||
+    manifest.revisions.length !== version ||
     !revision ||
     manifest.projectId !== artifact.cloud_project_id ||
     manifest.artifactId !== artifactId ||
@@ -378,6 +378,17 @@ async function commitSyncRevision(
       "Cloud manifest does not match the Sync Artifact",
     );
   }
+  if (
+    manifest.revisions.some(
+      (candidate, index) => candidate.version !== index + 1,
+    )
+  ) {
+    return errorResponse(
+      409,
+      "CONFLICT",
+      "Cloud manifest revisions must be a contiguous committed history",
+    );
+  }
   const fileEntries = revision.files.filter((file) => file.kind === "file");
   const totalBytes = fileEntries.reduce(
     (total, file) => total + file.byteSize,
@@ -389,7 +400,11 @@ async function commitSyncRevision(
   if (totalBytes > MAX_REMOTE_REVISION_BYTES) {
     return errorResponse(413, "REVISION_TOO_LARGE", "Revision is too large");
   }
-  if (fileEntries.some((file) => mandatoryExclusion(file.path))) {
+  if (
+    manifest.revisions.some((candidate) =>
+      candidate.files.some((file) => mandatoryExclusion(file.path)),
+    )
+  ) {
     return errorResponse(
       422,
       "VALIDATION_ERROR",
@@ -437,6 +452,54 @@ async function commitSyncRevision(
         committedAt: existing.committed_at,
       }),
     );
+  }
+  const committedHistory = await env.DB.prepare(
+    `SELECT id, artifact_id, version, committed_at, cloud_manifest_key
+       FROM local_revisions
+      WHERE artifact_id = ? AND committed_at IS NOT NULL
+      ORDER BY version ASC`,
+  )
+    .bind(artifactId)
+    .all<CommittedRevisionRow>();
+  if (committedHistory.results.length !== version - 1) {
+    return errorResponse(
+      409,
+      "CONFLICT",
+      "Revisions must be committed in local version order",
+    );
+  }
+  for (const committed of committedHistory.results) {
+    if (committed.version < 1 || committed.version >= version) {
+      return errorResponse(
+        409,
+        "CONFLICT",
+        "Existing committed Revision history is not contiguous",
+      );
+    }
+    if (!committed.cloud_manifest_key) {
+      return errorResponse(
+        409,
+        "CONFLICT",
+        "Existing committed Revision is missing its cloud manifest",
+      );
+    }
+    const prefix: CloudManifest = {
+      ...manifest,
+      revisions: manifest.revisions.slice(0, committed.version),
+    };
+    if (
+      !(await committedManifestMatches(
+        env.PRIVATE_ARTIFACTS,
+        committed.cloud_manifest_key,
+        prefix,
+      ))
+    ) {
+      return errorResponse(
+        409,
+        "CONFLICT",
+        "Cloud manifest does not describe the committed Revision history",
+      );
+    }
   }
   if (existing && existing.id !== revisionId) {
     return errorResponse(
@@ -724,6 +787,9 @@ function mandatoryExclusion(path: string) {
     const lower = segment.toLocaleLowerCase();
     return (
       lower === ".panesignore" ||
+      lower === "artifact.json" ||
+      lower === "draft" ||
+      lower === "draft.json" ||
       lower === ".git" ||
       lower === "node_modules" ||
       lower === "vendor" ||

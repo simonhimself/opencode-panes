@@ -31,6 +31,7 @@
   "dependencies": {
     "@opencode-panes/renderers": "*",
     "dompurify": "^3.4.13",
+    "ignore": "^7.0.6",
     "linkedom": "^0.18.12",
     "mermaid": "^11.16.1",
     "react": "^19.2.8",

@@ -26,6 +26,7 @@ import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
 import { parseHTML } from "linkedom";
+import ignore, { type Ignore } from "ignore";
 import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -452,7 +453,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
       }),
       artifact_sync: tool({
         description:
-          "Sync the earliest unsynced finalized local Revision to private Cloudflare storage. This never publishes an artifact.",
+          "Sync every unsynced finalized local Revision in order to private Cloudflare storage. This never publishes an artifact.",
         args: {
           artifactId: tool.schema
             .string()
@@ -1911,20 +1912,7 @@ async function syncLocalArtifact(
   ) {
     throw new Error("Sync refuses an Artifact with an unfinished Draft.");
   }
-  if (await pathExists(join(artifact.artifactDirectory, ".panesignore"))) {
-    throw new Error("Sync cannot evaluate .panesignore and fails closed.");
-  }
-  if (
-    artifact.manifest.revisions.some((revision) =>
-      revision.files.some((file) =>
-        file.path
-          .split("/")
-          .some((segment) => segment.toLocaleLowerCase() === ".panesignore"),
-      ),
-    )
-  ) {
-    throw new Error("Sync cannot evaluate .panesignore and fails closed.");
-  }
+  const panesIgnore = await readPanesIgnore(artifact.artifactDirectory);
 
   const checkpointPath = syncCheckpointPath(
     options.apiBaseUrl.origin,
@@ -2070,24 +2058,34 @@ async function syncLocalArtifact(
   }
 
   const synced = new Set(state.syncedRevisionVersions);
-  const revision = artifact.manifest.revisions.find(
-    (candidate) => !synced.has(candidate.version),
-  );
-  if (revision) {
-    const selectedFiles = revision.files.filter(
-      (file) => !mandatorySyncExclusion(file.path),
-    );
-    if (mandatorySyncExclusion(revision.preview.entryPath)) {
+  const pendingRevisions = artifact.manifest.revisions
+    .filter((candidate) => !synced.has(candidate.version))
+    .sort((left, right) => left.version - right.version);
+  let lastSyncedVersion = state.syncedRevisionVersions.at(-1) ?? 0;
+  for (const revision of pendingRevisions) {
+    const selections = artifact.manifest.revisions
+      .filter(
+        (candidate) =>
+          synced.has(candidate.version) ||
+          candidate.version === revision.version,
+      )
+      .sort((left, right) => left.version - right.version)
+      .map((candidate) => ({
+        version: candidate.version,
+        paths: selectedSyncFiles(candidate, panesIgnore).map(
+          (file) => file.path,
+        ),
+      }));
+    const selectedFiles = selectedSyncFiles(revision, panesIgnore);
+    if (
+      mandatorySyncExclusion(revision.preview.entryPath) ||
+      panesIgnore.ignores(revision.preview.entryPath)
+    ) {
       throw new Error(
         `Sync cannot upload the excluded Preview entry ${JSON.stringify(revision.preview.entryPath)}.`,
       );
     }
-    const derived = deriveCloudManifest(artifact.manifest, [
-      {
-        version: revision.version,
-        paths: selectedFiles.map((file) => file.path),
-      },
-    ]);
+    const derived = deriveCloudManifest(artifact.manifest, selections);
     const cloudManifest: CloudManifest = {
       ...derived,
       projectId: state.cloudProjectId,
@@ -2153,7 +2151,9 @@ async function syncLocalArtifact(
         ...new Set([...state.syncedRevisionVersions, revision.version]),
       ].sort((left, right) => left - right),
     };
+    synced.add(revision.version);
     await writeSyncState(state);
+    lastSyncedVersion = revision.version;
     injectFailure(options, "sync-after-commit");
   }
 
@@ -2170,8 +2170,7 @@ async function syncLocalArtifact(
     operation: "synced",
     artifactId: artifact.manifest.artifactId,
     title: artifact.manifest.title,
-    syncedVersion:
-      revision?.version ?? state.syncedRevisionVersions.at(-1) ?? 0,
+    syncedVersion: lastSyncedVersion,
     pendingVersions,
     creatorUrl: state.creatorUrl,
     inventoryUrl: state.inventoryUrl,
@@ -2202,6 +2201,9 @@ function mandatorySyncExclusion(path: string) {
     const lower = segment.toLocaleLowerCase();
     return (
       lower === ".panesignore" ||
+      lower === "artifact.json" ||
+      lower === "draft" ||
+      lower === "draft.json" ||
       lower === ".git" ||
       lower === "node_modules" ||
       lower === "vendor" ||
@@ -2219,6 +2221,43 @@ function mandatorySyncExclusion(path: string) {
       lower.endsWith(".key") ||
       lower.endsWith(".p12")
     );
+  });
+}
+
+async function readPanesIgnore(artifactDirectory: string): Promise<Ignore> {
+  const path = join(artifactDirectory, ".panesignore");
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return ignore();
+    throw error;
+  }
+  if (!stats.isFile()) {
+    throw new Error("Artifact .panesignore must be a regular file.");
+  }
+  let contents: string;
+  try {
+    contents = new TextDecoder("utf-8", { fatal: true }).decode(
+      await readFile(path),
+    );
+  } catch {
+    throw new Error("Artifact .panesignore must contain valid UTF-8 rules.");
+  }
+  try {
+    return ignore().add(contents);
+  } catch (error) {
+    throw new Error(
+      `Artifact .panesignore contains invalid Gitignore rules: ${errorMessage(error)}`,
+    );
+  }
+}
+
+function selectedSyncFiles(revision: FinalizedRevision, panesIgnore: Ignore) {
+  return revision.files.filter((file) => {
+    if (mandatorySyncExclusion(file.path)) return false;
+    const path = file.kind === "directory" ? `${file.path}/` : file.path;
+    return !panesIgnore.ignores(path);
   });
 }
 
@@ -2316,7 +2355,13 @@ async function finalizeArtifact(
       draft.requestedOrigins,
     );
 
-    const files = await scanRevisionFiles(draftPath);
+    const draftStats = await lstat(draftPath);
+    if (!draftStats.isDirectory() || draftStats.isSymbolicLink()) {
+      throw new Error("Draft root must be a regular directory.");
+    }
+    const files = await scanRevisionFiles(draftPath, {
+      materializeSymlinks: true,
+    });
     const draftFingerprint = fingerprintDraft(files);
     const entryFile = files.find(
       (file) => file.kind === "file" && file.path === request.preview.entryPath,
@@ -2963,8 +3008,14 @@ async function readDraftMetadata(path: string) {
   return parsed.data;
 }
 
-async function scanRevisionFiles(root: string): Promise<ArtifactFile[]> {
+async function scanRevisionFiles(
+  root: string,
+  options: { materializeSymlinks?: boolean } = {},
+): Promise<ArtifactFile[]> {
   const files: ArtifactFile[] = [];
+  const rootRealPath = options.materializeSymlinks
+    ? await realpath(root)
+    : undefined;
 
   async function visit(directory: string, relativeDirectory: string) {
     const entries = await readdir(directory, { withFileTypes: true });
@@ -2981,12 +3032,52 @@ async function scanRevisionFiles(root: string): Promise<ArtifactFile[]> {
       }
       const absolutePath = join(directory, entry.name);
       const stats = await lstat(absolutePath);
-      const mode = stats.mode & 0o7777;
       if (stats.isSymbolicLink()) {
-        throw new Error(
-          `Draft contains unsupported symlink ${JSON.stringify(relativePath)}.`,
-        );
+        if (!options.materializeSymlinks || !rootRealPath) {
+          throw new Error(
+            `Finalized Revision contains an unexpected symlink ${JSON.stringify(relativePath)}.`,
+          );
+        }
+        const target = await realpath(absolutePath).catch(() => undefined);
+        if (
+          !target ||
+          (target !== rootRealPath &&
+            !target.startsWith(
+              `${rootRealPath}${process.platform === "win32" ? "\\" : "/"}`,
+            ))
+        ) {
+          throw new Error(
+            `Draft symlink escapes the Revision: ${JSON.stringify(relativePath)}.`,
+          );
+        }
+        const targetStats = await lstat(target).catch(() => undefined);
+        if (!targetStats?.isFile()) {
+          throw new Error(
+            `Draft symlink does not resolve to a regular file: ${JSON.stringify(relativePath)}.`,
+          );
+        }
+        const bytes = await readFile(target);
+        const temporary = join(directory, `.${randomUUID()}.symlink`);
+        await writeFile(temporary, bytes, { mode: targetStats.mode & 0o7777 });
+        try {
+          await rename(temporary, absolutePath);
+        } catch (error) {
+          await unlink(temporary).catch(() => undefined);
+          throw error;
+        }
+        const materializedStats = await lstat(absolutePath);
+        const mode = materializedStats.mode & 0o7777;
+        files.push({
+          kind: "file",
+          path: normalized.data,
+          sha256: createHash("sha256").update(bytes).digest("hex"),
+          byteSize: bytes.byteLength,
+          mediaType: mediaTypeForPath(normalized.data, bytes),
+          mode,
+        });
+        continue;
       }
+      const mode = stats.mode & 0o7777;
       if (stats.isDirectory()) {
         files.push({
           kind: "directory",
@@ -3035,9 +3126,20 @@ async function verifyFinalizedRevisions(artifact: LocalArtifact) {
   }
   for (const revision of artifact.manifest.revisions) {
     const path = join(artifact.artifactDirectory, `v${revision.version}`);
-    if (!(await pathExists(path))) {
+    let revisionStats;
+    try {
+      revisionStats = await lstat(path);
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        throw new Error(
+          `Finalized Revision v${revision.version} is missing from disk.`,
+        );
+      }
+      throw error;
+    }
+    if (!revisionStats.isDirectory() || revisionStats.isSymbolicLink()) {
       throw new Error(
-        `Finalized Revision v${revision.version} is missing from disk.`,
+        `Finalized Revision v${revision.version} is not a regular directory.`,
       );
     }
     await verifyRevisionFiles(path, revision.files);
@@ -3045,6 +3147,10 @@ async function verifyFinalizedRevisions(artifact: LocalArtifact) {
 }
 
 async function verifyRevisionFiles(root: string, expected: ArtifactFile[]) {
+  const rootStats = await lstat(root);
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
+    throw new Error("Finalized Revision root must be a regular directory.");
+  }
   const actual = await scanRevisionFiles(root);
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error("Finalized Revision files no longer match artifact.json.");

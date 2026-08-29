@@ -31,6 +31,97 @@ async function api(path: string, init?: RequestInit) {
 }
 
 describe("first private Sync Worker HTTP seam", () => {
+  it("commits complete history one Revision at a time and retrieves each committed Revision", async () => {
+    const create = await api(
+      "/api/sync/artifacts",
+      jsonRequest({
+        projectId: "project-sync-history",
+        artifactId: "artifact-sync-history",
+        slug: "sync-history",
+        title: "Sync history",
+        idempotencyKey: "sync-history-1",
+        ownerCredential: "owner-credential-history",
+        creatorToken: "creator-token-history",
+      }),
+    );
+    const artifact = syncCreateResponseSchema.parse(await create.json());
+    const v1 = new TextEncoder().encode("v1\r\n");
+    const v2 = Uint8Array.from([0, 255, 1, 254]);
+    const revision = (version: number, bytes: Uint8Array) => ({
+      id: `revision-local-${version}`,
+      version,
+      preview: { adapter: "browser" as const, entryPath: "index.html" },
+      approvedOrigins: [],
+      files: [
+        {
+          kind: "file" as const,
+          path: "index.html",
+          sha256: "pending",
+          byteSize: bytes.byteLength,
+          mediaType: "application/octet-stream",
+        },
+      ],
+      createdAt: "2026-08-29T12:00:00.000Z",
+    });
+    const firstRevision = revision(1, v1);
+    firstRevision.files[0]!.sha256 = await sha256(v1);
+    const firstManifest = cloudManifestSchema.parse({
+      schemaVersion: 1,
+      projectId: artifact.cloudProjectId,
+      artifactId: artifact.cloudArtifactId,
+      slug: "sync-history",
+      title: "Sync history",
+      revisions: [firstRevision],
+    });
+    await uploadFile(
+      artifact.cloudArtifactId,
+      1,
+      v1,
+      "application/octet-stream",
+    );
+    expect(
+      (
+        await api(
+          `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/commit`,
+          jsonRequest({ manifest: firstManifest }, "owner-credential-history"),
+        )
+      ).status,
+    ).toBe(201);
+
+    const secondRevision = revision(2, v2);
+    secondRevision.files[0]!.sha256 = await sha256(v2);
+    const secondManifest = cloudManifestSchema.parse({
+      ...firstManifest,
+      revisions: [firstRevision, secondRevision],
+    });
+    await uploadFile(
+      artifact.cloudArtifactId,
+      2,
+      v2,
+      "application/octet-stream",
+    );
+    expect(
+      (
+        await api(
+          `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/2/commit`,
+          jsonRequest({ manifest: secondManifest }, "owner-credential-history"),
+        )
+      ).status,
+    ).toBe(201);
+
+    for (const [version, expected] of [
+      [1, v1],
+      [2, v2],
+    ] as const) {
+      const response = await api(
+        `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/${version}/files/index.html`,
+        { headers: { Authorization: "Bearer owner-credential-history" } },
+      );
+      expect(response.status).toBe(200);
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(expected);
+    }
+  });
+
   it("creates one idempotent cloud Artifact and commits exact files privately", async () => {
     const createRequest = {
       projectId: PROJECT_ID,
@@ -293,6 +384,27 @@ describe("first private Sync Worker HTTP seam", () => {
     );
   });
 });
+
+async function uploadFile(
+  artifactId: string,
+  version: number,
+  bytes: Uint8Array,
+  mediaType: string,
+) {
+  return api(
+    `/api/sync/artifacts/${artifactId}/revisions/${version}/files/index.html`,
+    {
+      method: "PUT",
+      headers: {
+        Authorization: "Bearer owner-credential-history",
+        "Content-Type": mediaType,
+        "X-Panes-File-SHA256": await sha256(bytes),
+        "X-Panes-File-Byte-Size": String(bytes.byteLength),
+      },
+      body: bytes.buffer as ArrayBuffer,
+    },
+  );
+}
 
 async function sha256(bytes: Uint8Array) {
   const digest = await crypto.subtle.digest(

@@ -7,6 +7,7 @@ import {
   readdir,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -38,6 +39,58 @@ afterEach(async () => {
 });
 
 describe("artifact_finalize tool", () => {
+  it("snapshots internal symlinks as regular files and rejects escaping targets", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Symlink snapshot" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    const draftPath = metadata(prepare).draftPath as string;
+    await writeFile(join(draftPath, "index.html"), "<h1>safe</h1>");
+    await writeFile(join(draftPath, "payload.txt"), "exact bytes\r\n");
+    await symlink("payload.txt", join(draftPath, "alias.txt"));
+
+    const result = await executeTool(
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+    );
+    expect(
+      await readFile(
+        join(metadata(result).revisionPath as string, "alias.txt"),
+      ),
+    ).toEqual(Buffer.from("exact bytes\r\n"));
+    expect(
+      (
+        await stat(join(metadata(result).revisionPath as string, "alias.txt"))
+      ).isFile(),
+    ).toBe(true);
+
+    const escapingPrepare = await executeTool(
+      "artifact_prepare",
+      { title: "Escaping symlink" },
+      context,
+    );
+    const escapingDraft = metadata(escapingPrepare).draftPath as string;
+    await writeFile(join(escapingDraft, "index.html"), "<h1>unsafe</h1>");
+    const outsidePath = join(project, "outside.txt");
+    await writeFile(outsidePath, "must not enter the Revision");
+    await symlink(outsidePath, join(escapingDraft, "outside.txt"));
+    await expect(
+      executeTool(
+        "artifact_finalize",
+        {
+          artifactId: metadata(escapingPrepare).artifactId,
+          entryPath: "index.html",
+          adapter: "browser",
+        },
+        context,
+      ),
+    ).rejects.toThrow(/symlink|escape/i);
+  });
+
   it("returns a script-free outer shell with a restrictive artifact frame", async () => {
     const context = toolContext();
     const prepare = await executeTool(

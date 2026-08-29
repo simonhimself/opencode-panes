@@ -60,7 +60,7 @@ afterEach(async () => {
 });
 
 describe("artifact_sync tool", () => {
-  it("uploads only the earliest finalized Revision, commits exact bytes, and reports pending history", async () => {
+  it("uploads every finalized Revision, commits exact bytes, and reports complete history", async () => {
     const context = toolContext();
     const first = await prepareAndFinalize(context, "Sync me", {
       "index.html": Buffer.from("<h1>one</h1>\r\n"),
@@ -80,8 +80,8 @@ describe("artifact_sync tool", () => {
     expect(metadata).toMatchObject({
       operation: "synced",
       artifactId,
-      syncedVersion: 1,
-      pendingVersions: [2],
+      syncedVersion: 2,
+      pendingVersions: [],
       openCreatorAfterSuccess: "disabled",
     });
     expect(String(metadata.creatorUrl)).toContain("/creator/");
@@ -90,24 +90,46 @@ describe("artifact_sync tool", () => {
       requests.filter(({ path }) => path === "/api/sync/artifacts"),
     ).toHaveLength(1);
     const fileRequests = requests.filter(({ method }) => method === "PUT");
-    expect(fileRequests.map(({ path }) => path).sort()).toEqual([
-      expect.stringContaining("/files/assets%2Fpayload.bin"),
-      expect.stringContaining("/files/index.html"),
-    ]);
+    expect(fileRequests.map(({ path }) => path)).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("/files/assets%2Fpayload.bin"),
+        expect.stringContaining("/files/index.html"),
+        expect.stringContaining("/revisions/2/files/index.html"),
+        expect.stringContaining("/revisions/2/files/assets%2Fpayload.bin"),
+      ]),
+    );
+    expect(fileRequests).toHaveLength(4);
     expect(
-      fileRequests
-        .sort((left, right) => left.path.localeCompare(right.path))
-        .map(({ body }) => body),
-    ).toEqual([Buffer.from([0, 255, 1, 254]), Buffer.from("<h1>one</h1>\r\n")]);
-    const commit = requests.find(({ path }) => path.endsWith("/commit"));
-    expect(commit).toBeDefined();
-    const cloudManifest = JSON.parse(String(commit?.body)).manifest as {
+      fileRequests.find(({ path }) =>
+        path.includes("/revisions/1/files/index.html"),
+      )?.body,
+    ).toEqual(Buffer.from("<h1>one</h1>\r\n"));
+    expect(
+      fileRequests.find(({ path }) =>
+        path.includes("/revisions/1/files/assets%2Fpayload.bin"),
+      )?.body,
+    ).toEqual(Buffer.from([0, 255, 1, 254]));
+    expect(
+      fileRequests.find(({ path }) =>
+        path.includes("/revisions/2/files/index.html"),
+      )?.body,
+    ).toEqual(Buffer.from("<h1>two</h1>"));
+    const commits = requests.filter(({ path }) => path.endsWith("/commit"));
+    expect(commits).toHaveLength(2);
+    const firstManifest = JSON.parse(String(commits[0]?.body)).manifest as {
       revisions: Array<{ files: Array<{ path: string }> }>;
     };
-    expect(cloudManifest.revisions[0]?.files.map(({ path }) => path)).toEqual([
+    expect(firstManifest.revisions).toHaveLength(1);
+    expect(firstManifest.revisions[0]?.files.map(({ path }) => path)).toEqual([
       "assets",
       "assets/payload.bin",
       "index.html",
+    ]);
+    const finalManifest = JSON.parse(String(commits[1]?.body)).manifest as {
+      revisions: Array<{ version: number }>;
+    };
+    expect(finalManifest.revisions.map(({ version }) => version)).toEqual([
+      1, 2,
     ]);
 
     const localManifest = JSON.parse(
@@ -125,17 +147,65 @@ describe("artifact_sync tool", () => {
     expect(JSON.stringify(result)).not.toContain("owner-credential");
   });
 
-  it("fails closed for a custom ignore file before contacting the API", async () => {
+  it("applies artifact-root Gitignore rules while keeping mandatory exclusions excluded", async () => {
     const context = toolContext();
     const prepared = await prepareAndFinalize(context, "Custom ignore", {
       "index.html": Buffer.from("<h1>one</h1>"),
-      ".panesignore": Buffer.from("secret.txt"),
+      "secret.txt": Buffer.from("secret"),
+      "keep.secret": Buffer.from("keep"),
+      ".env": Buffer.from("SECRET=never-upload"),
+      "node_modules/pkg.js": Buffer.from("dependency"),
     });
-    requests = [];
+    await writeFile(
+      join(project, "artifacts", "custom-ignore", ".panesignore"),
+      "*.secret\n!keep.secret\nsecret.txt\n!.env\n",
+    );
+
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    const commit = requests.find(({ path }) => path.endsWith("/commit"));
+    const cloudManifest = JSON.parse(String(commit?.body)).manifest as {
+      revisions: Array<{ files: Array<{ path: string }> }>;
+    };
+    expect(cloudManifest.revisions[0]?.files.map(({ path }) => path)).toEqual([
+      "index.html",
+      "keep.secret",
+    ]);
+    expect(String(commit?.body)).not.toContain("secret.txt");
+    expect(String(commit?.body)).not.toContain(".env");
+    expect(String(commit?.body)).not.toContain("node_modules");
+  });
+
+  it("keeps an earlier committed Revision visible when a later Sync attempt fails", async () => {
+    const context = toolContext();
+    const first = await prepareAndFinalize(context, "Partial history", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    await prepareAndFinalize(context, first.artifactId, {
+      "index.html": Buffer.from("<h1>two</h1>"),
+    });
+
     await expect(
-      executeSync({ artifactId: prepared.artifactId }, context),
-    ).rejects.toThrow(/\.panesignore|ignore/i);
-    expect(requests).toHaveLength(0);
+      executeSync({ artifactId: first.artifactId }, context, {
+        failureInjector: (phase) => {
+          if (phase === "sync-after-commit") throw new Error("later failure");
+        },
+      }),
+    ).rejects.toThrow("later failure");
+    expect(
+      requests.filter(({ path }) => path.endsWith("/commit")),
+    ).toHaveLength(1);
+
+    requests = [];
+    const retry = await executeSync({ artifactId: first.artifactId }, context);
+    expect(resultMetadata(retry)).toMatchObject({
+      syncedVersion: 2,
+      pendingVersions: [],
+    });
+    expect(
+      requests
+        .filter(({ method }) => method === "PUT")
+        .every(({ path }) => path.includes("/revisions/2/")),
+    ).toBe(true);
   });
 
   it("recovers cloud identity from the protected checkpoint", async () => {
