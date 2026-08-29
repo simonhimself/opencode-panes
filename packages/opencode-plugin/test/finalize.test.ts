@@ -89,6 +89,26 @@ describe("artifact_finalize tool", () => {
         context,
       ),
     ).rejects.toThrow(/symlink|escape/i);
+
+    const brokenPrepare = await executeTool(
+      "artifact_prepare",
+      { title: "Broken symlink" },
+      context,
+    );
+    const brokenDraft = metadata(brokenPrepare).draftPath as string;
+    await writeFile(join(brokenDraft, "index.html"), "<h1>broken</h1>");
+    await symlink("missing.txt", join(brokenDraft, "missing.txt"));
+    await expect(
+      executeTool(
+        "artifact_finalize",
+        {
+          artifactId: metadata(brokenPrepare).artifactId,
+          entryPath: "index.html",
+          adapter: "browser",
+        },
+        context,
+      ),
+    ).rejects.toThrow(/symlink|escape/i);
   });
 
   it("returns a script-free outer shell with a restrictive artifact frame", async () => {

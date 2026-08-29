@@ -3,6 +3,7 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import { createHash } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -22,6 +23,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { OpenCodePanesPlugin } from "../src/index.js";
+import { MAX_REMOTE_FILE_BYTES } from "@opencode-panes/contracts";
 
 let project: string;
 let stateHome: string;
@@ -65,6 +67,8 @@ describe("artifact_sync tool", () => {
     const first = await prepareAndFinalize(context, "Sync me", {
       "index.html": Buffer.from("<h1>one</h1>\r\n"),
       "assets/payload.bin": Buffer.from([0, 255, 1, 254]),
+      "bom.txt": Buffer.from([0xef, 0xbb, 0xbf, 0x66, 0x6f, 0x6f, 0x0d, 0x0a]),
+      "empty.bin": Buffer.alloc(0),
       ".env": Buffer.from("SECRET=never-upload"),
       ".git/config": Buffer.from("git internals"),
       "node_modules/pkg/index.js": Buffer.from("dependency"),
@@ -98,7 +102,7 @@ describe("artifact_sync tool", () => {
         expect.stringContaining("/revisions/2/files/assets%2Fpayload.bin"),
       ]),
     );
-    expect(fileRequests).toHaveLength(4);
+    expect(fileRequests).toHaveLength(8);
     expect(
       fileRequests.find(({ path }) =>
         path.includes("/revisions/1/files/index.html"),
@@ -109,6 +113,16 @@ describe("artifact_sync tool", () => {
         path.includes("/revisions/1/files/assets%2Fpayload.bin"),
       )?.body,
     ).toEqual(Buffer.from([0, 255, 1, 254]));
+    expect(
+      fileRequests.find(({ path }) =>
+        path.includes("/revisions/1/files/bom.txt"),
+      )?.body,
+    ).toEqual(Buffer.from([0xef, 0xbb, 0xbf, 0x66, 0x6f, 0x6f, 0x0d, 0x0a]));
+    expect(
+      fileRequests.find(({ path }) =>
+        path.includes("/revisions/1/files/empty.bin"),
+      )?.body,
+    ).toEqual(Buffer.alloc(0));
     expect(
       fileRequests.find(({ path }) =>
         path.includes("/revisions/2/files/index.html"),
@@ -123,6 +137,8 @@ describe("artifact_sync tool", () => {
     expect(firstManifest.revisions[0]?.files.map(({ path }) => path)).toEqual([
       "assets",
       "assets/payload.bin",
+      "bom.txt",
+      "empty.bin",
       "index.html",
     ]);
     const finalManifest = JSON.parse(String(commits[1]?.body)).manifest as {
@@ -173,6 +189,111 @@ describe("artifact_sync tool", () => {
     expect(String(commit?.body)).not.toContain("secret.txt");
     expect(String(commit?.body)).not.toContain(".env");
     expect(String(commit?.body)).not.toContain("node_modules");
+  });
+
+  it("does not count an ignored oversized file or disclose its metadata", async () => {
+    const context = toolContext();
+    const ignoredBytes = Buffer.alloc(MAX_REMOTE_FILE_BYTES + 1, 7);
+    const prepared = await prepareAndFinalize(context, "Ignored limit", {
+      "index.html": Buffer.from("<h1>visible</h1>"),
+      "ignored.bin": ignoredBytes,
+    });
+    const ignoredHash = createHash("sha256").update(ignoredBytes).digest("hex");
+    await writeFile(
+      join(project, "artifacts", "ignored-limit", ".panesignore"),
+      "ignored.bin\n",
+    );
+
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    const commit = requests.find(({ path }) => path.endsWith("/commit"));
+    expect(String(commit?.body)).not.toContain("ignored.bin");
+    expect(String(commit?.body)).not.toContain(ignoredHash);
+    expect(String(commit?.body)).not.toContain(String(ignoredBytes.byteLength));
+    expect(
+      requests.filter(
+        ({ method, path }) => method === "PUT" && path.includes("ignored.bin"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("preserves an earlier filtered cloud Revision when ignore rules change", async () => {
+    const context = toolContext();
+    const first = await prepareAndFinalize(context, "Changing ignore", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+      "retained.txt": Buffer.from("keep in v1"),
+      "v1-ignored.txt": Buffer.from("omit in v1"),
+    });
+    const panesIgnorePath = join(
+      project,
+      "artifacts",
+      "changing-ignore",
+      ".panesignore",
+    );
+    await writeFile(panesIgnorePath, "v1-ignored.txt\nv2-ignored.txt\n");
+    await executeSync({ artifactId: first.artifactId }, context);
+    const firstCommit = JSON.parse(
+      String(requests.find(({ path }) => path.endsWith("/commit"))?.body),
+    ).manifest as { revisions: Array<{ files: Array<{ path: string }> }> };
+
+    await prepareAndFinalize(context, first.artifactId, {
+      "index.html": Buffer.from("<h1>two</h1>"),
+      "v2-ignored.txt": Buffer.from("omit in v2"),
+    });
+    await writeFile(
+      panesIgnorePath,
+      "retained.txt\nv1-ignored.txt\nv2-ignored.txt\n",
+    );
+    requests = [];
+    await executeSync({ artifactId: first.artifactId }, context);
+    const secondCommit = JSON.parse(
+      String(requests.find(({ path }) => path.endsWith("/commit"))?.body),
+    ).manifest as { revisions: Array<{ files: Array<{ path: string }> }> };
+    expect(secondCommit.revisions[0]).toEqual(firstCommit.revisions[0]);
+    expect(secondCommit.revisions[1]?.files.map(({ path }) => path)).toEqual([
+      "index.html",
+    ]);
+    expect(
+      requests.filter(
+        ({ method, path }) =>
+          method === "PUT" && path.includes("/revisions/1/"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("fails clearly when committed state lacks filtered Revision metadata", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Missing metadata", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    await executeSync({ artifactId: prepared.artifactId }, context);
+
+    expect(
+      await updateStoredSyncState((state) => {
+        delete state.syncedRevisionManifests;
+      }),
+    ).toBe(true);
+
+    await expect(
+      executeSync({ artifactId: prepared.artifactId }, context),
+    ).rejects.toThrow(/lacks filtered metadata/i);
+  });
+
+  it("fails clearly when committed state metadata does not correlate", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Corrupt metadata", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    await executeSync({ artifactId: prepared.artifactId }, context);
+
+    expect(
+      await updateStoredSyncState((state) => {
+        state.syncedRevisionManifests = [];
+      }),
+    ).toBe(true);
+
+    await expect(
+      executeSync({ artifactId: prepared.artifactId }, context),
+    ).rejects.toThrow(/does not correlate/i);
   });
 
   it("keeps an earlier committed Revision visible when a later Sync attempt fails", async () => {
@@ -308,6 +429,26 @@ function resultMetadata(result: ToolResult) {
   if (typeof result === "string" || !result.metadata)
     throw new Error("expected metadata");
   return result.metadata as Record<string, unknown>;
+}
+
+async function updateStoredSyncState(
+  update: (state: Record<string, unknown>) => void,
+) {
+  const stateRoot = join(stateHome, "opencode-panes");
+  const stateFiles = await readdir(stateRoot, { recursive: true });
+  for (const file of stateFiles) {
+    if (!file.endsWith(".json")) continue;
+    const statePath = join(stateRoot, file);
+    const state = JSON.parse(await readFile(statePath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    if (!Array.isArray(state.syncedRevisionVersions)) continue;
+    update(state);
+    await writeFile(statePath, JSON.stringify(state));
+    return true;
+  }
+  return false;
 }
 
 async function handleRequest(

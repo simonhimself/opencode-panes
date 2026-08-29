@@ -76,8 +76,10 @@ describe("first private Sync Worker HTTP seam", () => {
     await uploadFile(
       artifact.cloudArtifactId,
       1,
+      "index.html",
       v1,
       "application/octet-stream",
+      "owner-credential-history",
     );
     expect(
       (
@@ -97,8 +99,10 @@ describe("first private Sync Worker HTTP seam", () => {
     await uploadFile(
       artifact.cloudArtifactId,
       2,
+      "index.html",
       v2,
       "application/octet-stream",
+      "owner-credential-history",
     );
     expect(
       (
@@ -388,15 +392,17 @@ describe("first private Sync Worker HTTP seam", () => {
 async function uploadFile(
   artifactId: string,
   version: number,
+  path: string,
   bytes: Uint8Array,
   mediaType: string,
+  token: string,
 ) {
   return api(
-    `/api/sync/artifacts/${artifactId}/revisions/${version}/files/index.html`,
+    `/api/sync/artifacts/${artifactId}/revisions/${version}/files/${encodeURIComponent(path)}`,
     {
       method: "PUT",
       headers: {
-        Authorization: "Bearer owner-credential-history",
+        Authorization: `Bearer ${token}`,
         "Content-Type": mediaType,
         "X-Panes-File-SHA256": await sha256(bytes),
         "X-Panes-File-Byte-Size": String(bytes.byteLength),

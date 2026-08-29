@@ -128,6 +128,7 @@ interface StoredSyncState {
   creatorExpiresAt: string;
   creationIdempotencyKey: string;
   syncedRevisionVersions: number[];
+  syncedRevisionManifests?: FinalizedRevision[];
 }
 
 interface SyncCheckpoint extends StoredSyncState {
@@ -1966,6 +1967,7 @@ async function syncLocalArtifact(
         inventoryUrl: "https://invalid.local/inventory",
         creatorExpiresAt: new Date(0).toISOString(),
         syncedRevisionVersions: [],
+        syncedRevisionManifests: [],
       };
       await writeSyncCheckpoint(checkpointPath, checkpoint);
       injectFailure(options, "sync-after-checkpoint");
@@ -2058,24 +2060,33 @@ async function syncLocalArtifact(
   }
 
   const synced = new Set(state.syncedRevisionVersions);
+  if (synced.size > 0 && !state.syncedRevisionManifests) {
+    throw new Error(
+      "Protected Sync state lacks filtered metadata for its committed Revisions. Restore the protected Panes state before retrying; Sync will not guess the prior cloud manifest.",
+    );
+  }
+  if (synced.size > 0) {
+    const committedVersions = [...synced].sort((left, right) => left - right);
+    const storedVersions = new Set(
+      state.syncedRevisionManifests!.map((revision) => revision.version),
+    );
+    if (
+      storedVersions.size !== synced.size ||
+      committedVersions.some(
+        (version, index) =>
+          version !== index + 1 || !storedVersions.has(version),
+      )
+    ) {
+      throw new Error(
+        "Protected Sync state has filtered metadata that does not correlate with its committed Revisions. Restore the protected Panes state before retrying.",
+      );
+    }
+  }
   const pendingRevisions = artifact.manifest.revisions
     .filter((candidate) => !synced.has(candidate.version))
     .sort((left, right) => left.version - right.version);
   let lastSyncedVersion = state.syncedRevisionVersions.at(-1) ?? 0;
   for (const revision of pendingRevisions) {
-    const selections = artifact.manifest.revisions
-      .filter(
-        (candidate) =>
-          synced.has(candidate.version) ||
-          candidate.version === revision.version,
-      )
-      .sort((left, right) => left.version - right.version)
-      .map((candidate) => ({
-        version: candidate.version,
-        paths: selectedSyncFiles(candidate, panesIgnore).map(
-          (file) => file.path,
-        ),
-      }));
     const selectedFiles = selectedSyncFiles(revision, panesIgnore);
     if (
       mandatorySyncExclusion(revision.preview.entryPath) ||
@@ -2085,11 +2096,36 @@ async function syncLocalArtifact(
         `Sync cannot upload the excluded Preview entry ${JSON.stringify(revision.preview.entryPath)}.`,
       );
     }
-    const derived = deriveCloudManifest(artifact.manifest, selections);
+    const currentRevision = deriveCloudManifest(artifact.manifest, [
+      {
+        version: revision.version,
+        paths: selectedFiles.map((file) => file.path),
+      },
+    ]).revisions[0];
+    if (!currentRevision)
+      throw new Error("Current cloud Revision could not be derived.");
+    const committedRevisionManifests = state.syncedRevisionManifests;
+    const previousRevisions = [...synced]
+      .sort((left, right) => left - right)
+      .map((version) => {
+        const stored = committedRevisionManifests?.find(
+          (candidate) => candidate.version === version,
+        );
+        if (!stored) {
+          throw new Error(
+            `Protected Sync state lacks filtered metadata for committed Revision v${version}. Restore the protected Panes state before retrying.`,
+          );
+        }
+        return stored;
+      });
     const cloudManifest: CloudManifest = {
-      ...derived,
+      schemaVersion: 1,
       projectId: state.cloudProjectId,
       artifactId: state.cloudArtifactId,
+      slug: artifact.manifest.slug,
+      title: artifact.manifest.title,
+      ...(artifact.manifest.kind ? { kind: artifact.manifest.kind } : {}),
+      revisions: [...previousRevisions, currentRevision],
     };
     for (const file of selectedFiles) {
       if (file.kind !== "file") continue;
@@ -2150,6 +2186,10 @@ async function syncLocalArtifact(
       syncedRevisionVersions: [
         ...new Set([...state.syncedRevisionVersions, revision.version]),
       ].sort((left, right) => left - right),
+      syncedRevisionManifests: [
+        ...(state.syncedRevisionManifests ?? []),
+        currentRevision,
+      ].sort((left, right) => left.version - right.version),
     };
     synced.add(revision.version);
     await writeSyncState(state);
@@ -2193,6 +2233,7 @@ function syncStateFromCheckpoint(checkpoint: SyncCheckpoint): StoredSyncState {
     creatorExpiresAt: checkpoint.creatorExpiresAt,
     creationIdempotencyKey: checkpoint.creationIdempotencyKey,
     syncedRevisionVersions: checkpoint.syncedRevisionVersions,
+    syncedRevisionManifests: checkpoint.syncedRevisionManifests ?? [],
   };
 }
 
@@ -4857,7 +4898,7 @@ function isStoredSyncState(
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const state = value as Record<string, unknown>;
   return (
-    Object.keys(state).length === 12 &&
+    (Object.keys(state).length === 12 || Object.keys(state).length === 13) &&
     state.schemaVersion === 1 &&
     state.apiOrigin === apiOrigin &&
     state.projectId === projectId &&
@@ -4875,7 +4916,12 @@ function isStoredSyncState(
         typeof version === "number" &&
         Number.isSafeInteger(version) &&
         version > 0,
-    )
+    ) &&
+    (state.syncedRevisionManifests === undefined ||
+      (Array.isArray(state.syncedRevisionManifests) &&
+        state.syncedRevisionManifests.every(
+          (revision) => finalizedRevisionSchema.safeParse(revision).success,
+        )))
   );
 }
 
@@ -4883,7 +4929,8 @@ function isSyncCheckpoint(value: unknown): value is SyncCheckpoint {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const checkpoint = value as Record<string, unknown>;
   return (
-    Object.keys(checkpoint).length === 14 &&
+    (Object.keys(checkpoint).length === 14 ||
+      Object.keys(checkpoint).length === 15) &&
     checkpoint.schemaVersion === 1 &&
     ["planned", "identity", "mapped"].includes(String(checkpoint.phase)) &&
     typeof checkpoint.apiOrigin === "string" &&
@@ -4897,7 +4944,12 @@ function isSyncCheckpoint(value: unknown): value is SyncCheckpoint {
     typeof checkpoint.inventoryUrl === "string" &&
     typeof checkpoint.creatorExpiresAt === "string" &&
     typeof checkpoint.creationIdempotencyKey === "string" &&
-    Array.isArray(checkpoint.syncedRevisionVersions)
+    Array.isArray(checkpoint.syncedRevisionVersions) &&
+    (checkpoint.syncedRevisionManifests === undefined ||
+      (Array.isArray(checkpoint.syncedRevisionManifests) &&
+        checkpoint.syncedRevisionManifests.every(
+          (revision) => finalizedRevisionSchema.safeParse(revision).success,
+        )))
   );
 }
 
