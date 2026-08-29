@@ -42,6 +42,7 @@ import {
   artifactManifestSchema,
   artifactFilesSchema,
   artifactSlugSchema,
+  deriveCloudManifest,
   WORKSPACE_TOKEN_FRAGMENT_KEY,
   artifactIdSchema,
   artifactTypeSchema,
@@ -58,12 +59,15 @@ import {
   revisionNumberSchema,
   revisionResponseSchema,
   workspaceTokenSchema,
+  syncCreateResponseSchema,
+  syncRevisionCommitResponseSchema,
   type ArtifactManifest,
   type ArtifactFile,
   type ArtifactType,
   type Draft,
   type FinalizedRevision,
   type PreviewEntry,
+  type CloudManifest,
 } from "@opencode-panes/contracts";
 import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin";
 
@@ -108,6 +112,26 @@ interface StoredArtifactState {
   viewerUrl: string;
   title: string;
   type: ArtifactType;
+}
+
+interface StoredSyncState {
+  schemaVersion: 1;
+  apiOrigin: string;
+  projectId: string;
+  artifactId: string;
+  cloudProjectId: string;
+  cloudArtifactId: string;
+  ownerCredential: string;
+  creatorUrl: string;
+  inventoryUrl: string;
+  creatorExpiresAt: string;
+  creationIdempotencyKey: string;
+  syncedRevisionVersions: number[];
+}
+
+interface SyncCheckpoint extends StoredSyncState {
+  phase: "planned" | "identity" | "mapped";
+  creatorToken: string;
 }
 
 type AutoOpenStatus = "disabled" | "opened" | "permission-denied" | "failed";
@@ -424,6 +448,27 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             originApprovals,
             options,
           );
+        },
+      }),
+      artifact_sync: tool({
+        description:
+          "Sync the earliest unsynced finalized local Revision to private Cloudflare storage. This never publishes an artifact.",
+        args: {
+          artifactId: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^\S+$/)
+            .describe("Local artifact ID returned by artifact_prepare."),
+          openCreatorAfterSuccess: tool.schema
+            .boolean()
+            .optional()
+            .describe(
+              "Open the returned 30-day Creator link after Sync succeeds.",
+            ),
+        },
+        async execute(args, context) {
+          return syncArtifact(args, context, locks, options);
         },
       }),
     },
@@ -1786,6 +1831,23 @@ interface OriginApproval {
   preview: PreviewEntry;
 }
 
+type SyncArguments = {
+  artifactId: string;
+  openCreatorAfterSuccess?: boolean | undefined;
+};
+
+interface SyncResult {
+  operation: "synced";
+  artifactId: string;
+  title: string;
+  syncedVersion: number;
+  pendingVersions: number[];
+  creatorUrl: string;
+  inventoryUrl: string;
+  creatorExpiresAt: string;
+  openCreatorAfterSuccess: AutoOpenStatus;
+}
+
 interface FinalizationJournal {
   schemaVersion: 1;
   phase: "prepared" | "renamed" | "manifest-replaced";
@@ -1795,6 +1857,369 @@ interface FinalizationJournal {
   revisionPath: string;
   revision: FinalizedRevision;
   manifest: ArtifactManifest;
+}
+
+async function syncArtifact(
+  args: SyncArguments,
+  context: ToolContext,
+  locks: Map<string, Promise<void>>,
+  options: ResolvedOptions,
+) {
+  const artifactId = artifactIdSchema.safeParse(args.artifactId);
+  if (!artifactId.success) throw validationError("Artifact ID is invalid");
+  if (
+    args.openCreatorAfterSuccess !== undefined &&
+    typeof args.openCreatorAfterSuccess !== "boolean"
+  ) {
+    throw validationError("openCreatorAfterSuccess must be a boolean");
+  }
+
+  const project = await resolveLocalProject(context);
+  const existing = await findArtifact(project.artifactRoot, artifactId.data);
+  if (!existing) {
+    throw new Error(
+      `No local artifact with ID ${artifactId.data} was found under ${project.artifactRoot}.`,
+    );
+  }
+  return withArtifactLock(locks, existing.artifactDirectory, () =>
+    syncLocalArtifact(
+      existing,
+      context,
+      options,
+      args.openCreatorAfterSuccess ?? false,
+    ),
+  );
+}
+
+async function syncLocalArtifact(
+  existing: LocalArtifact,
+  context: ToolContext,
+  options: ResolvedOptions,
+  openCreatorAfterSuccess: boolean,
+) {
+  await recoverFinalization(existing);
+  await recoverImport(existing);
+  const artifact = await readArtifactDirectory(existing.artifactDirectory);
+  if (!artifact) throw new Error("The local artifact disappeared during Sync.");
+  await verifyFinalizedRevisions(artifact);
+  if (artifact.manifest.revisions.length === 0) {
+    throw new Error("Sync requires at least one finalized Revision.");
+  }
+  if (
+    (await pathExists(join(artifact.artifactDirectory, "draft"))) ||
+    (await pathExists(join(artifact.artifactDirectory, "draft.json")))
+  ) {
+    throw new Error("Sync refuses an Artifact with an unfinished Draft.");
+  }
+  if (await pathExists(join(artifact.artifactDirectory, ".panesignore"))) {
+    throw new Error("Sync cannot evaluate .panesignore and fails closed.");
+  }
+  if (
+    artifact.manifest.revisions.some((revision) =>
+      revision.files.some((file) =>
+        file.path
+          .split("/")
+          .some((segment) => segment.toLocaleLowerCase() === ".panesignore"),
+      ),
+    )
+  ) {
+    throw new Error("Sync cannot evaluate .panesignore and fails closed.");
+  }
+
+  const checkpointPath = syncCheckpointPath(
+    options.apiBaseUrl.origin,
+    artifact.manifest.projectId,
+    artifact.manifest.artifactId,
+  );
+  let state = await readSyncState(
+    options.apiBaseUrl.origin,
+    artifact.manifest.projectId,
+    artifact.manifest.artifactId,
+  );
+  let checkpoint = await readSyncCheckpoint(checkpointPath);
+  if (!state && artifact.manifest.cloud) {
+    throw new Error(
+      `Sync ownership state for artifact ${artifact.manifest.artifactId} is missing. Restore the protected Panes state before retrying.`,
+    );
+  }
+
+  if (!state) {
+    if (checkpoint) {
+      if (
+        checkpoint.apiOrigin !== options.apiBaseUrl.origin ||
+        checkpoint.projectId !== artifact.manifest.projectId ||
+        checkpoint.artifactId !== artifact.manifest.artifactId
+      ) {
+        throw new Error("Sync checkpoint does not match this local Artifact.");
+      }
+      if (checkpoint.phase === "identity") {
+        state = syncStateFromCheckpoint(checkpoint);
+        await writeSyncState(state);
+      }
+    }
+  }
+
+  if (!state) {
+    if (!checkpoint) {
+      const ownerCredential = `sync-owner-${randomUUID()}`;
+      const creatorToken = `sync-creator-${randomUUID()}`;
+      checkpoint = {
+        schemaVersion: 1,
+        phase: "planned",
+        apiOrigin: options.apiBaseUrl.origin,
+        projectId: artifact.manifest.projectId,
+        artifactId: artifact.manifest.artifactId,
+        creationIdempotencyKey: `sync-${randomUUID()}`,
+        ownerCredential,
+        creatorToken,
+        cloudProjectId: "pending",
+        cloudArtifactId: "pending",
+        creatorUrl: "https://invalid.local/creator/pending",
+        inventoryUrl: "https://invalid.local/inventory",
+        creatorExpiresAt: new Date(0).toISOString(),
+        syncedRevisionVersions: [],
+      };
+      await writeSyncCheckpoint(checkpointPath, checkpoint);
+      injectFailure(options, "sync-after-checkpoint");
+    }
+    if (checkpoint.phase !== "planned") {
+      throw new Error("Sync checkpoint could not recover its cloud identity.");
+    }
+
+    await ensureUploadPermission(context, options.apiBaseUrl, {
+      operation: "sync",
+      title: artifact.manifest.title,
+    });
+    const createPayload = {
+      projectId: artifact.manifest.projectId,
+      artifactId: artifact.manifest.artifactId,
+      slug: artifact.manifest.slug,
+      title: artifact.manifest.title,
+      ...(artifact.manifest.kind ? { kind: artifact.manifest.kind } : {}),
+      idempotencyKey: checkpoint.creationIdempotencyKey,
+      ownerCredential: checkpoint.ownerCredential,
+      creatorToken: checkpoint.creatorToken,
+    };
+    const createResponse = await fetchPanes(
+      new URL("/api/sync/artifacts", options.apiBaseUrl),
+      {
+        method: "POST",
+        headers: jsonHeaders(undefined, options.createApiKey),
+        body: JSON.stringify(createPayload),
+      },
+      context.abort,
+      options.requestTimeoutMs,
+    );
+    const created = await parseApiResponse(
+      createResponse,
+      syncCreateResponseSchema,
+      [
+        ...(options.createApiKey ? [options.createApiKey] : []),
+        checkpoint.ownerCredential,
+        checkpoint.creatorToken,
+      ],
+    );
+    const creatorUrl = validateCreatorUrl(
+      created.creatorUrl,
+      options.apiBaseUrl.origin,
+      checkpoint.creatorToken,
+    );
+    const inventoryUrl = validateInventoryUrl(
+      created.inventoryUrl,
+      options.apiBaseUrl.origin,
+    );
+    checkpoint = {
+      ...checkpoint,
+      phase: "identity",
+      cloudProjectId: created.cloudProjectId,
+      cloudArtifactId: created.cloudArtifactId,
+      creatorUrl,
+      inventoryUrl,
+      creatorExpiresAt: created.creatorExpiresAt,
+    };
+    await writeSyncCheckpoint(checkpointPath, checkpoint);
+    state = syncStateFromCheckpoint(checkpoint);
+    injectFailure(options, "sync-after-ownership");
+    await writeSyncState(state);
+  } else if (checkpoint && checkpoint.apiOrigin !== options.apiBaseUrl.origin) {
+    throw new Error("Sync checkpoint belongs to another API origin.");
+  }
+
+  if (!state) throw new Error("Sync ownership state could not be recovered.");
+  if (
+    artifact.manifest.cloud &&
+    (artifact.manifest.cloud.cloudProjectId !== state.cloudProjectId ||
+      artifact.manifest.cloud.cloudArtifactId !== state.cloudArtifactId)
+  ) {
+    throw new Error(
+      "The local cloud Artifact mapping conflicts with protected Sync state.",
+    );
+  }
+  if (!artifact.manifest.cloud) {
+    await writeJsonDurable(
+      join(artifact.artifactDirectory, "artifact.json"),
+      artifactManifestSchema.parse({
+        ...artifact.manifest,
+        cloud: {
+          cloudProjectId: state.cloudProjectId,
+          cloudArtifactId: state.cloudArtifactId,
+        },
+      }),
+    );
+    injectFailure(options, "sync-after-mapping");
+  }
+
+  const synced = new Set(state.syncedRevisionVersions);
+  const revision = artifact.manifest.revisions.find(
+    (candidate) => !synced.has(candidate.version),
+  );
+  if (revision) {
+    const selectedFiles = revision.files.filter(
+      (file) => !mandatorySyncExclusion(file.path),
+    );
+    if (mandatorySyncExclusion(revision.preview.entryPath)) {
+      throw new Error(
+        `Sync cannot upload the excluded Preview entry ${JSON.stringify(revision.preview.entryPath)}.`,
+      );
+    }
+    const derived = deriveCloudManifest(artifact.manifest, [
+      {
+        version: revision.version,
+        paths: selectedFiles.map((file) => file.path),
+      },
+    ]);
+    const cloudManifest: CloudManifest = {
+      ...derived,
+      projectId: state.cloudProjectId,
+      artifactId: state.cloudArtifactId,
+    };
+    for (const file of selectedFiles) {
+      if (file.kind !== "file") continue;
+      const bytes = await readFile(
+        join(artifact.artifactDirectory, `v${revision.version}`, file.path),
+      );
+      const actualHash = createHash("sha256").update(bytes).digest("hex");
+      if (bytes.byteLength !== file.byteSize || actualHash !== file.sha256) {
+        throw new Error(
+          `Finalized Revision ${revision.version} changed while Sync was reading ${file.path}.`,
+        );
+      }
+      const uploadResponse = await fetchPanes(
+        new URL(
+          `/api/sync/artifacts/${encodeURIComponent(state.cloudArtifactId)}/revisions/${revision.version}/files/${encodeURIComponent(file.path)}`,
+          options.apiBaseUrl,
+        ),
+        {
+          method: "PUT",
+          headers: {
+            ...jsonHeaders(state.ownerCredential),
+            "content-type": file.mediaType,
+            "x-panes-file-sha256": file.sha256,
+            "x-panes-file-byte-size": String(file.byteSize),
+          },
+          body: bytes,
+        },
+        context.abort,
+        options.requestTimeoutMs,
+      );
+      if (uploadResponse.status !== 204) {
+        await parseApiResponse(
+          uploadResponse,
+          syncRevisionCommitResponseSchema,
+          [state.ownerCredential],
+        );
+      }
+    }
+    injectFailure(options, "sync-after-upload");
+    const commitResponse = await fetchPanes(
+      new URL(
+        `/api/sync/artifacts/${encodeURIComponent(state.cloudArtifactId)}/revisions/${revision.version}/commit`,
+        options.apiBaseUrl,
+      ),
+      {
+        method: "POST",
+        headers: jsonHeaders(state.ownerCredential),
+        body: JSON.stringify({ manifest: cloudManifest }),
+      },
+      context.abort,
+      options.requestTimeoutMs,
+    );
+    await parseApiResponse(commitResponse, syncRevisionCommitResponseSchema, [
+      state.ownerCredential,
+    ]);
+    state = {
+      ...state,
+      syncedRevisionVersions: [
+        ...new Set([...state.syncedRevisionVersions, revision.version]),
+      ].sort((left, right) => left - right),
+    };
+    await writeSyncState(state);
+    injectFailure(options, "sync-after-commit");
+  }
+
+  await unlink(checkpointPath).catch(() => undefined);
+  const pendingVersions = artifact.manifest.revisions
+    .map((candidate) => candidate.version)
+    .filter((version) => !state.syncedRevisionVersions.includes(version));
+  const autoOpenStatus = await maybeOpenViewer(
+    state.creatorUrl,
+    context,
+    openCreatorAfterSuccess,
+  );
+  return syncToolResult({
+    operation: "synced",
+    artifactId: artifact.manifest.artifactId,
+    title: artifact.manifest.title,
+    syncedVersion:
+      revision?.version ?? state.syncedRevisionVersions.at(-1) ?? 0,
+    pendingVersions,
+    creatorUrl: state.creatorUrl,
+    inventoryUrl: state.inventoryUrl,
+    creatorExpiresAt: state.creatorExpiresAt,
+    openCreatorAfterSuccess: autoOpenStatus,
+  });
+}
+
+function syncStateFromCheckpoint(checkpoint: SyncCheckpoint): StoredSyncState {
+  return {
+    schemaVersion: 1,
+    apiOrigin: checkpoint.apiOrigin,
+    projectId: checkpoint.projectId,
+    artifactId: checkpoint.artifactId,
+    cloudProjectId: checkpoint.cloudProjectId,
+    cloudArtifactId: checkpoint.cloudArtifactId,
+    ownerCredential: checkpoint.ownerCredential,
+    creatorUrl: checkpoint.creatorUrl,
+    inventoryUrl: checkpoint.inventoryUrl,
+    creatorExpiresAt: checkpoint.creatorExpiresAt,
+    creationIdempotencyKey: checkpoint.creationIdempotencyKey,
+    syncedRevisionVersions: checkpoint.syncedRevisionVersions,
+  };
+}
+
+function mandatorySyncExclusion(path: string) {
+  return path.split("/").some((segment) => {
+    const lower = segment.toLocaleLowerCase();
+    return (
+      lower === ".panesignore" ||
+      lower === ".git" ||
+      lower === "node_modules" ||
+      lower === "vendor" ||
+      lower === ".cache" ||
+      lower === ".parcel-cache" ||
+      lower === ".vite" ||
+      lower === ".turbo" ||
+      lower === "__pycache__" ||
+      lower === ".next" ||
+      lower === ".nuxt" ||
+      lower === "coverage" ||
+      lower === ".env" ||
+      lower.startsWith(".env.") ||
+      lower.endsWith(".pem") ||
+      lower.endsWith(".key") ||
+      lower.endsWith(".p12")
+    );
+  });
 }
 
 async function finalizeArtifact(
@@ -4197,7 +4622,7 @@ function isLoopbackHost(url: URL) {
 async function ensureUploadPermission(
   context: ToolContext,
   apiBaseUrl: URL,
-  metadata: { operation: "create" | "update"; title: string },
+  metadata: { operation: "create" | "update" | "sync"; title: string },
 ) {
   await context.ask({
     permission: "artifact_upload",
@@ -4205,6 +4630,177 @@ async function ensureUploadPermission(
     always: [apiBaseUrl.origin],
     metadata: { endpoint: apiBaseUrl.origin, ...metadata },
   });
+}
+
+function syncToolResult(input: SyncResult) {
+  const metadata = {
+    operation: input.operation,
+    artifactId: input.artifactId,
+    title: input.title,
+    syncedVersion: input.syncedVersion,
+    pendingVersions: input.pendingVersions,
+    creatorUrl: input.creatorUrl,
+    inventoryUrl: input.inventoryUrl,
+    creatorExpiresAt: input.creatorExpiresAt,
+    openCreatorAfterSuccess: input.openCreatorAfterSuccess,
+  };
+  return {
+    title: `Synced ${input.title}`,
+    output: JSON.stringify(metadata),
+    metadata,
+  };
+}
+
+function validateCreatorUrl(value: unknown, apiOrigin: string, token: string) {
+  if (typeof value !== "string") throw malformedSuccessResponse();
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw malformedSuccessResponse();
+  }
+  if (
+    url.origin !== apiOrigin ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname !== `/creator/${encodeURIComponent(token)}`
+  ) {
+    throw malformedSuccessResponse();
+  }
+  return url.href;
+}
+
+function validateInventoryUrl(value: unknown, apiOrigin: string) {
+  if (typeof value !== "string") throw malformedSuccessResponse();
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw malformedSuccessResponse();
+  }
+  if (
+    url.origin !== apiOrigin ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    url.pathname !== "/inventory"
+  ) {
+    throw malformedSuccessResponse();
+  }
+  return url.href;
+}
+
+async function writeSyncState(state: StoredSyncState) {
+  const path = syncStatePath(
+    state.apiOrigin,
+    state.projectId,
+    state.artifactId,
+  );
+  await writeProtectedJson(path, state);
+}
+
+async function readSyncState(
+  apiOrigin: string,
+  projectId: string,
+  artifactId: string,
+): Promise<StoredSyncState | undefined> {
+  const path = syncStatePath(apiOrigin, projectId, artifactId);
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw new Error(
+      `Could not read local Sync state for artifact ${artifactId}.`,
+    );
+  }
+  if (!isStoredSyncState(value, apiOrigin, projectId, artifactId)) {
+    throw new Error(`Local Sync state for artifact ${artifactId} is invalid.`);
+  }
+  return value;
+}
+
+async function writeSyncCheckpoint(path: string, checkpoint: SyncCheckpoint) {
+  await writeProtectedJson(path, checkpoint);
+}
+
+async function readSyncCheckpoint(
+  path: string,
+): Promise<SyncCheckpoint | undefined> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw new Error(`Sync checkpoint at ${path} is malformed.`);
+  }
+  if (!isSyncCheckpoint(value))
+    throw new Error(`Sync checkpoint at ${path} is invalid.`);
+  return value;
+}
+
+function isStoredSyncState(
+  value: unknown,
+  apiOrigin: string,
+  projectId: string,
+  artifactId: string,
+): value is StoredSyncState {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const state = value as Record<string, unknown>;
+  return (
+    Object.keys(state).length === 12 &&
+    state.schemaVersion === 1 &&
+    state.apiOrigin === apiOrigin &&
+    state.projectId === projectId &&
+    state.artifactId === artifactId &&
+    typeof state.cloudProjectId === "string" &&
+    typeof state.cloudArtifactId === "string" &&
+    ownerTokenSchema.safeParse(state.ownerCredential).success &&
+    typeof state.creatorUrl === "string" &&
+    typeof state.inventoryUrl === "string" &&
+    typeof state.creatorExpiresAt === "string" &&
+    typeof state.creationIdempotencyKey === "string" &&
+    Array.isArray(state.syncedRevisionVersions) &&
+    state.syncedRevisionVersions.every(
+      (version) =>
+        typeof version === "number" &&
+        Number.isSafeInteger(version) &&
+        version > 0,
+    )
+  );
+}
+
+function isSyncCheckpoint(value: unknown): value is SyncCheckpoint {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const checkpoint = value as Record<string, unknown>;
+  return (
+    Object.keys(checkpoint).length === 14 &&
+    checkpoint.schemaVersion === 1 &&
+    ["planned", "identity", "mapped"].includes(String(checkpoint.phase)) &&
+    typeof checkpoint.apiOrigin === "string" &&
+    typeof checkpoint.projectId === "string" &&
+    typeof checkpoint.artifactId === "string" &&
+    typeof checkpoint.cloudProjectId === "string" &&
+    typeof checkpoint.cloudArtifactId === "string" &&
+    ownerTokenSchema.safeParse(checkpoint.ownerCredential).success &&
+    ownerTokenSchema.safeParse(checkpoint.creatorToken).success &&
+    typeof checkpoint.creatorUrl === "string" &&
+    typeof checkpoint.inventoryUrl === "string" &&
+    typeof checkpoint.creatorExpiresAt === "string" &&
+    typeof checkpoint.creationIdempotencyKey === "string" &&
+    Array.isArray(checkpoint.syncedRevisionVersions)
+  );
+}
+
+async function writeProtectedJson(path: string, value: unknown) {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await restrictPermissions(directory, 0o700);
+  await writeJsonDurable(path, value, 0o600);
+  await restrictPermissions(path, 0o600);
 }
 
 async function writeArtifactState(state: StoredArtifactState) {
@@ -4363,6 +4959,34 @@ function artifactStateDirectory(apiOrigin: string) {
 
 function artifactStatePath(apiOrigin: string, artifactId: string) {
   return join(artifactStateDirectory(apiOrigin), `${sha256(artifactId)}.json`);
+}
+
+function syncStatePath(
+  apiOrigin: string,
+  projectId: string,
+  artifactId: string,
+) {
+  return join(
+    stateRootDirectory(),
+    "origins",
+    sha256(apiOrigin),
+    "sync",
+    `${sha256(`${projectId}:${artifactId}`)}.json`,
+  );
+}
+
+function syncCheckpointPath(
+  apiOrigin: string,
+  projectId: string,
+  artifactId: string,
+) {
+  return join(
+    stateRootDirectory(),
+    "origins",
+    sha256(apiOrigin),
+    "sync-checkpoints",
+    `${sha256(`${projectId}:${artifactId}`)}.json`,
+  );
 }
 
 function stateRootDirectory() {

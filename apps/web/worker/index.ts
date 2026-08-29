@@ -17,6 +17,7 @@ import {
   type ErrorIssue,
   type Revision,
 } from "@opencode-panes/contracts";
+import { routeSyncRequest } from "./sync";
 
 // JSON can encode one UTF-8 source byte as a six-byte Unicode escape.
 export const MAX_JSON_BODY_BYTES = MAX_ARTIFACT_SOURCE_BYTES * 6 + 16 * 1024;
@@ -101,6 +102,9 @@ export default {
 
 async function routeRequest(request: Request, env: Env): Promise<Response> {
   const { pathname } = new URL(request.url);
+
+  const syncResponse = await routeSyncRequest(request, env);
+  if (syncResponse) return syncResponse;
 
   if (pathname === "/api/artifacts") {
     if (request.method !== "POST") return methodNotAllowed(["POST"]);
@@ -872,6 +876,17 @@ export function logUnexpectedError(request: Request, error: unknown): void {
 
 function routeTemplate(pathname: string): string {
   if (pathname === "/api/artifacts") return "/api/artifacts";
+  if (pathname === "/api/sync/artifacts") return "/api/sync/artifacts";
+  if (
+    /^\/api\/sync\/artifacts\/[^/]+\/revisions\/\d+\/files\/.+$/u.test(pathname)
+  ) {
+    return "/api/sync/artifacts/:artifactId/revisions/:version/files/:path";
+  }
+  if (
+    /^\/api\/sync\/artifacts\/[^/]+\/revisions\/\d+\/commit$/u.test(pathname)
+  ) {
+    return "/api/sync/artifacts/:artifactId/revisions/:version/commit";
+  }
   if (/^\/api\/public\/[^/]+$/.test(pathname)) return "/api/public/:token";
   if (/^\/api\/artifacts\/[^/]+\/revisions$/.test(pathname)) {
     return "/api/artifacts/:artifactId/revisions";

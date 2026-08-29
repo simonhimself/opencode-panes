@@ -15,6 +15,8 @@ export const MAX_ARTIFACT_REVISIONS = 16;
 export const MAX_ARTIFACT_TOTAL_SOURCE_BYTES = 2 * 1024 * 1024;
 export const MAX_ARTIFACT_TITLE_LENGTH = 200;
 export const WORKSPACE_TOKEN_FRAGMENT_KEY = "workspaceToken";
+export const MAX_REMOTE_FILE_BYTES = 25 * 1024 * 1024;
+export const MAX_REMOTE_REVISION_BYTES = 100 * 1024 * 1024;
 
 export const LOCAL_ARTIFACT_MANIFEST_SCHEMA_VERSION = 1;
 export const CLOUD_MANIFEST_SCHEMA_VERSION = 1;
@@ -408,6 +410,36 @@ export const cloudManifestSelectionSchema = z.strictObject({
   }),
 });
 
+export const syncCreateRequestSchema = z.strictObject({
+  projectId: artifactIdSchema,
+  artifactId: artifactIdSchema,
+  slug: artifactSlugSchema,
+  title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
+  kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).optional(),
+  idempotencyKey: z.string().min(1).max(256),
+  ownerCredential: ownerTokenSchema,
+  creatorToken: ownerTokenSchema,
+});
+
+export const syncCreateResponseSchema = z.strictObject({
+  cloudProjectId: artifactIdSchema,
+  cloudArtifactId: artifactIdSchema,
+  ownerCredential: ownerTokenSchema,
+  creatorUrl: urlSchema,
+  inventoryUrl: urlSchema,
+  creatorExpiresAt: timestampSchema,
+});
+
+export const syncRevisionCommitRequestSchema = z.strictObject({
+  manifest: cloudManifestSchema,
+});
+
+export const syncRevisionCommitResponseSchema = z.strictObject({
+  cloudArtifactId: artifactIdSchema,
+  version: revisionNumberSchema,
+  committedAt: timestampSchema,
+});
+
 export type ArtifactManifest = z.infer<typeof artifactManifestSchema>;
 export type CloudArtifactMapping = z.infer<typeof cloudArtifactMappingSchema>;
 export type CloudManifest = z.infer<typeof cloudManifestSchema>;
@@ -421,6 +453,14 @@ export type ArtifactFile = z.infer<typeof artifactFileSchema>;
 export type FinalizedRevision = z.infer<typeof finalizedRevisionSchema>;
 export type CloudManifestSelection = z.infer<
   typeof cloudManifestSelectionSchema
+>;
+export type SyncCreateRequest = z.infer<typeof syncCreateRequestSchema>;
+export type SyncCreateResponse = z.infer<typeof syncCreateResponseSchema>;
+export type SyncRevisionCommitRequest = z.infer<
+  typeof syncRevisionCommitRequestSchema
+>;
+export type SyncRevisionCommitResponse = z.infer<
+  typeof syncRevisionCommitResponseSchema
 >;
 
 export const deriveCloudManifest = (
@@ -522,6 +562,9 @@ export const API_ERROR_CODES = [
   "NOT_FOUND",
   "CONFLICT",
   "SOURCE_TOO_LARGE",
+  "FILE_TOO_LARGE",
+  "REVISION_TOO_LARGE",
+  "HASH_MISMATCH",
   "INTERNAL_ERROR",
 ] as const;
 

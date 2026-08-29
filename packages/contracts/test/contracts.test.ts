@@ -12,6 +12,8 @@ import {
   MAX_ARTIFACT_REVISIONS,
   MAX_ARTIFACT_SOURCE_BYTES,
   MAX_ARTIFACT_TOTAL_SOURCE_BYTES,
+  MAX_REMOTE_FILE_BYTES,
+  MAX_REMOTE_REVISION_BYTES,
   ownerCredentialSchema,
   publicationSchema,
   PUBLICATION_DURATIONS,
@@ -29,6 +31,10 @@ import {
   requestedOriginsSchema,
   syncStateSchema,
   shareResponseSchema,
+  syncCreateRequestSchema,
+  syncCreateResponseSchema,
+  syncRevisionCommitRequestSchema,
+  syncRevisionCommitResponseSchema,
   workspaceTokenSchema,
 } from "../src/index.js";
 
@@ -376,6 +382,55 @@ describe("local-first lifecycle contracts", () => {
         { version: 1, paths: ["index.html", "missing.js"] },
       ]),
     ).toThrow("outside revision v1");
+  });
+
+  it("validates first-Sync admission and commit envelopes", () => {
+    const create = syncCreateRequestSchema.parse({
+      projectId: "project-1",
+      artifactId: "artifact-1",
+      slug: "landing-page",
+      title: "Landing page",
+      idempotencyKey: "sync-1",
+      ownerCredential: "owner-secret",
+      creatorToken: "creator-secret",
+    });
+    expect(create.projectId).toBe("project-1");
+
+    expect(
+      syncCreateResponseSchema.safeParse({
+        cloudProjectId: "project-1",
+        cloudArtifactId: "cloud-artifact-1",
+        ownerCredential: "owner-secret",
+        creatorUrl: "https://panes.example/creator/creator-secret",
+        inventoryUrl: "https://panes.example/inventory",
+        creatorExpiresAt: "2026-09-16T12:00:00.000Z",
+      }).success,
+    ).toBe(true);
+    expect(
+      syncRevisionCommitRequestSchema.safeParse({
+        manifest: {
+          schemaVersion: 1,
+          projectId: "project-1",
+          artifactId: "cloud-artifact-1",
+          slug: "landing-page",
+          title: "Landing page",
+          revisions: [],
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      syncRevisionCommitResponseSchema.safeParse({
+        cloudArtifactId: "cloud-artifact-1",
+        version: 1,
+        committedAt: "2026-09-16T12:00:00.000Z",
+      }).success,
+    ).toBe(true);
+  });
+
+  it("exports independent remote file and Revision limits", () => {
+    expect(MAX_REMOTE_FILE_BYTES).toBe(25 * 1024 * 1024);
+    expect(MAX_REMOTE_REVISION_BYTES).toBe(100 * 1024 * 1024);
+    expect(MAX_REMOTE_REVISION_BYTES).toBeGreaterThan(MAX_REMOTE_FILE_BYTES);
   });
 });
 

@@ -1,12 +1,13 @@
 import {
   artifactIdSchema,
   MAX_MEDIA_TYPE_LENGTH,
+  MAX_REMOTE_FILE_BYTES,
   relativePathSchema,
   revisionIdSchema,
   sha256Schema,
 } from "@opencode-panes/contracts";
 
-export const MAX_REMOTE_FILE_BYTES = 25 * 1024 * 1024;
+export { MAX_REMOTE_FILE_BYTES };
 
 export interface PrivateRevisionFileInput {
   projectId: string;
@@ -86,6 +87,7 @@ export async function putPrivateRevisionFile(
     const pipe = input.bytes.pipeTo(fixedLength.writable);
     const put = bucket.put(objectKey, fixedLength.readable, {
       httpMetadata: { contentType: mediaType },
+      customMetadata: { sha256: fileHash, byteSize: String(byteSize) },
     });
     await Promise.all([pipe, put]);
   } else {
@@ -97,6 +99,7 @@ export async function putPrivateRevisionFile(
     fileHash = await sha256(bytes);
     await bucket.put(objectKey, bytes, {
       httpMetadata: { contentType: mediaType },
+      customMetadata: { sha256: fileHash, byteSize: String(byteSize) },
     });
   }
   return {
