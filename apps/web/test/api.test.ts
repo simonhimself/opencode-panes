@@ -240,6 +240,7 @@ describe("artifact API", () => {
   it("optionally requires the production artifact creation key", async () => {
     const protectedEnv: Env = {
       DB: env.DB,
+      PRIVATE_ARTIFACTS: env.PRIVATE_ARTIFACTS,
       PANES_CREATE_API_KEY: "production-create-key",
     };
     const artifactPayload = {

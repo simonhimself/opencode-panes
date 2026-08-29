@@ -24,4 +24,10 @@
       "migrations_dir": "./migrations",
     },
   ],
+  "r2_buckets": [
+    {
+      "binding": "PRIVATE_ARTIFACTS",
+      "bucket_name": "opencode-panes-private",
+    },
+  ],
 }
