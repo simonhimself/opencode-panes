@@ -6,7 +6,7 @@ import {
   syncCreateResponseSchema,
 } from "@opencode-panes/contracts";
 import { env } from "cloudflare:test";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import worker from "../worker/index";
 
 const ORIGIN = "https://panes.example";
@@ -236,9 +236,7 @@ describe("local-first publication lifecycle", () => {
       durationDays: 7,
       status: "active",
     });
-    expect(publication.publicUrl).toMatch(
-      /^https:\/\/panes\.example\/published\//u,
-    );
+    expect(publication.publicUrl).toBeUndefined();
 
     const stored = await env.DB.prepare(
       "SELECT * FROM publications WHERE id = ?",
@@ -281,10 +279,10 @@ describe("local-first publication lifecycle", () => {
       base64Bytes(stored?.token_ciphertext ?? ""),
     );
     expect(new TextDecoder().decode(plaintext)).toBe(
-      publication.publicUrl!.split("/").at(-1),
+      await storedPublicationToken(artifact.cloudArtifactId, publication.id),
     );
     expect(JSON.stringify(stored)).not.toContain(
-      new URL(publication.publicUrl!).pathname.split("/").at(-1),
+      await storedPublicationToken(artifact.cloudArtifactId, publication.id),
     );
   });
 
@@ -303,7 +301,12 @@ describe("local-first publication lifecycle", () => {
     );
     expect(replay.id).toBe(first.id);
     expect(replay.expiresAt).toBe(first.expiresAt);
-    expect(replay.publicUrl).toBe(first.publicUrl);
+    expect(first.publicUrl).toBeUndefined();
+    expect(replay.publicUrl).toBeUndefined();
+    const publicToken = await storedPublicationToken(
+      artifact.cloudArtifactId,
+      first.id,
+    );
 
     const extended = publicationSchema.parse(
       await (
@@ -323,10 +326,7 @@ describe("local-first publication lifecycle", () => {
         })
       ).status,
     ).toBe(204);
-    expect(
-      (await api(`/api/publications/${first.publicUrl!.split("/").at(-1)}`))
-        .status,
-    ).toBe(410);
+    expect((await api(`/api/publications/${publicToken}`)).status).toBe(410);
     const workspace = creatorWorkspaceResponseSchema.parse(
       await (await api(`/api/creator/${artifact.creatorToken}`)).json(),
     );
@@ -334,7 +334,7 @@ describe("local-first publication lifecycle", () => {
     expect(workspace.publicationHistory?.[0]?.status).toBe("revoked");
   });
 
-  it("fails closed when active ciphertext is tampered or the key is missing", async () => {
+  it("keeps creator metadata operations independent from recoverable ciphertext", async () => {
     const artifact = await syncedArtifact();
     const publish = publicationSchema.parse(
       await (
@@ -349,20 +349,14 @@ describe("local-first publication lifecycle", () => {
     )
       .bind("tampered", publish.id)
       .run();
-    const logSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const sameActive = await api(
+      `/api/creator/${artifact.creatorToken}/publish`,
+      jsonRequest({ revisionVersion: 1, durationDays: 7 }),
+    );
+    expect(sameActive.status).toBe(200);
     expect(
-      (
-        await api(
-          `/api/creator/${artifact.creatorToken}/publish`,
-          jsonRequest({ revisionVersion: 1, durationDays: 7 }),
-        )
-      ).status,
-    ).toBe(500);
-    const logs = JSON.stringify(logSpy.mock.calls);
-    expect(logs).not.toContain(artifact.creatorToken);
-    expect(logs).not.toContain(publish.publicUrl!.split("/").at(-1));
-    expect(logs).toContain("/api/creator/:token/publication-action");
-    logSpy.mockRestore();
+      publicationSchema.parse(await sameActive.json()).publicUrl,
+    ).toBeUndefined();
     const afterTamper = await env.DB.prepare(
       "SELECT id, status, token_hash FROM publications WHERE artifact_id = ?",
     )
@@ -386,7 +380,15 @@ describe("local-first publication lifecycle", () => {
           noKeyEnv,
         )
       ).status,
-    ).toBe(500);
+    ).toBe(200);
+    const extended = await api(
+      `/api/creator/${artifact.creatorToken}/extend`,
+      jsonRequest({ durationDays: 1 }),
+    );
+    expect(extended.status).toBe(200);
+    expect(
+      publicationSchema.parse(await extended.json()).publicUrl,
+    ).toBeUndefined();
   });
 
   it("replaces another revision and republishes after revoke or expiry", async () => {
@@ -405,6 +407,10 @@ describe("local-first publication lifecycle", () => {
     )
       .bind(first.id)
       .first<{ token_nonce: string }>();
+    const firstToken = await storedPublicationToken(
+      artifact.cloudArtifactId,
+      first.id,
+    );
     const replacement = publicationSchema.parse(
       await (
         await api(
@@ -422,10 +428,7 @@ describe("local-first publication lifecycle", () => {
       .first<{ token_nonce: string }>();
     expect(replacementStored?.token_nonce).toMatch(/^[0-9a-f]{24}$/u);
     expect(replacementStored?.token_nonce).not.toBe(firstStored?.token_nonce);
-    expect(
-      (await api(`/api/publications/${first.publicUrl!.split("/").at(-1)}`))
-        .status,
-    ).toBe(410);
+    expect((await api(`/api/publications/${firstToken}`)).status).toBe(410);
     expect(
       (
         await env.DB.prepare(
@@ -457,7 +460,8 @@ describe("local-first publication lifecycle", () => {
       ).json(),
     );
     expect(republished.id).not.toBe(replacement.id);
-    expect(republished.publicUrl).not.toBe(replacement.publicUrl);
+    expect(replacement.publicUrl).toBeUndefined();
+    expect(republished.publicUrl).toBeUndefined();
     const workspace = creatorWorkspaceResponseSchema.parse(
       await (await api(`/api/creator/${artifact.creatorToken}`)).json(),
     );
@@ -485,7 +489,10 @@ describe("local-first publication lifecycle", () => {
         )
       ).json(),
     );
-    const token = publication.publicUrl!.split("/").at(-1)!;
+    const token = await storedPublicationToken(
+      artifact.cloudArtifactId,
+      publication.id,
+    );
     expect((await api(`/api/public/${token}`)).status).toBe(404);
     const privateSnapshot = creatorWorkspaceResponseSchema.parse(
       await (await api(`/api/creator/${artifact.creatorToken}`)).json(),
@@ -509,7 +516,7 @@ describe("local-first publication lifecycle", () => {
     expect(await unknownResponse.text()).not.toContain(unknownToken);
   });
 
-  it("rejects swapped ciphertext, wrong keys, and unsupported key versions without replacement", async () => {
+  it("keeps creator metadata operations independent from ciphertext contents", async () => {
     const artifact = await syncedArtifact();
     const first = publicationSchema.parse(
       await (
@@ -549,7 +556,7 @@ describe("local-first publication lifecycle", () => {
           jsonRequest({ revisionVersion: 1, durationDays: 7 }),
         )
       ).status,
-    ).toBe(500);
+    ).toBe(200);
     expect(
       (
         await env.DB.prepare(
@@ -572,7 +579,7 @@ describe("local-first publication lifecycle", () => {
           jsonRequest({ revisionVersion: 1, durationDays: 7 }),
         )
       ).status,
-    ).toBe(500);
+    ).toBe(200);
     const wrongKeyEnv: Env = {
       DB: env.DB,
       PRIVATE_ARTIFACTS: env.PRIVATE_ARTIFACTS,
@@ -587,7 +594,7 @@ describe("local-first publication lifecycle", () => {
           wrongKeyEnv,
         )
       ).status,
-    ).toBe(500);
+    ).toBe(200);
   });
 
   it("serializes competing mutations and exposes a deterministic busy response", async () => {
@@ -661,15 +668,13 @@ describe("local-first publication lifecycle", () => {
     const activeCommitted = committed.find(
       (publication) => publication.id === workspace.publication?.id,
     );
-    if (!activeCommitted?.publicUrl)
-      throw new Error("active publication URL is missing");
-    expect(
-      (
-        await api(
-          `/api/publications/${activeCommitted.publicUrl.split("/").at(-1)}`,
-        )
-      ).status,
-    ).toBe(200);
+    if (!activeCommitted)
+      throw new Error("active publication response is missing");
+    const activeToken = await storedPublicationToken(
+      artifact.cloudArtifactId,
+      activeCommitted.id,
+    );
+    expect((await api(`/api/publications/${activeToken}`)).status).toBe(200);
   });
 
   it("isolates a public multi-file Revision and authenticates by hash only", async () => {
@@ -701,7 +706,10 @@ describe("local-first publication lifecycle", () => {
         )
       ).json(),
     );
-    const token = publication.publicUrl!.split("/").at(-1)!;
+    const token = await storedPublicationToken(
+      artifact.cloudArtifactId,
+      publication.id,
+    );
 
     const workspaceResponse = await api(`/api/publications/${token}`);
     expect(workspaceResponse.status).toBe(200);
@@ -806,6 +814,39 @@ async function hash(value: string | Uint8Array) {
     ),
     (byte) => byte.toString(16).padStart(2, "0"),
   ).join("");
+}
+
+async function storedPublicationToken(
+  artifactId: string,
+  publicationId: string,
+): Promise<string> {
+  const row = await env.DB.prepare(
+    "SELECT token_ciphertext, token_nonce FROM publications WHERE id = ?",
+  )
+    .bind(publicationId)
+    .first<{ token_ciphertext: string; token_nonce: string }>();
+  if (!row) throw new Error("Publication ciphertext is missing");
+  const key = await crypto.subtle.importKey(
+    "raw",
+    hexBytes(
+      "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    ),
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"],
+  );
+  const plaintext = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: hexBytes(row.token_nonce),
+      additionalData: new TextEncoder().encode(
+        `opencode-panes/publication/${artifactId}/${publicationId}/key-v1`,
+      ),
+    },
+    key,
+    base64Bytes(row.token_ciphertext),
+  );
+  return new TextDecoder().decode(plaintext);
 }
 
 function encodePath(path: string): string {

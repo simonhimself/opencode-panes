@@ -4,6 +4,7 @@ import {
 } from "@opencode-panes/contracts";
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
+import { decryptPublicationToken } from "../worker/publication";
 
 const ORIGIN = "https://panes.example";
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
@@ -140,11 +141,16 @@ describe("safe Revision ZIP downloads", () => {
       `/api/creator/${artifact.creatorToken}/publish`,
       jsonRequest({ revisionVersion: 1, durationDays: 7 }),
     );
-    const publicToken = String(
-      ((await publication.json()) as { publicUrl: string }).publicUrl,
-    )
-      .split("/")
-      .at(-1);
+    const publicationBody = (await publication.json()) as {
+      id: string;
+      publicUrl?: string;
+    };
+    expect(publication.status).toBe(201);
+    expect(publicationBody.publicUrl).toBeUndefined();
+    const publicToken = await storedPublicationToken(
+      artifact.artifactId,
+      publicationBody.id,
+    );
     const publicV1 = await api(
       `/api/publications/${publicToken}/download.zip?version=2`,
     );
@@ -1043,4 +1049,31 @@ async function sha256(value: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("");
+}
+
+async function storedPublicationToken(
+  artifactId: string,
+  publicationId: string,
+): Promise<string> {
+  const row = await env.DB.prepare(
+    "SELECT artifact_id, token_ciphertext, token_nonce, encryption_key_version FROM publications WHERE id = ?",
+  )
+    .bind(publicationId)
+    .first<{
+      artifact_id: string;
+      token_ciphertext: string | null;
+      token_nonce: string | null;
+      encryption_key_version: number | null;
+    }>();
+  if (!row || row.artifact_id !== artifactId)
+    throw new Error(
+      `Publication ciphertext is missing for ${artifactId}/${publicationId}`,
+    );
+  return decryptPublicationToken(env, {
+    id: publicationId,
+    artifactId,
+    tokenCiphertext: row.token_ciphertext,
+    tokenNonce: row.token_nonce,
+    encryptionKeyVersion: row.encryption_key_version,
+  });
 }

@@ -157,12 +157,11 @@ export async function routePublicationRequest(
       creatorPublicationExtendRequestSchema,
     );
     if (!body.ok) return body.response;
-    return mutatePublication(request, env, artifact, "extend", body.data);
+    return mutatePublication(env, artifact, "extend", body.data);
   }
   const body = await parseBody(request, creatorPublicationRequestSchema);
   if (!body.ok) return body.response;
   return mutatePublication(
-    request,
     env,
     artifact,
     operation === "extend"
@@ -230,7 +229,6 @@ async function authenticateCreator(
 }
 
 async function mutatePublication(
-  request: Request,
   env: Env,
   artifact: CreatorArtifactRow,
   operation: "publish" | "republish" | "extend",
@@ -245,7 +243,7 @@ async function mutatePublication(
   if (!lease) return conflict("Publication is busy; retry this action");
   try {
     if (operation === "extend")
-      return extendPublication(request, env, artifact, body.durationDays);
+      return extendPublication(env, artifact, body.durationDays);
 
     const revision = await env.DB.prepare(
       `SELECT id, version, committed_at FROM local_revisions
@@ -264,14 +262,7 @@ async function mutatePublication(
       Date.parse(active.expires_at) > nowDate.getTime() &&
       active.revision_version === revision.version
     ) {
-      const token = await decryptPublicationToken(env, {
-        id: active.id,
-        artifactId: active.artifact_id,
-        tokenCiphertext: active.token_ciphertext,
-        tokenNonce: active.token_nonce,
-        encryptionKeyVersion: active.encryption_key_version,
-      });
-      return publicationResponse(request, active, token, 200);
+      return publicationResponse(active, 200);
     }
 
     const publicationId = `publication_${crypto.randomUUID()}`;
@@ -327,7 +318,7 @@ async function mutatePublication(
       .bind(publicationId)
       .first<PublicationRow>();
     if (!created) throw new Error("Created Publication was not found");
-    return publicationResponse(request, created, token, 201);
+    return publicationResponse(created, 201);
   } finally {
     await releasePublicationLease(
       env.DB,
@@ -338,7 +329,6 @@ async function mutatePublication(
 }
 
 async function extendPublication(
-  request: Request,
   env: Env,
   artifact: CreatorArtifactRow,
   durationDays: 1 | 7 | 30,
@@ -368,14 +358,7 @@ async function extendPublication(
     .first<PublicationRow>();
   if (!updated || updated.status !== "active")
     return conflict("Publication is no longer active; use Republish instead");
-  const token = await decryptPublicationToken(env, {
-    id: updated.id,
-    artifactId: updated.artifact_id,
-    tokenCiphertext: updated.token_ciphertext,
-    tokenNonce: updated.token_nonce,
-    encryptionKeyVersion: updated.encryption_key_version,
-  });
-  return publicationResponse(request, updated, token, 200);
+  return publicationResponse(updated, 200);
 }
 
 async function unpublishPublication(
@@ -440,19 +423,13 @@ async function publicationView(row: PublicationRow): Promise<Publication> {
   });
 }
 
-async function publicationResponse(
-  request: Request,
-  row: PublicationRow,
-  token: string,
-  status: number,
-) {
+async function publicationResponse(row: PublicationRow, status: number) {
   return jsonResponse(
     publicationSchema.parse({
       id: row.id,
       artifactId: row.artifact_id,
       revisionVersion: row.revision_version,
       durationDays: row.duration_days,
-      publicUrl: publicUrl(request, token),
       status: "active",
       createdAt: row.created_at,
       expiresAt: row.expires_at,
@@ -959,13 +936,6 @@ async function hashToken(token: string) {
       await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)),
     ),
   );
-}
-
-function publicUrl(request: Request, token: string) {
-  return new URL(
-    `/published/${encodeURIComponent(token)}`,
-    request.url,
-  ).toString();
 }
 
 async function parseBody<T>(

@@ -156,13 +156,8 @@ select,
   line-height: 1.5;
 }
 
-.publication-url {
-  overflow: hidden;
+.publication-summary a {
   color: #ffc293;
-  font-family: "SFMono-Regular", Consolas, monospace;
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .publication-actions label {

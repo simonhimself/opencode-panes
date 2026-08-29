@@ -1,9 +1,14 @@
-import type { Artifact, Revision } from "@opencode-panes/contracts";
+import type {
+  Artifact,
+  CreatorWorkspaceResponse,
+  Revision,
+} from "@opencode-panes/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, SourceCode } from "../../src/app";
+import { CreatorWorkspace } from "../../src/creator-workspace";
 import { parseViewerRoute, publicUrlStorageKey } from "../../src/viewer";
 
 const ARTIFACT: Artifact = {
@@ -177,6 +182,55 @@ describe("artifact workspace", () => {
     expect(container.textContent).toContain("Your cloud shelf is clear.");
     expect(container.textContent).not.toContain("Publish");
     expect(container.textContent).not.toContain("Delete");
+  });
+
+  it("keeps creator publication controls while directing URL recovery to inventory", () => {
+    const workspace: CreatorWorkspaceResponse = {
+      cloudArtifactId: "artifact-demo",
+      cloudProjectId: "project-demo",
+      slug: "demo",
+      title: "Demo artifact",
+      creatorExpiresAt: "2026-09-28T12:00:00.000Z",
+      revisions: [
+        {
+          id: "revision-demo",
+          version: 1,
+          preview: { adapter: "browser", entryPath: "index.html" },
+          approvedOrigins: [],
+          files: [
+            {
+              kind: "file",
+              path: "index.html",
+              sha256: "a".repeat(64),
+              byteSize: 10,
+              mediaType: "text/html",
+            },
+          ],
+          createdAt: "2026-08-29T12:00:00.000Z",
+        },
+      ],
+      publication: {
+        id: "publication-demo",
+        artifactId: "artifact-demo",
+        revisionVersion: 1,
+        durationDays: 7,
+        status: "active",
+        createdAt: "2026-08-29T12:00:00.000Z",
+        expiresAt: "2026-09-05T12:00:00.000Z",
+        publicUrl: "https://panes.example/published/secret-token",
+      },
+      publicationHistory: [],
+    };
+    const markup = renderToStaticMarkup(
+      <CreatorWorkspace token="creator-token" workspace={workspace} />,
+    );
+    expect(markup).toContain("authenticated cloud inventory");
+    expect(markup).toContain("Extend by 7 days");
+    expect(markup).toContain("Republish v1");
+    expect(markup).not.toContain(
+      "https://panes.example/published/secret-token",
+    );
+    expect(markup).not.toContain("Copy public URL");
   });
   it("preserves raw source as text in code mode", () => {
     const source = '<script>alert("raw")</script>\n# heading';

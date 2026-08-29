@@ -295,19 +295,15 @@ function PublicationControls({
       </div>
       <p className="publication-summary">
         {isActive
-          ? `Revision v${activePublication.revisionVersion} is public until ${formatDateTime(activePublication.expiresAt)}.`
+          ? `Revision v${activePublication.revisionVersion} is public until ${formatDateTime(activePublication.expiresAt)}. `
           : `Revision v${revision.version} is selected. Publishing will make only this synced Revision public.`}
+        {isActive ? (
+          <>
+            Recover its public URL from the{" "}
+            <a href="/inventory">authenticated cloud inventory</a>.
+          </>
+        ) : null}
       </p>
-      {isActive && activePublication.publicUrl ? (
-        <a
-          className="publication-url"
-          href={activePublication.publicUrl}
-          rel="noreferrer"
-          target="_blank"
-        >
-          {activePublication.publicUrl}
-        </a>
-      ) : null}
       <div className="publication-actions">
         <label>
           <span>Duration</span>
