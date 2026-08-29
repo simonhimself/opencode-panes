@@ -7,6 +7,7 @@ import {
   type CreatorWorkspaceResponse,
   type InventoryResponse,
   type InventoryCreatorRotateResponse,
+  type InventoryReconnectCodeResponse,
   type PublicPublicationResponse,
   type Revision,
   type ShareResponse,
@@ -428,6 +429,22 @@ export function rotateInventoryCreator(
     `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/creator/rotate`,
     {
       body: "{}",
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function issueInventoryReconnectCode(
+  artifactId: string,
+  confirmation: string,
+  fetcher: Fetcher = fetch,
+): Promise<InventoryReconnectCodeResponse> {
+  return requestJson<InventoryReconnectCodeResponse>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/reconnect-code`,
+    {
+      body: JSON.stringify({ confirmation }),
       headers: { "Content-Type": "application/json" },
       method: "POST",
     },

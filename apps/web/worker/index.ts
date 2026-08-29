@@ -24,6 +24,7 @@ import {
   inventoryResponse,
   loadInventory,
   mutateInventoryPublicationRequest,
+  issueInventoryReconnectCode,
   rotateInventoryCreator,
 } from "./inventory";
 
@@ -150,6 +151,16 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     const artifactId = parseArtifactId(inventoryCreatorRotation[1]);
     if (artifactId instanceof Response) return artifactId;
     return rotateInventoryCreator(request, env, artifactId);
+  }
+
+  const inventoryReconnect = pathname.match(
+    /^\/api\/inventory\/artifacts\/([^/]+)\/reconnect-code$/u,
+  );
+  if (inventoryReconnect) {
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    const artifactId = parseArtifactId(inventoryReconnect[1]);
+    if (artifactId instanceof Response) return artifactId;
+    return issueInventoryReconnectCode(request, env, artifactId);
   }
 
   const inventoryPublication = pathname.match(
@@ -1001,6 +1012,9 @@ function routeTemplate(pathname: string): string {
   }
   if (/^\/api\/artifacts\/[^/]+$/.test(pathname)) {
     return "/api/artifacts/:artifactId";
+  }
+  if (/^\/api\/inventory\/artifacts\/[^/]+\/reconnect-code$/u.test(pathname)) {
+    return "/api/inventory/artifacts/:artifactId/reconnect-code";
   }
   if (pathname === "/api/inventory") return "/api/inventory";
   return "unmatched";

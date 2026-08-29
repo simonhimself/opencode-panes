@@ -31,6 +31,7 @@ let server: ReturnType<typeof createServer>;
 let apiOrigin: string;
 let verifiedProbe: boolean;
 let failSync: boolean;
+let failReconnect: boolean;
 let cloudCopyExists: boolean;
 let cloudDeleteCount: number;
 let requests: Array<{
@@ -46,6 +47,7 @@ beforeEach(async () => {
   requests = [];
   verifiedProbe = false;
   failSync = false;
+  failReconnect = false;
   cloudCopyExists = false;
   cloudDeleteCount = 0;
   vi.stubEnv("XDG_STATE_HOME", stateHome);
@@ -111,6 +113,191 @@ describe("sync and publish intent tools", () => {
     expect(ask).toHaveBeenCalledWith(
       expect.objectContaining({ permission: "artifact_open" }),
     );
+  });
+
+  it("reconnects from the canonical local manifest after protected state loss", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Reconnect me", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+      "local-secret.txt": Buffer.from("must remain local"),
+    });
+    await writeFile(
+      join(project, "artifacts", "reconnect-me", ".panesignore"),
+      "local-secret.txt\n",
+    );
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    const firstCommit = requests.find(({ path }) => path.endsWith("/commit"));
+    expect(String(firstCommit?.body)).not.toContain("local-secret.txt");
+    await prepareAndFinalize(context, prepared.artifactId, {
+      "index.html": Buffer.from("<h1>two</h1>"),
+      "local-secret.txt": Buffer.from("still local"),
+    });
+    const statePath = await onlyStateFile();
+    await rm(statePath);
+
+    const plugin = await OpenCodePanesPlugin({} as never, {
+      apiBaseUrl: apiOrigin,
+      createApiKey: "admission-key",
+    });
+    const definition = plugin.tool?.artifact_reconnect as ToolDefinition;
+    const result = await definition.execute(
+      {
+        artifactId: prepared.artifactId,
+        reconnectCode: "panes-reconnect-0123456789abcdef0123456789abcdef",
+      },
+      context,
+    );
+    const metadata = resultMetadata(result);
+    expect(metadata).toMatchObject({
+      operation: "reconnected",
+      artifactId: prepared.artifactId,
+      creatorLinkStatus: "unavailable",
+      creatorLifecycleStatus: "active",
+      syncedRevisionVersions: [1],
+      publication: {
+        status: "none",
+        revisionVersion: null,
+        expiresAt: null,
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain("panes-reconnect-");
+    expect(JSON.stringify(result)).not.toContain("owner-credential");
+    expect(String(metadata.guidance)).toContain(
+      "explicit Creator-link rotation",
+    );
+    expect(
+      requests.filter(({ path }) => path.endsWith("/reconnect")),
+    ).toHaveLength(1);
+    const state = JSON.parse(await readFile(await onlyStateFile(), "utf8")) as {
+      ownerCredential?: string;
+      creatorUrl?: string;
+      creatorLinkStatus?: string;
+      syncedRevisionManifests?: Array<{
+        version: number;
+        files: Array<{ path: string }>;
+      }>;
+    };
+    expect(state.ownerCredential).toMatch(/^sync-owner-/u);
+    expect(state.creatorUrl).toBeUndefined();
+    expect(state.creatorLinkStatus).toBe("unavailable");
+    expect(state.syncedRevisionManifests?.[0]?.version).toBe(1);
+    expect(
+      state.syncedRevisionManifests?.[0]?.files.map(({ path }) => path),
+    ).toEqual(["index.html"]);
+
+    requests = [];
+    const nextSync = await executeSync(
+      { artifactId: prepared.artifactId },
+      context,
+    );
+    expect(resultMetadata(nextSync)).toMatchObject({ syncedVersion: 2 });
+    const secondCommit = requests.find(({ path }) => path.endsWith("/commit"));
+    expect(secondCommit).toBeDefined();
+    expect(String(secondCommit?.body)).not.toContain("local-secret.txt");
+    expect(
+      requests.some(
+        ({ method, path, body }) =>
+          method === "PUT" &&
+          (path.includes("local-secret.txt") ||
+            body.toString().includes("still local")),
+      ),
+    ).toBe(false);
+    const secondManifest = JSON.parse(String(secondCommit?.body)).manifest as {
+      revisions: Array<{ version: number; files: Array<{ path: string }> }>;
+    };
+    expect(secondManifest.revisions.map(({ version }) => version)).toEqual([
+      1, 2,
+    ]);
+    expect(secondManifest.revisions[0]?.files.map(({ path }) => path)).toEqual([
+      "index.html",
+    ]);
+
+    requests = [];
+    const publish = await OpenCodePanesPlugin({} as never, {
+      apiBaseUrl: apiOrigin,
+      createApiKey: "admission-key",
+    });
+    const publishDefinition = publish.tool?.artifact_publish as ToolDefinition;
+    expect(
+      resultMetadata(
+        await publishDefinition.execute(
+          { artifactId: prepared.artifactId },
+          context,
+        ),
+      ),
+    ).toMatchObject({
+      creatorLinkStatus: "unavailable",
+      openCreatorAfterSuccess: "failed",
+    });
+    expect(requests.some(({ path }) => path.endsWith("/creator/rotate"))).toBe(
+      false,
+    );
+
+    requests = [];
+    const rotated = await executeSync(
+      { artifactId: prepared.artifactId, rotateCreatorLink: true },
+      context,
+    );
+    expect(resultMetadata(rotated)).toMatchObject({
+      creatorLinkStatus: "available",
+      creatorUrl: `${apiOrigin}/creator/creator-rotated`,
+    });
+    expect(
+      requests.filter(({ path }) => path.endsWith("/creator/rotate")),
+    ).toHaveLength(1);
+    const rotatedState = JSON.parse(
+      await readFile(await onlyStateFile(), "utf8"),
+    ) as { creatorUrl?: string; creatorLinkStatus?: string };
+    expect(rotatedState).toMatchObject({
+      creatorUrl: `${apiOrigin}/creator/creator-rotated`,
+      creatorLinkStatus: "available",
+    });
+  });
+
+  it("redacts reconnect code and generated Owner credential from API errors", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Reconnect error", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    await rm(await onlyStateFile());
+    failReconnect = true;
+    const reconnectCode = "panes-reconnect-0123456789abcdef0123456789abcdef";
+    await expect(
+      (
+        await OpenCodePanesPlugin({} as never, {
+          apiBaseUrl: apiOrigin,
+          createApiKey: "admission-key",
+        })
+      ).tool?.artifact_reconnect?.execute(
+        { artifactId: prepared.artifactId, reconnectCode },
+        context,
+      ),
+    ).rejects.toThrow("[redacted]");
+    const reconnectRequest = requests.find(({ path }) =>
+      path.endsWith("/reconnect"),
+    );
+    const reconnectPayload = JSON.parse(
+      reconnectRequest?.body.toString("utf8") ?? "{}",
+    ) as { newOwnerCredential?: string };
+    const error = await (async () => {
+      try {
+        await (
+          await OpenCodePanesPlugin({} as never, {
+            apiBaseUrl: apiOrigin,
+            createApiKey: "admission-key",
+          })
+        ).tool?.artifact_reconnect?.execute(
+          { artifactId: prepared.artifactId, reconnectCode },
+          context,
+        );
+      } catch (value) {
+        return String(value);
+      }
+      return "";
+    })();
+    expect(error).not.toContain(reconnectCode);
+    expect(error).not.toContain(reconnectPayload.newOwnerCredential ?? "");
   });
 
   it("stops the publish intent on full Sync failure before opening or publishing", async () => {
@@ -608,6 +795,17 @@ function resultMetadata(result: ToolResult) {
   return result.metadata as Record<string, unknown>;
 }
 
+async function onlyStateFile(): Promise<string> {
+  const stateRoot = join(stateHome, "opencode-panes");
+  const stateFiles = (await readdir(stateRoot, { recursive: true }))
+    .filter((file) => file.endsWith(".json"))
+    .map((file) => join(stateRoot, file));
+  if (stateFiles.length !== 1) {
+    throw new Error(`expected one state file, found ${stateFiles.length}`);
+  }
+  return stateFiles[0] as string;
+}
+
 async function updateStoredSyncState(
   update: (state: Record<string, unknown>) => void,
 ) {
@@ -643,6 +841,71 @@ async function handleRequest(
     headers: request.headers,
   });
   response.setHeader("content-type", "application/json");
+  if (path.endsWith("/reconnect")) {
+    const payload = JSON.parse(body.toString("utf8")) as {
+      localProjectId: string;
+      localArtifactId: string;
+      cloudProjectId: string;
+      cloudArtifactId: string;
+      newOwnerCredential: string;
+      reconnectCode: string;
+    };
+    const createRequest = requests.find(
+      ({ path: requestPath }) => requestPath === "/api/sync/artifacts",
+    );
+    const commitRequest = [...requests]
+      .reverse()
+      .find(({ path: requestPath }) => requestPath.endsWith("/commit"));
+    const createPayload = createRequest
+      ? (JSON.parse(createRequest.body.toString("utf8")) as {
+          idempotencyKey: string;
+        })
+      : undefined;
+    const commitPayload = commitRequest
+      ? (JSON.parse(commitRequest.body.toString("utf8")) as {
+          manifest: { revisions: unknown[] };
+        })
+      : undefined;
+    if (failReconnect) {
+      response.statusCode = 409;
+      response.end(
+        JSON.stringify({
+          error: {
+            code: "CONFLICT",
+            message: `${payload.reconnectCode} ${payload.newOwnerCredential}`,
+          },
+        }),
+      );
+      return;
+    }
+    response.statusCode = 200;
+    response.end(
+      JSON.stringify({
+        operation: "reconnected",
+        apiOrigin,
+        localProjectId: payload.localProjectId,
+        localArtifactId: payload.localArtifactId,
+        cloudProjectId: payload.cloudProjectId,
+        cloudArtifactId: payload.cloudArtifactId,
+        creationIdempotencyKey:
+          createPayload?.idempotencyKey ?? "idempotency-sync-me",
+        inventoryUrl: `${apiOrigin}/inventory`,
+        creatorLink: {
+          status: "active",
+          expiresAt: "2026-09-28T12:00:00.000Z",
+        },
+        publication: {
+          status: "none",
+          revisionVersion: null,
+          expiresAt: null,
+        },
+        syncedRevisionManifests: commitPayload?.manifest.revisions ?? [],
+      }),
+    );
+    expect(payload.reconnectCode).toMatch(/^panes-reconnect-/u);
+    expect(payload.newOwnerCredential).not.toBe(payload.reconnectCode);
+    return;
+  }
   if (path === "/api/sync/artifacts") {
     if (failSync) {
       response.statusCode = 503;

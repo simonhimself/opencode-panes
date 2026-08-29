@@ -152,6 +152,121 @@ describe("artifact workspace", () => {
     expect(container.textContent).not.toContain("read-only");
   });
 
+  it("requires the exact reconnect confirmation and keeps the issued code ephemeral", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const payload = {
+      projects: [
+        {
+          projectId: "project-demo",
+          artifacts: [
+            {
+              artifactId: "artifact-demo",
+              slug: "demo",
+              title: "Demo artifact",
+              kind: null,
+              lifecycleState: "active",
+              revisionCount: 1,
+              storageBytes: 10,
+              lastSyncedAt: "2026-08-29T12:00:00.000Z",
+              creatorLink: {
+                status: "active",
+                expiresAt: "2026-09-28T12:00:00.000Z",
+              },
+              publication: {
+                status: "none",
+                revisionVersion: null,
+                expiresAt: null,
+              },
+              revisions: [
+                { version: 1, createdAt: "2026-08-29T12:00:00.000Z" },
+              ],
+              warnings: [],
+            },
+          ],
+        },
+      ],
+    };
+    const requests: Array<{ method: string; body?: string }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({
+          method: init?.method ?? "GET",
+          ...(typeof init?.body === "string" ? { body: init.body } : {}),
+        });
+        if (init?.method === "POST") {
+          return new Response(
+            JSON.stringify({
+              cloudArtifactId: "artifact-demo",
+              reconnectCode: "panes-reconnect-0123456789abcdef0123456789abcdef",
+              expiresAt: "2026-08-29T12:10:00.000Z",
+            }),
+          );
+        }
+        return new Response(JSON.stringify(payload));
+      }),
+    );
+
+    await act(async () => {
+      root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+    const input = container.querySelector<HTMLInputElement>(
+      "#reconnect-artifact-demo",
+    );
+    const issue = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Issue reconnect code",
+    );
+    expect(issue?.disabled).toBe(true);
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      setter?.call(input, "RECOVER OWNER CREDENTIAL");
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+      await settle();
+    });
+    expect(issue?.disabled).toBe(true);
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        "value",
+      )?.set;
+      setter?.call(
+        input,
+        "RECOVER OWNER CREDENTIAL FOR ARTIFACT artifact-demo: REDEMPTION REPLACES THE CURRENT OWNER CREDENTIAL (Demo artifact)",
+      );
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+      await settle();
+    });
+    expect(issue?.disabled).toBe(false);
+    await act(async () => {
+      issue?.click();
+      await settle();
+    });
+    expect(container.textContent).toContain("Copy this code now");
+    expect(container.textContent).toContain(
+      "panes-reconnect-0123456789abcdef0123456789abcdef",
+    );
+    const copy = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Copy reconnect code",
+    );
+    await act(async () => {
+      copy?.click();
+      await settle();
+    });
+    expect(writeText).toHaveBeenCalledWith(
+      "panes-reconnect-0123456789abcdef0123456789abcdef",
+    );
+    expect(requests.filter(({ method }) => method === "POST")).toHaveLength(1);
+    expect(requests[1]?.body).toContain("REDEMPTION REPLACES");
+  });
+
   it("shows a rotated Creator URL only after rotation and explains deletion consequences", async () => {
     const writeText = vi.fn(async () => undefined);
     Object.defineProperty(navigator, "clipboard", {

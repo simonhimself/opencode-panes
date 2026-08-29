@@ -34,6 +34,8 @@ export const PANES_RENDERER_TYPES = [
 export const PUBLICATION_DURATIONS = [1, 7, 30] as const;
 export const DEFAULT_PUBLICATION_DURATION = 7;
 export const SYNC_STATES = ["pending", "syncing", "synced", "failed"] as const;
+export const RECONNECT_CODE_TTL_MS = 10 * 60 * 1000;
+export const RECONNECT_CODE_PREFIX = "panes-reconnect-";
 
 export const artifactTypeSchema = z.enum(ARTIFACT_TYPES);
 
@@ -575,6 +577,56 @@ export const inventoryCloudDeletionRequestSchema = z.strictObject({
   confirmation: z.string().min(1).max(256),
 });
 
+export const reconnectCodeSchema = z
+  .string()
+  .length(RECONNECT_CODE_PREFIX.length + 32)
+  .regex(new RegExp(`^${RECONNECT_CODE_PREFIX}[a-f0-9]{32}$`, "u"));
+
+export const inventoryReconnectCodeRequestSchema = z.strictObject({
+  confirmation: z.string().trim().min(1).max(512),
+});
+
+export const inventoryReconnectCodeResponseSchema = z.strictObject({
+  cloudArtifactId: artifactIdSchema,
+  reconnectCode: reconnectCodeSchema,
+  expiresAt: timestampSchema,
+});
+
+const reconnectCreatorLinkSchema = z.strictObject({
+  status: z.enum(["active", "expired", "revoked"]),
+  expiresAt: timestampSchema,
+});
+
+const reconnectPublicationSchema = z.strictObject({
+  status: z.enum(["active", "expired", "revoked", "none"]),
+  revisionVersion: revisionNumberSchema.nullable(),
+  expiresAt: timestampSchema.nullable(),
+});
+
+export const syncReconnectRequestSchema = z.strictObject({
+  apiOrigin: httpOriginSchema,
+  localProjectId: artifactIdSchema,
+  localArtifactId: artifactIdSchema,
+  cloudProjectId: artifactIdSchema,
+  cloudArtifactId: artifactIdSchema,
+  reconnectCode: reconnectCodeSchema,
+  newOwnerCredential: ownerTokenSchema,
+});
+
+export const syncReconnectResponseSchema = z.strictObject({
+  operation: z.literal("reconnected"),
+  apiOrigin: httpOriginSchema,
+  localProjectId: artifactIdSchema,
+  localArtifactId: artifactIdSchema,
+  cloudProjectId: artifactIdSchema,
+  cloudArtifactId: artifactIdSchema,
+  creationIdempotencyKey: z.string().min(1).max(256).regex(/^\S+$/u),
+  inventoryUrl: urlSchema,
+  creatorLink: reconnectCreatorLinkSchema,
+  publication: reconnectPublicationSchema,
+  syncedRevisionManifests: z.array(finalizedRevisionSchema),
+});
+
 export type ArtifactManifest = z.infer<typeof artifactManifestSchema>;
 export type CloudArtifactMapping = z.infer<typeof cloudArtifactMappingSchema>;
 export type CloudManifest = z.infer<typeof cloudManifestSchema>;
@@ -642,6 +694,14 @@ export type InventoryPublicationUnpublishRequest = z.infer<
 export type InventoryCloudDeletionRequest = z.infer<
   typeof inventoryCloudDeletionRequestSchema
 >;
+export type InventoryReconnectCodeRequest = z.infer<
+  typeof inventoryReconnectCodeRequestSchema
+>;
+export type InventoryReconnectCodeResponse = z.infer<
+  typeof inventoryReconnectCodeResponseSchema
+>;
+export type SyncReconnectRequest = z.infer<typeof syncReconnectRequestSchema>;
+export type SyncReconnectResponse = z.infer<typeof syncReconnectResponseSchema>;
 
 export const deriveCloudManifest = (
   manifest: unknown,

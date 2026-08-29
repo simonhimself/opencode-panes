@@ -59,6 +59,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 - [x] Install the OpenCode server plugin as a private local plugin file
 - [x] Register one `artifact` custom tool
 - [x] Register the local-first `artifact_prepare` and `artifact_finalize` tools
+- [x] Register the local-first `artifact_reconnect` tool for Owner credential recovery
 - [x] Associate artifacts with the current OpenCode session ID
 - [x] Return artifact ID, revision, and browser URL in the tool result
 - [x] Request permission before uploading source for the first time
@@ -66,6 +67,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 - [x] Provide an optional browser auto-open setting
 - [x] Document project and global installation
 - [x] Bundle and install a global plugin file with no repository dependency
+- [x] Recover a lost Owner credential with an authenticated, short-lived, single-use reconnect code
 
 ## OpenCode Plugin Contract
 

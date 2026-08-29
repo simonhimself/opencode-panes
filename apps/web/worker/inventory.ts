@@ -1,4 +1,8 @@
 import {
+  RECONNECT_CODE_PREFIX,
+  RECONNECT_CODE_TTL_MS,
+  inventoryReconnectCodeRequestSchema,
+  inventoryReconnectCodeResponseSchema,
   inventoryCreatorRotateResponseSchema,
   inventoryPublicationMutationRequestSchema,
   inventoryPublicationUnpublishRequestSchema,
@@ -15,6 +19,7 @@ import { mutatePublicationForInventory } from "./publication";
 import { readBoundedText } from "./bounded-json";
 
 const INVENTORY_BODY_LIMIT = 4096;
+const RECONNECT_CODE_ID_PREFIX = "owner-reconnect-";
 
 interface InventoryRow {
   project_id: string;
@@ -45,6 +50,12 @@ interface PublicationCiphertext {
   tokenCiphertext: string | null;
   tokenNonce: string | null;
   encryptionKeyVersion: number | null;
+}
+
+interface ReconnectArtifactRow {
+  cloud_artifact_id: string;
+  title: string;
+  lifecycle_state: "active" | "deleting";
 }
 
 export async function loadInventory(
@@ -290,6 +301,103 @@ export async function rotateInventoryCreator(
   );
 }
 
+export function reconnectCodeConfirmation(
+  artifactId: string,
+  title: string,
+): string {
+  return `RECOVER OWNER CREDENTIAL FOR ARTIFACT ${artifactId}: REDEMPTION REPLACES THE CURRENT OWNER CREDENTIAL (${title})`;
+}
+
+export async function issueInventoryReconnectCode(
+  request: Request,
+  env: Env,
+  artifactId: string,
+): Promise<Response> {
+  // Keep the Access check in the router ahead of this lookup and body read.
+  const artifact = await env.DB.prepare(
+    `SELECT cloud_artifact_id, title, lifecycle_state
+       FROM sync_artifacts
+      WHERE cloud_artifact_id = ?`,
+  )
+    .bind(artifactId)
+    .first<ReconnectArtifactRow>();
+  if (!artifact) return inventoryError(404, "Artifact not found");
+  if (artifact.lifecycle_state === "deleting")
+    return inventoryError(409, "Artifact deletion is in progress");
+
+  const body = await readJson(request);
+  if (!body.ok) return inventoryError(400, "Request validation failed");
+  const parsed = inventoryReconnectCodeRequestSchema.safeParse(body.value);
+  if (
+    !parsed.success ||
+    parsed.data.confirmation !==
+      reconnectCodeConfirmation(artifactId, artifact.title)
+  ) {
+    return inventoryError(
+      400,
+      "Recovery confirmation did not match this Artifact",
+    );
+  }
+
+  const reconnectCode = generateReconnectCode();
+  const codeHash = await hashToken(reconnectCode);
+  const createdAt = new Date();
+  const createdAtValue = createdAt.toISOString();
+  const expiresAt = new Date(
+    createdAt.getTime() + RECONNECT_CODE_TTL_MS,
+  ).toISOString();
+  const [inserted, revoked] = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO owner_reconnect_codes
+        (id, artifact_id, code_hash, created_at, expires_at)
+       SELECT ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM sync_artifacts
+           WHERE cloud_artifact_id = ? AND lifecycle_state = 'active'
+        )`,
+    ).bind(
+      `${RECONNECT_CODE_ID_PREFIX}${crypto.randomUUID()}`,
+      artifactId,
+      codeHash,
+      createdAtValue,
+      expiresAt,
+      artifactId,
+    ),
+    env.DB.prepare(
+      `UPDATE owner_reconnect_codes
+          SET revoked_at = ?
+        WHERE artifact_id = ? AND code_hash <> ?
+          AND consumed_at IS NULL AND revoked_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM owner_reconnect_codes
+             WHERE artifact_id = ? AND code_hash = ?
+          )
+          AND EXISTS (
+            SELECT 1 FROM sync_artifacts
+             WHERE cloud_artifact_id = ? AND lifecycle_state = 'active'
+          )`,
+    ).bind(
+      createdAtValue,
+      artifactId,
+      codeHash,
+      artifactId,
+      codeHash,
+      artifactId,
+    ),
+  ]);
+  if (inserted?.meta.changes !== 1 || revoked === undefined) {
+    return inventoryError(409, "Artifact is unavailable for recovery");
+  }
+
+  return inventoryJsonResponse(
+    inventoryReconnectCodeResponseSchema.parse({
+      cloudArtifactId: artifactId,
+      reconnectCode,
+      expiresAt,
+    }),
+  );
+}
+
 export async function mutateInventoryPublicationRequest(
   request: Request,
   env: Env,
@@ -345,6 +453,24 @@ function inventoryError(status: number, message: string): Response {
     },
     status,
   );
+}
+
+function generateReconnectCode(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return `${RECONNECT_CODE_PREFIX}${Array.from(bytes, (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("")}`;
+}
+
+async function hashToken(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
 }
 
 async function readJson(

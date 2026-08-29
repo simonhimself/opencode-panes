@@ -39,6 +39,13 @@ import {
   inventoryPublicationMutationRequestSchema,
   inventoryCloudDeletionRequestSchema,
   inventoryPublicationUnpublishRequestSchema,
+  inventoryReconnectCodeRequestSchema,
+  inventoryReconnectCodeResponseSchema,
+  reconnectCodeSchema,
+  RECONNECT_CODE_PREFIX,
+  RECONNECT_CODE_TTL_MS,
+  syncReconnectRequestSchema,
+  syncReconnectResponseSchema,
   workspaceTokenSchema,
 } from "../src/index.js";
 
@@ -291,6 +298,77 @@ describe("local-first artifact manifests", () => {
 });
 
 describe("local-first lifecycle contracts", () => {
+  it("bounds reconnect codes and keeps recovery responses secret-minimal", () => {
+    const reconnectCode = `${RECONNECT_CODE_PREFIX}${"a".repeat(32)}`;
+    expect(RECONNECT_CODE_TTL_MS).toBe(10 * 60 * 1000);
+    expect(reconnectCodeSchema.safeParse(reconnectCode).success).toBe(true);
+    expect(reconnectCodeSchema.safeParse(`${reconnectCode}x`).success).toBe(
+      false,
+    );
+    expect(
+      inventoryReconnectCodeRequestSchema.safeParse({
+        confirmation: "Recover owner credential for artifact-1",
+      }).success,
+    ).toBe(true);
+    expect(
+      inventoryReconnectCodeResponseSchema.safeParse({
+        cloudArtifactId: "cloud-artifact-1",
+        reconnectCode,
+        expiresAt: "2026-08-29T12:10:00.000Z",
+      }).success,
+    ).toBe(true);
+    expect(
+      inventoryReconnectCodeResponseSchema.safeParse({
+        cloudArtifactId: "cloud-artifact-1",
+        reconnectCode,
+        expiresAt: "2026-08-29T12:10:00.000Z",
+        ownerCredential: "owner-secret",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("binds redemption to API, local, and cloud identities", () => {
+    const reconnectCode = `${RECONNECT_CODE_PREFIX}${"b".repeat(32)}`;
+    const request = syncReconnectRequestSchema.parse({
+      apiOrigin: "https://panes.example/",
+      localProjectId: "local-project-1",
+      localArtifactId: "local-artifact-1",
+      cloudProjectId: "cloud-project-1",
+      cloudArtifactId: "cloud-artifact-1",
+      reconnectCode,
+      newOwnerCredential: "owner-secret",
+    });
+    expect(request.apiOrigin).toBe("https://panes.example");
+    expect(
+      syncReconnectRequestSchema.safeParse({
+        ...request,
+        extra: "not-allowed",
+      }).success,
+    ).toBe(false);
+    expect(
+      syncReconnectResponseSchema.safeParse({
+        operation: "reconnected",
+        apiOrigin: "https://panes.example",
+        localProjectId: "local-project-1",
+        localArtifactId: "local-artifact-1",
+        cloudProjectId: "cloud-project-1",
+        cloudArtifactId: "cloud-artifact-1",
+        creationIdempotencyKey: "sync-reconnect-1",
+        inventoryUrl: "https://panes.example/inventory",
+        creatorLink: {
+          status: "active",
+          expiresAt: "2026-09-28T12:00:00.000Z",
+        },
+        publication: {
+          status: "none",
+          revisionVersion: null,
+          expiresAt: null,
+        },
+        syncedRevisionManifests: [],
+      }).success,
+    ).toBe(true);
+  });
+
   it("keeps authenticated inventory mutations strict and secret-minimal", () => {
     expect(
       inventoryCreatorRotateResponseSchema.safeParse({

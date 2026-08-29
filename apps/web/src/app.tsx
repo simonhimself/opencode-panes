@@ -31,6 +31,7 @@ import {
   followCurrentRevision,
   getStoredPublicUrl,
   includeRevision,
+  issueInventoryReconnectCode,
   deleteInventoryArtifact,
   extendInventoryPublication,
   republishInventoryPublication,
@@ -265,11 +266,20 @@ function InventoryArtifactCard({
     url: string;
     expiresAt: string;
   }>();
+  const [reconnectCode, setReconnectCode] = useState<{
+    code: string;
+    expiresAt: string;
+  }>();
+  const [reconnectConfirmation, setReconnectConfirmation] = useState("");
   const publication = artifact.publication;
   const deleting = artifact.lifecycleState === "deleting";
   const deletionConfirmation = `DELETE CLOUD COPY OF ${artifact.title}`;
   useEffect(() => {
-    if (deleting) setRotatedCreator(undefined);
+    if (deleting) {
+      setRotatedCreator(undefined);
+      setReconnectCode(undefined);
+      setReconnectConfirmation("");
+    }
   }, [deleting]);
   const runAction = async (label: string, action: () => Promise<unknown>) => {
     setBusy(label);
@@ -408,6 +418,64 @@ function InventoryArtifactCard({
           >
             Unpublish
           </button>
+        </div>
+        <div className="inventory-reconnect-action">
+          <label htmlFor={`reconnect-${artifact.artifactId}`}>
+            Type <code>{reconnectConfirmationText(artifact)}</code> to replace
+            the current Owner credential
+          </label>
+          <input
+            id={`reconnect-${artifact.artifactId}`}
+            onChange={(event) => setReconnectConfirmation(event.target.value)}
+            value={reconnectConfirmation}
+          />
+          <button
+            disabled={
+              Boolean(busy) ||
+              deleting ||
+              reconnectConfirmation !== reconnectConfirmationText(artifact)
+            }
+            onClick={() =>
+              void runAction("Reconnect code issued", async () => {
+                const issued = await issueInventoryReconnectCode(
+                  artifact.artifactId,
+                  reconnectConfirmation,
+                );
+                setReconnectCode({
+                  code: issued.reconnectCode,
+                  expiresAt: issued.expiresAt,
+                });
+                setReconnectConfirmation("");
+              })
+            }
+            type="button"
+          >
+            {busy === "Reconnect code issued"
+              ? "Issuing…"
+              : "Issue reconnect code"}
+          </button>
+          {reconnectCode ? (
+            <div className="inventory-reconnect-code" role="alert">
+              <strong>Copy this code now. It will not be shown again.</strong>
+              <code>{reconnectCode.code}</code>
+              <span>
+                Expires {formatInventoryTime(reconnectCode.expiresAt)} (10
+                minutes)
+              </span>
+              <button
+                aria-label="Copy reconnect code"
+                onClick={() =>
+                  void copyText(reconnectCode.code).then(
+                    () => onNotice(`${artifact.title} reconnect code copied`),
+                    () => onNotice("Clipboard access is unavailable"),
+                  )
+                }
+                type="button"
+              >
+                Copy reconnect code
+              </button>
+            </div>
+          ) : null}
         </div>
         {rotatedCreator ? (
           <div className="inventory-creator-link">
@@ -1265,4 +1333,8 @@ function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function reconnectConfirmationText(artifact: InventoryArtifact): string {
+  return `RECOVER OWNER CREDENTIAL FOR ARTIFACT ${artifact.artifactId}: REDEMPTION REPLACES THE CURRENT OWNER CREDENTIAL (${artifact.title})`;
 }

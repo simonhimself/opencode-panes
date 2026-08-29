@@ -14,6 +14,8 @@ import {
   syncRevisionCommitResponseSchema,
   syncCreatorRotateRequestSchema,
   syncCreatorRotateResponseSchema,
+  syncReconnectRequestSchema,
+  syncReconnectResponseSchema,
   type ApiErrorCode,
   type CloudManifest,
   type ErrorIssue,
@@ -114,6 +116,16 @@ export async function routeSyncRequest(
   if (pathname === "/api/sync/artifacts") {
     if (request.method !== "POST") return methodNotAllowed(["POST"]);
     return createSyncArtifact(request, env);
+  }
+
+  const reconnectMatch = pathname.match(
+    /^\/api\/sync\/artifacts\/([^/]+)\/reconnect$/u,
+  );
+  if (reconnectMatch) {
+    const artifactId = parseArtifactId(reconnectMatch[1]);
+    if (artifactId instanceof Response) return artifactId;
+    if (request.method !== "POST") return methodNotAllowed(["POST"]);
+    return reconnectSyncArtifact(request, env, artifactId);
   }
 
   const creatorDownloadMatch = pathname.match(
@@ -408,6 +420,360 @@ async function createSyncArtifact(
     body.data.ownerCredential,
     body.data.creatorToken,
     201,
+  );
+}
+
+interface ReconnectRow extends SyncArtifactRow {
+  sync_lease_owner: string | null;
+  sync_lease_expires_at: string | null;
+}
+
+interface ReconnectRevisionRow {
+  id: string;
+  version: number;
+  preview_entry: string;
+  approved_origins: string;
+  created_at: string;
+  cloud_manifest_key: string | null;
+}
+
+interface ReconnectFileRow {
+  path: string;
+  sha256: string;
+  byte_size: number;
+  media_type: string;
+  object_key: string;
+}
+
+async function reconnectSyncArtifact(
+  request: Request,
+  env: Env,
+  artifactId: string,
+): Promise<Response> {
+  const body = await parseJsonBody(
+    request,
+    syncReconnectRequestSchema,
+    SYNC_BODY_LIMIT,
+  );
+  if (!body.ok) return reconnectError(400);
+
+  const now = new Date().toISOString();
+  if (body.data.apiOrigin !== new URL(request.url).origin)
+    return reconnectError(403);
+  if (body.data.cloudArtifactId !== artifactId) return reconnectError(403);
+  const row = await env.DB.prepare(
+    `SELECT cloud_artifact_id, cloud_project_id, local_project_id,
+            local_artifact_id, slug, title, kind, owner_token_hash,
+            creation_idempotency_key, creator_token_hash,
+            creator_created_at, creator_expires_at, lifecycle_state,
+            sync_lease_owner, sync_lease_expires_at
+       FROM sync_artifacts
+      WHERE cloud_artifact_id = ? AND cloud_project_id = ?
+        AND local_project_id = ? AND local_artifact_id = ?`,
+  )
+    .bind(
+      artifactId,
+      body.data.cloudProjectId,
+      body.data.localProjectId,
+      body.data.localArtifactId,
+    )
+    .first<ReconnectRow>();
+  if (!row) return reconnectError(403);
+  if (row.lifecycle_state === "deleting") return reconnectError(409);
+  if (
+    row.sync_lease_owner &&
+    row.sync_lease_expires_at &&
+    row.sync_lease_expires_at > now
+  ) {
+    return reconnectError(409);
+  }
+
+  const reconnectCodeHash = await hashToken(body.data.reconnectCode);
+  const code = await env.DB.prepare(
+    `SELECT 1 AS valid
+       FROM owner_reconnect_codes
+      WHERE artifact_id = ? AND code_hash = ?
+        AND consumed_at IS NULL AND revoked_at IS NULL
+        AND expires_at > ?`,
+  )
+    .bind(artifactId, reconnectCodeHash, now)
+    .first<{ valid: number }>();
+  if (!code) return reconnectError(403);
+
+  const revisions = await loadReconnectRevisions(env, row);
+  if (!revisions) return reconnectError(409);
+
+  const creatorLink = await loadReconnectCreatorLink(env.DB, artifactId, now);
+  if (!creatorLink) return reconnectError(409);
+  const publication = await loadReconnectPublication(env.DB, artifactId, now);
+
+  const newOwnerHash = await hashToken(body.data.newOwnerCredential);
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE sync_artifacts
+          SET owner_token_hash = ?, updated_at = ?
+        WHERE cloud_artifact_id = ? AND cloud_project_id = ?
+          AND local_project_id = ? AND local_artifact_id = ?
+          AND lifecycle_state = 'active'
+          AND (sync_lease_owner IS NULL OR sync_lease_expires_at <= ?)
+          AND EXISTS (
+            SELECT 1 FROM owner_reconnect_codes
+             WHERE artifact_id = ? AND code_hash = ?
+               AND consumed_at IS NULL AND revoked_at IS NULL
+               AND expires_at > ?
+          )`,
+    ).bind(
+      newOwnerHash,
+      now,
+      artifactId,
+      body.data.cloudProjectId,
+      body.data.localProjectId,
+      body.data.localArtifactId,
+      now,
+      artifactId,
+      reconnectCodeHash,
+      now,
+    ),
+    env.DB.prepare(
+      `UPDATE owner_reconnect_codes
+          SET consumed_at = ?
+        WHERE artifact_id = ? AND code_hash = ?
+          AND consumed_at IS NULL AND revoked_at IS NULL
+          AND expires_at > ?
+          AND EXISTS (
+            SELECT 1 FROM sync_artifacts
+             WHERE cloud_artifact_id = ? AND cloud_project_id = ?
+               AND local_project_id = ? AND local_artifact_id = ?
+               AND owner_token_hash = ? AND updated_at = ?
+          )`,
+    ).bind(
+      now,
+      artifactId,
+      reconnectCodeHash,
+      now,
+      artifactId,
+      body.data.cloudProjectId,
+      body.data.localProjectId,
+      body.data.localArtifactId,
+      newOwnerHash,
+      now,
+    ),
+  ]);
+  if (results[0]?.meta.changes !== 1 || results[1]?.meta.changes !== 1)
+    return reconnectError(409);
+
+  return jsonResponse(
+    syncReconnectResponseSchema.parse({
+      operation: "reconnected",
+      apiOrigin: new URL(request.url).origin,
+      localProjectId: row.local_project_id,
+      localArtifactId: row.local_artifact_id,
+      cloudProjectId: row.cloud_project_id,
+      cloudArtifactId: row.cloud_artifact_id,
+      creationIdempotencyKey: row.creation_idempotency_key,
+      inventoryUrl: new URL("/inventory", request.url).toString(),
+      creatorLink,
+      publication,
+      syncedRevisionManifests: revisions,
+    }),
+  );
+}
+
+async function loadReconnectRevisions(
+  env: Env,
+  row: ReconnectRow,
+): Promise<CloudManifest["revisions"] | undefined> {
+  const result = await env.DB.prepare(
+    `SELECT id, version, preview_entry, approved_origins, created_at,
+            cloud_manifest_key
+       FROM local_revisions
+      WHERE artifact_id = ? AND committed_at IS NOT NULL
+      ORDER BY version ASC`,
+  )
+    .bind(row.cloud_artifact_id)
+    .all<ReconnectRevisionRow>();
+  const revisions: CloudManifest["revisions"] = [];
+  for (const [index, revisionRow] of result.results.entries()) {
+    if (revisionRow.version !== index + 1) return undefined;
+    if (!revisionRow.cloud_manifest_key) return undefined;
+    if (
+      revisionRow.cloud_manifest_key !==
+      syncManifestKey(
+        row.cloud_project_id,
+        row.cloud_artifact_id,
+        revisionRow.version,
+      )
+    )
+      return undefined;
+    const object = await env.PRIVATE_ARTIFACTS.get(
+      revisionRow.cloud_manifest_key,
+    );
+    if (!object) return undefined;
+    try {
+      const manifest = cloudManifestSchema.parse(await object.json());
+      if (
+        manifest.projectId !== row.cloud_project_id ||
+        manifest.artifactId !== row.cloud_artifact_id ||
+        manifest.slug !== row.slug ||
+        manifest.title !== row.title ||
+        (manifest.kind ?? undefined) !== (row.kind ?? undefined)
+      )
+        return undefined;
+      if (
+        manifest.revisions.some(
+          (candidate, index) => candidate.version !== index + 1,
+        )
+      )
+        return undefined;
+      const revision = manifest.revisions.find(
+        (candidate) => candidate.version === revisionRow.version,
+      );
+      if (!revision) return undefined;
+      const storedPreview = previewEntrySchema.safeParse(
+        JSON.parse(revisionRow.preview_entry),
+      );
+      const storedOrigins = approvedOriginsSchema.safeParse(
+        JSON.parse(revisionRow.approved_origins),
+      );
+      if (!storedPreview.success || !storedOrigins.success) return undefined;
+      if (revision.files.some((file) => mandatoryExclusion(file.path)))
+        return undefined;
+      if (
+        JSON.stringify(revision.preview) !==
+          JSON.stringify(storedPreview.data) ||
+        JSON.stringify(revision.approvedOrigins) !==
+          JSON.stringify(storedOrigins.data) ||
+        revision.createdAt !== revisionRow.created_at
+      )
+        return undefined;
+      const fileRows = await env.DB.prepare(
+        `SELECT path, sha256, byte_size, media_type, object_key
+           FROM revision_files
+          WHERE revision_id = ?
+          ORDER BY path ASC`,
+      )
+        .bind(revisionRow.id)
+        .all<ReconnectFileRow>();
+      const cloudFiles = revision.files.filter((file) => file.kind === "file");
+      if (fileRows.results.length !== cloudFiles.length) return undefined;
+      const cloudFilesByPath = new Map(
+        cloudFiles.map((file) => [file.path, file]),
+      );
+      for (const fileRow of fileRows.results) {
+        const cloudFile = cloudFilesByPath.get(fileRow.path);
+        if (
+          !cloudFile ||
+          cloudFile.sha256 !== fileRow.sha256 ||
+          cloudFile.byteSize !== fileRow.byte_size ||
+          cloudFile.mediaType !== fileRow.media_type ||
+          fileRow.object_key !==
+            privateRevisionObjectKey(
+              row.cloud_project_id,
+              row.cloud_artifact_id,
+              revisionRow.id,
+              fileRow.path,
+            )
+        )
+          return undefined;
+        const object = await env.PRIVATE_ARTIFACTS.head(fileRow.object_key);
+        if (
+          !object ||
+          object.customMetadata?.sha256 !== fileRow.sha256 ||
+          object.customMetadata?.byteSize !== String(fileRow.byte_size) ||
+          object.httpMetadata?.contentType !== fileRow.media_type
+        )
+          return undefined;
+      }
+      const filePaths = new Set(cloudFiles.map((file) => file.path));
+      if (
+        revision.files.some(
+          (file) =>
+            file.kind === "directory" &&
+            ![...filePaths].some((path) => path.startsWith(`${file.path}/`)),
+        )
+      )
+        return undefined;
+      revisions.push(revision);
+    } catch {
+      return undefined;
+    }
+  }
+  return revisions;
+}
+
+async function loadReconnectCreatorLink(
+  db: D1Database,
+  artifactId: string,
+  now: string,
+): Promise<
+  { status: "active" | "expired" | "revoked"; expiresAt: string } | undefined
+> {
+  const row = await db
+    .prepare(
+      `SELECT expires_at, revoked_at
+         FROM creator_links
+        WHERE artifact_id = ?
+        ORDER BY created_at DESC LIMIT 1`,
+    )
+    .bind(artifactId)
+    .first<{ expires_at: string; revoked_at: string | null }>();
+  if (!row) return undefined;
+  return {
+    status: row.revoked_at
+      ? "revoked"
+      : row.expires_at <= now
+        ? "expired"
+        : "active",
+    expiresAt: row.expires_at,
+  };
+}
+
+async function loadReconnectPublication(
+  db: D1Database,
+  artifactId: string,
+  now: string,
+): Promise<{
+  status: "active" | "expired" | "revoked" | "none";
+  revisionVersion: number | null;
+  expiresAt: string | null;
+}> {
+  const row = await db
+    .prepare(
+      `SELECT revision_version, status, expires_at
+         FROM publications
+        WHERE artifact_id = ?
+        ORDER BY created_at DESC LIMIT 1`,
+    )
+    .bind(artifactId)
+    .first<{
+      revision_version: number;
+      status: "active" | "expired" | "revoked";
+      expires_at: string;
+    }>();
+  if (!row) return { status: "none", revisionVersion: null, expiresAt: null };
+  return {
+    status:
+      row.status === "revoked"
+        ? "revoked"
+        : row.expires_at <= now
+          ? "expired"
+          : "active",
+    revisionVersion: row.revision_version,
+    expiresAt: row.expires_at,
+  };
+}
+
+function reconnectError(status: 400 | 403 | 409): Response {
+  return errorResponse(
+    status,
+    status === 409
+      ? "CONFLICT"
+      : status === 403
+        ? "FORBIDDEN"
+        : "VALIDATION_ERROR",
+    status === 409
+      ? "Reconnect is unavailable while the Artifact is busy or changing"
+      : "Reconnect request is invalid",
   );
 }
 

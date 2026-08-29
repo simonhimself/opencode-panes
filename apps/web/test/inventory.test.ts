@@ -8,13 +8,19 @@ import {
   deleteInventoryArtifact,
 } from "../worker/deletion";
 import {
+  inventoryReconnectCodeResponseSchema,
   inventoryCreatorRotateResponseSchema,
   inventoryResponseSchema,
   publicationSchema,
+  syncReconnectResponseSchema,
 } from "@opencode-panes/contracts";
+import { reconnectCodeConfirmation } from "../worker/inventory";
 import { readBoundedText } from "../worker/bounded-json";
+import { privateRevisionObjectKey } from "../worker/storage";
 
 const ORIGIN = "https://panes.example";
+const RECONNECT_MANIFEST_V2_KEY =
+  "private/manifests/636c6f75642d70726f6a6563742d6f6e65/636c6f75642d61727469666163742d6f6e65/v2.json";
 const KEY_MATERIAL =
   "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
@@ -42,6 +48,363 @@ beforeEach(async () => {
 });
 
 describe("authenticated cloud inventory", () => {
+  it("issues one-time hashed reconnect codes with a bounded TTL and replaces only the Owner credential", async () => {
+    const material = await accessMaterial("reconnect");
+    stubJwks(material);
+    await seedInventory();
+    await seedReconnectManifests();
+    const headers = {
+      "Cf-Access-Jwt-Assertion": await accessToken(material, {
+        email: "simonhimself@gmail.com",
+      }),
+      "Content-Type": "application/json",
+    };
+    const confirmation = reconnectCodeConfirmation(
+      "cloud-artifact-one",
+      "Inventory one",
+    );
+    const issue = () =>
+      api(
+        "/api/inventory/artifacts/cloud-artifact-one/reconnect-code",
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ confirmation }),
+        },
+        accessEnv(material),
+      );
+    const first = inventoryReconnectCodeResponseSchema.parse(
+      await (await issue()).json(),
+    );
+    expect(first.reconnectCode).toMatch(/^panes-reconnect-[a-f0-9]{32}$/u);
+    expect(Date.parse(first.expiresAt) - Date.now()).toBeGreaterThan(
+      9 * 60_000,
+    );
+    expect(Date.parse(first.expiresAt) - Date.now()).toBeLessThanOrEqual(
+      10 * 60_000,
+    );
+    const storedFirst = await env.DB.prepare(
+      "SELECT code_hash, expires_at, consumed_at, revoked_at FROM owner_reconnect_codes WHERE artifact_id = ? ORDER BY created_at ASC LIMIT 1",
+    )
+      .bind("cloud-artifact-one")
+      .first<{
+        code_hash: string;
+        expires_at: string;
+        consumed_at: string | null;
+        revoked_at: string | null;
+      }>();
+    expect(storedFirst).toMatchObject({
+      code_hash: await sha256Text(first.reconnectCode),
+      expires_at: first.expiresAt,
+      consumed_at: null,
+      revoked_at: null,
+    });
+    expect(JSON.stringify(storedFirst)).not.toContain(first.reconnectCode);
+
+    const second = inventoryReconnectCodeResponseSchema.parse(
+      await (await issue()).json(),
+    );
+    expect(second.reconnectCode).not.toBe(first.reconnectCode);
+    expect(
+      await env.DB.prepare(
+        "SELECT revoked_at FROM owner_reconnect_codes WHERE code_hash = ?",
+      )
+        .bind(await sha256Text(first.reconnectCode))
+        .first<{ revoked_at: string | null }>(),
+    ).toMatchObject({ revoked_at: expect.any(String) });
+
+    await env.DB.prepare(
+      "UPDATE owner_reconnect_codes SET expires_at = ? WHERE code_hash = ?",
+    )
+      .bind("2020-01-01T00:00:00.000Z", await sha256Text(second.reconnectCode))
+      .run();
+    const expired = await api(
+      "/api/sync/artifacts/cloud-artifact-one/reconnect",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          localProjectId: "local-project-one",
+          localArtifactId: "local-artifact-one",
+          cloudProjectId: "cloud-project-one",
+          cloudArtifactId: "cloud-artifact-one",
+          reconnectCode: second.reconnectCode,
+          newOwnerCredential: "expired-owner",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(expired.status).toBe(403);
+    const third = inventoryReconnectCodeResponseSchema.parse(
+      await (await issue()).json(),
+    );
+    const wrongArtifact = await api(
+      "/api/sync/artifacts/cloud-artifact-one/reconnect",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          localProjectId: "local-project-one",
+          localArtifactId: "local-artifact-one",
+          cloudProjectId: "cloud-project-one",
+          cloudArtifactId: "cloud-artifact-two",
+          reconnectCode: third.reconnectCode,
+          newOwnerCredential: "wrong-artifact-owner",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(wrongArtifact.status).toBe(403);
+
+    const manifestObject = await env.PRIVATE_ARTIFACTS.get(
+      RECONNECT_MANIFEST_V2_KEY,
+    );
+    if (!manifestObject) throw new Error("reconnect manifest fixture missing");
+    const originalManifest = await manifestObject.text();
+    const corruptManifest = JSON.parse(originalManifest) as {
+      revisions: Array<{ files: Array<{ sha256?: string }> }>;
+    };
+    const secondManifest = corruptManifest.revisions[1];
+    const firstFile = secondManifest?.files[0];
+    if (!firstFile) throw new Error("reconnect revision fixture missing");
+    firstFile.sha256 = "0".repeat(64);
+    await env.PRIVATE_ARTIFACTS.put(
+      RECONNECT_MANIFEST_V2_KEY,
+      JSON.stringify(corruptManifest),
+    );
+    const corruptR2 = await api(
+      "/api/sync/artifacts/cloud-artifact-one/reconnect",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          localProjectId: "local-project-one",
+          localArtifactId: "local-artifact-one",
+          cloudProjectId: "cloud-project-one",
+          cloudArtifactId: "cloud-artifact-one",
+          reconnectCode: third.reconnectCode,
+          newOwnerCredential: "corrupt-r2-owner",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(corruptR2.status).toBe(409);
+    await env.PRIVATE_ARTIFACTS.put(
+      RECONNECT_MANIFEST_V2_KEY,
+      originalManifest,
+    );
+
+    await env.DB.prepare(
+      "UPDATE revision_files SET sha256 = ? WHERE revision_id = ? AND path = ?",
+    )
+      .bind("0".repeat(64), "revision-one-v2", "index.html")
+      .run();
+    const corrupt = await api(
+      "/api/sync/artifacts/cloud-artifact-one/reconnect",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          localProjectId: "local-project-one",
+          localArtifactId: "local-artifact-one",
+          cloudProjectId: "cloud-project-one",
+          cloudArtifactId: "cloud-artifact-one",
+          reconnectCode: third.reconnectCode,
+          newOwnerCredential: "corrupt-owner",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(corrupt.status).toBe(409);
+    expect(
+      await env.DB.prepare(
+        "SELECT owner_token_hash FROM sync_artifacts WHERE cloud_artifact_id = ?",
+      )
+        .bind("cloud-artifact-one")
+        .first<{ owner_token_hash: string }>(),
+    ).toMatchObject({ owner_token_hash: "a".repeat(64) });
+    expect(
+      await env.DB.prepare(
+        "SELECT consumed_at FROM owner_reconnect_codes WHERE code_hash = ?",
+      )
+        .bind(await sha256Text(third.reconnectCode))
+        .first<{ consumed_at: string | null }>(),
+    ).toMatchObject({ consumed_at: null });
+    await env.DB.prepare(
+      "UPDATE revision_files SET sha256 = ? WHERE revision_id = ? AND path = ?",
+    )
+      .bind("e".repeat(64), "revision-one-v2", "index.html")
+      .run();
+
+    const before = await env.DB.prepare(
+      "SELECT owner_token_hash, creator_token_hash FROM sync_artifacts WHERE cloud_artifact_id = ?",
+    )
+      .bind("cloud-artifact-one")
+      .first<{ owner_token_hash: string; creator_token_hash: string }>();
+    const redeemed = await api(
+      "/api/sync/artifacts/cloud-artifact-one/reconnect",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          localProjectId: "local-project-one",
+          localArtifactId: "local-artifact-one",
+          cloudProjectId: "cloud-project-one",
+          cloudArtifactId: "cloud-artifact-one",
+          reconnectCode: third.reconnectCode,
+          newOwnerCredential: "replacement-owner-credential",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(redeemed.status).toBe(200);
+    const response = syncReconnectResponseSchema.parse(await redeemed.json());
+    expect(response.creatorLink.status).toBe("active");
+    expect(response.publication).toEqual({
+      status: "active",
+      revisionVersion: 2,
+      expiresAt: "2026-09-05T12:00:00.000Z",
+    });
+    expect(
+      response.syncedRevisionManifests.map((revision) => revision.version),
+    ).toEqual([1, 2]);
+    const after = await env.DB.prepare(
+      "SELECT owner_token_hash, creator_token_hash FROM sync_artifacts WHERE cloud_artifact_id = ?",
+    )
+      .bind("cloud-artifact-one")
+      .first<{ owner_token_hash: string; creator_token_hash: string }>();
+    expect(after?.owner_token_hash).toBe(
+      await sha256Text("replacement-owner-credential"),
+    );
+    expect(after?.owner_token_hash).not.toBe(before?.owner_token_hash);
+    expect(after?.creator_token_hash).toBe(before?.creator_token_hash);
+    expect(
+      await env.DB.prepare(
+        "SELECT consumed_at FROM owner_reconnect_codes WHERE code_hash = ?",
+      )
+        .bind(await sha256Text(third.reconnectCode))
+        .first<{ consumed_at: string | null }>(),
+    ).toMatchObject({ consumed_at: expect.any(String) });
+
+    const oldOwner = await api(
+      "/api/sync/artifacts/cloud-artifact-one/lease/release",
+      {
+        method: "POST",
+        headers: { Authorization: "Bearer old-owner" },
+      },
+      accessEnv(material),
+    );
+    expect(oldOwner.status).toBe(403);
+    const newOwner = await api(
+      "/api/sync/artifacts/cloud-artifact-one/lease/release",
+      {
+        method: "POST",
+        headers: { Authorization: "Bearer replacement-owner-credential" },
+      },
+      accessEnv(material),
+    );
+    expect(newOwner.status).toBe(204);
+
+    const reused = await api(
+      "/api/sync/artifacts/cloud-artifact-one/reconnect",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          localProjectId: "local-project-one",
+          localArtifactId: "local-artifact-one",
+          cloudProjectId: "cloud-project-one",
+          cloudArtifactId: "cloud-artifact-one",
+          reconnectCode: third.reconnectCode,
+          newOwnerCredential: "another-owner",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(reused.status).toBe(403);
+
+    const concurrent = inventoryReconnectCodeResponseSchema.parse(
+      await (await issue()).json(),
+    );
+    const redeemConcurrently = (newOwnerCredential: string) =>
+      api(
+        "/api/sync/artifacts/cloud-artifact-one/reconnect",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            apiOrigin: ORIGIN,
+            localProjectId: "local-project-one",
+            localArtifactId: "local-artifact-one",
+            cloudProjectId: "cloud-project-one",
+            cloudArtifactId: "cloud-artifact-one",
+            reconnectCode: concurrent.reconnectCode,
+            newOwnerCredential,
+          }),
+        },
+        accessEnv(material),
+      );
+    const concurrentResults = await Promise.all([
+      redeemConcurrently("concurrent-owner-a"),
+      redeemConcurrently("concurrent-owner-b"),
+    ]);
+    expect(
+      concurrentResults.filter((result) => result.status === 200),
+    ).toHaveLength(1);
+    expect(concurrentResults.some((result) => result.status !== 200)).toBe(
+      true,
+    );
+  });
+
+  it("rejects recovery confirmation and deleting Artifacts without disclosing metadata", async () => {
+    const material = await accessMaterial("reconnect-boundaries");
+    stubJwks(material);
+    await seedInventory();
+    const headers = {
+      "Cf-Access-Jwt-Assertion": await accessToken(material, {
+        email: "simonhimself@gmail.com",
+      }),
+      "Content-Type": "application/json",
+    };
+    const incorrect = await api(
+      "/api/inventory/artifacts/cloud-artifact-one/reconnect-code",
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ confirmation: "RECOVER OWNER CREDENTIAL" }),
+      },
+      accessEnv(material),
+    );
+    expect(incorrect.status).toBe(400);
+    await env.DB.prepare(
+      "UPDATE sync_artifacts SET lifecycle_state = 'deleting' WHERE cloud_artifact_id = ?",
+    )
+      .bind("cloud-artifact-one")
+      .run();
+    const deleting = await api(
+      "/api/inventory/artifacts/cloud-artifact-one/reconnect-code",
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          confirmation: reconnectCodeConfirmation(
+            "cloud-artifact-one",
+            "Inventory one",
+          ),
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(deleting.status).toBe(409);
+    expect(await deleting.text()).not.toContain("Inventory one");
+  });
+
   it("cancels a chunked body as soon as it exceeds the byte limit", async () => {
     const cancel = vi.fn(async () => undefined);
     const body = new ReadableStream<Uint8Array>({
@@ -1050,6 +1413,132 @@ async function encryptedToken(
     new TextEncoder().encode(token).buffer as ArrayBuffer,
   );
   return btoa(String.fromCharCode(...new Uint8Array(ciphertext)));
+}
+
+async function seedReconnectManifests() {
+  const manifests = [
+    {
+      key: "private/manifests/636c6f75642d70726f6a6563742d6f6e65/636c6f75642d61727469666163742d6f6e65/v1.json",
+      revision: {
+        id: "revision-one-v1",
+        version: 1,
+        preview: { adapter: "browser", entryPath: "index.html" },
+        approvedOrigins: [],
+        files: [
+          {
+            kind: "file",
+            path: "index.html",
+            sha256: "d".repeat(64),
+            byteSize: 2,
+            mediaType: "text/html",
+          },
+        ],
+        createdAt: "2026-08-29T12:00:00.000Z",
+      },
+    },
+    {
+      key: RECONNECT_MANIFEST_V2_KEY,
+      revision: {
+        id: "revision-one-v2",
+        version: 2,
+        preview: { adapter: "browser", entryPath: "index.html" },
+        approvedOrigins: [],
+        files: [
+          {
+            kind: "file",
+            path: "index.html",
+            sha256: "e".repeat(64),
+            byteSize: 3,
+            mediaType: "text/html",
+          },
+          {
+            kind: "file",
+            path: "assets/app.js",
+            sha256: "f".repeat(64),
+            byteSize: 4,
+            mediaType: "text/javascript",
+          },
+        ],
+        createdAt: "2026-08-29T12:00:00.000Z",
+      },
+    },
+  ];
+  const manifestV1 = manifests[0];
+  const manifestV2 = manifests[1];
+  if (!manifestV1 || !manifestV2)
+    throw new Error("reconnect fixtures incomplete");
+  const fileV1 = privateRevisionObjectKey(
+    "cloud-project-one",
+    "cloud-artifact-one",
+    "revision-one-v1",
+    "index.html",
+  );
+  const fileV2 = privateRevisionObjectKey(
+    "cloud-project-one",
+    "cloud-artifact-one",
+    "revision-one-v2",
+    "index.html",
+  );
+  const appV2 = privateRevisionObjectKey(
+    "cloud-project-one",
+    "cloud-artifact-one",
+    "revision-one-v2",
+    "assets/app.js",
+  );
+  const manifestV2Revisions = [manifestV1.revision, manifestV2.revision];
+  for (const { key, revision } of manifests) {
+    await env.PRIVATE_ARTIFACTS.put(
+      key,
+      JSON.stringify({
+        schemaVersion: 1,
+        projectId: "cloud-project-one",
+        artifactId: "cloud-artifact-one",
+        slug: "inventory-one",
+        title: "Inventory one",
+        kind: "prototype",
+        revisions: revision.version === 2 ? manifestV2Revisions : [revision],
+      }),
+    );
+  }
+  await env.PRIVATE_ARTIFACTS.put(fileV1, "ok", {
+    httpMetadata: { contentType: "text/html" },
+    customMetadata: { sha256: "d".repeat(64), byteSize: "2" },
+  });
+  await env.PRIVATE_ARTIFACTS.put(fileV2, "two", {
+    httpMetadata: { contentType: "text/html" },
+    customMetadata: { sha256: "e".repeat(64), byteSize: "3" },
+  });
+  await env.PRIVATE_ARTIFACTS.put(appV2, "file", {
+    httpMetadata: { contentType: "text/javascript" },
+    customMetadata: { sha256: "f".repeat(64), byteSize: "4" },
+  });
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE local_revisions SET cloud_manifest_key = ? WHERE id = ?",
+    ).bind(manifestV1.key, "revision-one-v1"),
+    env.DB.prepare(
+      "UPDATE local_revisions SET cloud_manifest_key = ? WHERE id = ?",
+    ).bind(manifestV2.key, "revision-one-v2"),
+    env.DB.prepare(
+      "UPDATE revision_files SET object_key = ? WHERE revision_id = ? AND path = ?",
+    ).bind(fileV1, "revision-one-v1", "index.html"),
+    env.DB.prepare(
+      "UPDATE revision_files SET object_key = ? WHERE revision_id = ? AND path = ?",
+    ).bind(fileV2, "revision-one-v2", "index.html"),
+    env.DB.prepare(
+      "UPDATE revision_files SET object_key = ? WHERE revision_id = ? AND path = ?",
+    ).bind(appV2, "revision-one-v2", "assets/app.js"),
+  ]);
+}
+
+async function sha256Text(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
 }
 
 async function api(path: string, init?: RequestInit, workerEnv: Env = env) {

@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import {
   createServer,
@@ -66,6 +66,8 @@ import {
   syncCreateResponseSchema,
   syncRevisionCommitResponseSchema,
   syncCreatorRotateResponseSchema,
+  reconnectCodeSchema,
+  syncReconnectResponseSchema,
   type ArtifactManifest,
   type ArtifactFile,
   type ArtifactType,
@@ -127,7 +129,8 @@ interface StoredSyncState {
   cloudProjectId: string;
   cloudArtifactId: string;
   ownerCredential: string;
-  creatorUrl: string;
+  creatorUrl?: string;
+  creatorLinkStatus?: "available" | "unavailable";
   inventoryUrl: string;
   creatorExpiresAt: string;
   creationIdempotencyKey: string;
@@ -482,6 +485,28 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
         },
         async execute(args, context) {
           return syncArtifact(args, context, locks, options);
+        },
+      }),
+      artifact_reconnect: tool({
+        description:
+          "Reconnect a local Panes Artifact after its Owner credential was lost. Read and validate its canonical artifact.json first, then redeem the one-time code. Recovery replaces only the Owner credential, never rotates Creator access or Publication, and returns safe continuation guidance.",
+        args: {
+          artifactId: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^\S+$/)
+            .describe("Local artifact ID from the canonical artifact.json."),
+          reconnectCode: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .describe(
+              "One-time code shown by the authenticated Cloud inventory.",
+            ),
+        },
+        async execute(args, context) {
+          return reconnectArtifact(args, context, options);
         },
       }),
       artifact_publish: tool({
@@ -1870,13 +1895,19 @@ type SyncArguments = {
   rotateCreatorLink?: boolean | undefined;
 };
 
+type ReconnectArguments = {
+  artifactId: string;
+  reconnectCode: string;
+};
+
 interface SyncResult {
   operation: "synced";
   artifactId: string;
   title: string;
   syncedVersion: number;
   pendingVersions: number[];
-  creatorUrl: string;
+  creatorUrl?: string;
+  creatorLinkStatus: "available" | "unavailable";
   inventoryUrl: string;
   creatorExpiresAt: string;
   openCreatorAfterSuccess: AutoOpenStatus;
@@ -1891,6 +1922,157 @@ interface FinalizationJournal {
   revisionPath: string;
   revision: FinalizedRevision;
   manifest: ArtifactManifest;
+}
+
+async function reconnectArtifact(
+  args: ReconnectArguments,
+  context: ToolContext,
+  options: ResolvedOptions,
+) {
+  const artifactId = artifactIdSchema.safeParse(args.artifactId);
+  if (!artifactId.success) throw validationError("Artifact ID is invalid");
+  const reconnectCode = reconnectCodeSchema.safeParse(args.reconnectCode);
+  if (!reconnectCode.success)
+    throw validationError("Reconnect code is invalid");
+
+  const project = await resolveLocalProject(context);
+  const existing = await findArtifact(project.artifactRoot, artifactId.data);
+  if (!existing) {
+    throw new Error(
+      `No local artifact with ID ${artifactId.data} was found under ${project.artifactRoot}.`,
+    );
+  }
+
+  await recoverFinalization(existing);
+  await recoverImport(existing);
+  const artifact = await readArtifactDirectory(existing.artifactDirectory);
+  if (!artifact)
+    throw new Error("The local Artifact disappeared during reconnect.");
+  await verifyFinalizedRevisions(artifact);
+  const cloud = artifact.manifest.cloud;
+  if (!cloud) {
+    throw new Error(
+      "Reconnect requires an existing cloud mapping in the canonical artifact manifest.",
+    );
+  }
+
+  const newOwnerCredential = generateOwnerCredential();
+  const response = await fetchPanes(
+    new URL(
+      `/api/sync/artifacts/${encodeURIComponent(cloud.cloudArtifactId)}/reconnect`,
+      options.apiBaseUrl,
+    ),
+    {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        apiOrigin: options.apiBaseUrl.origin,
+        localProjectId: artifact.manifest.projectId,
+        localArtifactId: artifact.manifest.artifactId,
+        cloudProjectId: cloud.cloudProjectId,
+        cloudArtifactId: cloud.cloudArtifactId,
+        reconnectCode: reconnectCode.data,
+        newOwnerCredential,
+      }),
+    },
+    context.abort,
+    options.requestTimeoutMs,
+  );
+  const reconnected = await parseApiResponse(
+    response,
+    syncReconnectResponseSchema,
+    [reconnectCode.data, newOwnerCredential],
+  );
+  if (
+    reconnected.apiOrigin !== options.apiBaseUrl.origin ||
+    reconnected.localProjectId !== artifact.manifest.projectId ||
+    reconnected.localArtifactId !== artifact.manifest.artifactId ||
+    reconnected.cloudProjectId !== cloud.cloudProjectId ||
+    reconnected.cloudArtifactId !== cloud.cloudArtifactId
+  ) {
+    throw malformedSuccessResponse();
+  }
+  const inventoryUrl = validateInventoryUrl(
+    reconnected.inventoryUrl,
+    options.apiBaseUrl.origin,
+  );
+  validateReconnectedRevisionManifests(
+    artifact.manifest,
+    reconnected.syncedRevisionManifests,
+  );
+  const state: StoredSyncState = {
+    schemaVersion: 1,
+    apiOrigin: options.apiBaseUrl.origin,
+    projectId: artifact.manifest.projectId,
+    artifactId: artifact.manifest.artifactId,
+    cloudProjectId: reconnected.cloudProjectId,
+    cloudArtifactId: reconnected.cloudArtifactId,
+    ownerCredential: newOwnerCredential,
+    creatorLinkStatus: "unavailable",
+    inventoryUrl,
+    creatorExpiresAt: reconnected.creatorLink.expiresAt,
+    creationIdempotencyKey: reconnected.creationIdempotencyKey,
+    syncedRevisionVersions: reconnected.syncedRevisionManifests.map(
+      (revision) => revision.version,
+    ),
+    syncedRevisionManifests: reconnected.syncedRevisionManifests,
+  };
+  await writeSyncState(state);
+  return reconnectToolResult({
+    artifactId: artifact.manifest.artifactId,
+    title: artifact.manifest.title,
+    cloudProjectId: state.cloudProjectId,
+    cloudArtifactId: state.cloudArtifactId,
+    creatorLinkStatus: "unavailable",
+    creatorLifecycleStatus: reconnected.creatorLink.status,
+    creatorExpiresAt: state.creatorExpiresAt,
+    syncedRevisionVersions: state.syncedRevisionVersions,
+    publication: reconnected.publication,
+  });
+}
+
+function generateOwnerCredential(): string {
+  return `sync-owner-${randomBytes(32).toString("hex")}`;
+}
+
+function validateReconnectedRevisionManifests(
+  manifest: ArtifactManifest,
+  revisions: FinalizedRevision[],
+): void {
+  if (revisions.length > manifest.revisions.length)
+    throw malformedSuccessResponse();
+  const seen = new Set<number>();
+  for (const [index, revision] of revisions.entries()) {
+    if (revision.version !== index + 1 || seen.has(revision.version))
+      throw malformedSuccessResponse();
+    seen.add(revision.version);
+    const local = manifest.revisions.find(
+      (candidate) => candidate.version === revision.version,
+    );
+    if (
+      !local ||
+      local.id !== revision.id ||
+      JSON.stringify(local.preview) !== JSON.stringify(revision.preview) ||
+      JSON.stringify(local.approvedOrigins) !==
+        JSON.stringify(revision.approvedOrigins) ||
+      local.createdAt !== revision.createdAt
+    ) {
+      throw malformedSuccessResponse();
+    }
+    for (const cloudFile of revision.files) {
+      const localFile = local.files.find(
+        (candidate) =>
+          candidate.path === cloudFile.path &&
+          candidate.kind === cloudFile.kind,
+      );
+      if (
+        !localFile ||
+        JSON.stringify(localFile) !== JSON.stringify(cloudFile)
+      ) {
+        throw malformedSuccessResponse();
+      }
+    }
+  }
 }
 
 async function syncArtifact(
@@ -2123,8 +2305,9 @@ async function syncLocalArtifact(
 
   if (
     rotateCreatorLink ||
-    !Number.isFinite(Date.parse(state.creatorExpiresAt)) ||
-    Date.parse(state.creatorExpiresAt) <= Date.now()
+    (state.creatorUrl !== undefined &&
+      (!Number.isFinite(Date.parse(state.creatorExpiresAt)) ||
+        Date.parse(state.creatorExpiresAt) <= Date.now()))
   ) {
     const rotationResponse = await fetchPanes(
       new URL(
@@ -2155,6 +2338,7 @@ async function syncLocalArtifact(
         rotated.creatorToken,
       ),
       creatorExpiresAt: rotated.creatorExpiresAt,
+      creatorLinkStatus: "available",
     };
     await writeSyncState(state);
   }
@@ -2337,7 +2521,8 @@ async function syncLocalArtifact(
     title: artifact.manifest.title,
     syncedVersion: lastSyncedVersion,
     pendingVersions,
-    creatorUrl: state.creatorUrl,
+    ...(state.creatorUrl ? { creatorUrl: state.creatorUrl } : {}),
+    creatorLinkStatus: state.creatorLinkStatus ?? "available",
     inventoryUrl: state.inventoryUrl,
     creatorExpiresAt: state.creatorExpiresAt,
     openCreatorAfterSuccess: autoOpenStatus,
@@ -2356,7 +2541,8 @@ function syncStateFromCheckpoint(
     cloudProjectId: checkpoint.cloudProjectId,
     cloudArtifactId: checkpoint.cloudArtifactId,
     ownerCredential: checkpoint.ownerCredential,
-    creatorUrl: checkpoint.creatorUrl,
+    ...(checkpoint.creatorUrl ? { creatorUrl: checkpoint.creatorUrl } : {}),
+    creatorLinkStatus: "available",
     inventoryUrl: checkpoint.inventoryUrl,
     creatorExpiresAt: checkpoint.creatorExpiresAt,
     creationIdempotencyKey: checkpoint.creationIdempotencyKey,
@@ -4893,11 +5079,12 @@ function toolResult(input: {
 }
 
 async function maybeOpenViewer(
-  viewerUrl: string,
+  viewerUrl: string | undefined,
   context: ToolContext,
   autoOpen: boolean,
 ): Promise<AutoOpenStatus> {
   if (!autoOpen) return "disabled";
+  if (!viewerUrl) return "failed";
 
   let url: URL;
   try {
@@ -4981,13 +5168,50 @@ function syncToolResult(input: SyncResult) {
     title: input.title,
     syncedVersion: input.syncedVersion,
     pendingVersions: input.pendingVersions,
-    creatorUrl: input.creatorUrl,
+    ...(input.creatorUrl ? { creatorUrl: input.creatorUrl } : {}),
+    creatorLinkStatus: input.creatorLinkStatus,
     inventoryUrl: input.inventoryUrl,
     creatorExpiresAt: input.creatorExpiresAt,
     openCreatorAfterSuccess: input.openCreatorAfterSuccess,
   };
   return {
     title: `Synced ${input.title}`,
+    output: JSON.stringify(metadata),
+    metadata,
+  };
+}
+
+function reconnectToolResult(input: {
+  artifactId: string;
+  title: string;
+  cloudProjectId: string;
+  cloudArtifactId: string;
+  creatorLinkStatus: "available" | "unavailable";
+  creatorLifecycleStatus: "active" | "expired" | "revoked";
+  creatorExpiresAt: string;
+  syncedRevisionVersions: number[];
+  publication: {
+    status: "active" | "expired" | "revoked" | "none";
+    revisionVersion: number | null;
+    expiresAt: string | null;
+  };
+}) {
+  const metadata = {
+    operation: "reconnected" as const,
+    artifactId: input.artifactId,
+    title: input.title,
+    cloudProjectId: input.cloudProjectId,
+    cloudArtifactId: input.cloudArtifactId,
+    creatorLinkStatus: input.creatorLinkStatus,
+    creatorLifecycleStatus: input.creatorLifecycleStatus,
+    creatorExpiresAt: input.creatorExpiresAt,
+    syncedRevisionVersions: input.syncedRevisionVersions,
+    publication: input.publication,
+    guidance:
+      "Owner credential restored. Creator access and Publication were unchanged. Request explicit Creator-link rotation before opening a new Creator workspace.",
+  };
+  return {
+    title: `Reconnected ${input.title}`,
     output: JSON.stringify(metadata),
     metadata,
   };
@@ -5094,7 +5318,7 @@ function isStoredSyncState(
   const state = value as Record<string, unknown>;
   return (
     Object.keys(state).length >= 12 &&
-    Object.keys(state).length <= 14 &&
+    Object.keys(state).length <= 16 &&
     state.schemaVersion === 1 &&
     state.apiOrigin === apiOrigin &&
     state.projectId === projectId &&
@@ -5102,7 +5326,14 @@ function isStoredSyncState(
     typeof state.cloudProjectId === "string" &&
     typeof state.cloudArtifactId === "string" &&
     ownerTokenSchema.safeParse(state.ownerCredential).success &&
-    typeof state.creatorUrl === "string" &&
+    (state.creatorUrl === undefined || typeof state.creatorUrl === "string") &&
+    (state.creatorLinkStatus === undefined ||
+      state.creatorLinkStatus === "available" ||
+      state.creatorLinkStatus === "unavailable") &&
+    !(
+      state.creatorLinkStatus === "unavailable" &&
+      state.creatorUrl !== undefined
+    ) &&
     typeof state.inventoryUrl === "string" &&
     typeof state.creatorExpiresAt === "string" &&
     typeof state.creationIdempotencyKey === "string" &&

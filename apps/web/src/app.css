@@ -971,6 +971,71 @@ select,
   gap: 8px;
 }
 
+.inventory-reconnect-action {
+  display: grid;
+  gap: 8px;
+  padding: 14px 0;
+  border-top: 1px solid #3e403d;
+}
+
+.inventory-reconnect-action input {
+  min-height: 34px;
+  box-sizing: border-box;
+  padding: 0 8px;
+  border: 1px solid #4b4e4a;
+  border-radius: 2px;
+  background: #1e201e;
+  color: #d9d9d2;
+}
+
+.inventory-reconnect-action label {
+  display: grid;
+  gap: 5px;
+  color: #858a82;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.inventory-reconnect-action label code {
+  color: #ffcab9;
+  overflow-wrap: anywhere;
+  text-transform: none;
+}
+
+.inventory-reconnect-code {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 12px;
+  border: 1px solid #cb7b43;
+  background: #27231f;
+}
+
+.inventory-reconnect-code strong {
+  color: #ffcab9;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.inventory-reconnect-code code {
+  color: #ffc293;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.inventory-reconnect-code span {
+  color: #9de0b0;
+  font-size: 12px;
+}
+
+.inventory-reconnect-code button {
+  justify-self: start;
+}
+
 .inventory-delete-action label {
   line-height: 1.5;
   text-transform: none;
