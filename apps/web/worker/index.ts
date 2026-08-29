@@ -25,6 +25,7 @@ const CREATE_KEY_HEADER = "X-Panes-Create-Key";
 const JSON_HEADERS = {
   "Cache-Control": "no-store",
   "Content-Type": "application/json; charset=utf-8",
+  "Referrer-Policy": "no-referrer",
 } as const;
 
 interface ArtifactRow {
@@ -85,7 +86,8 @@ export default {
     const crossOriginError = rejectCrossOriginRequest(request);
     if (crossOriginError) return crossOriginError;
 
-    if (request.method === "OPTIONS") return preflightResponse(request);
+    if (request.method === "OPTIONS")
+      return withCorsHeaders(request, preflightResponse(request));
 
     try {
       const response = await routeRequest(request, env);
@@ -896,6 +898,9 @@ function routeTemplate(pathname: string): string {
   ) {
     return "/api/sync/artifacts/:artifactId/revisions/:version/files/:path";
   }
+  if (/^\/api\/creator\/[^/]+\/revisions\/\d+\/files\/.+$/u.test(pathname)) {
+    return "/api/creator/:token/revisions/:version/files/:path";
+  }
   if (
     /^\/api\/sync\/artifacts\/[^/]+\/revisions\/\d+\/commit$/u.test(pathname)
   ) {
@@ -919,11 +924,13 @@ function routeTemplate(pathname: string): string {
 
 function withCorsHeaders(request: Request, response: Response): Response {
   const origin = request.headers.get("Origin");
-  if (!origin) return response;
-
   const headers = new Headers(response.headers);
-  headers.set("Access-Control-Allow-Origin", origin);
-  headers.append("Vary", "Origin");
+  headers.set("Cache-Control", "no-store");
+  headers.set("Referrer-Policy", "no-referrer");
+  if (origin) {
+    headers.set("Access-Control-Allow-Origin", origin);
+    headers.append("Vary", "Origin");
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,

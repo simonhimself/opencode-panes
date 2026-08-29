@@ -2,7 +2,10 @@ import {
   MAX_REMOTE_FILE_BYTES,
   MAX_REMOTE_REVISION_BYTES,
   artifactIdSchema,
+  approvedOriginsSchema,
+  creatorWorkspaceResponseSchema,
   ownerTokenSchema,
+  previewEntrySchema,
   relativePathSchema,
   syncCreateRequestSchema,
   syncCreateResponseSchema,
@@ -15,6 +18,10 @@ import {
   type CloudManifest,
   type ErrorIssue,
 } from "@opencode-panes/contracts";
+import {
+  createPreviewCsp,
+  normalizePreviewContentType,
+} from "@opencode-panes/renderers/preview-security";
 
 import { getCommittedRevisionFile, privateRevisionObjectKey } from "./storage";
 
@@ -28,11 +35,13 @@ const SYNC_LEASE_TTL_MS = 60 * 1000;
 export const TEMP_UPLOAD_GRACE_MS = 24 * 60 * 60 * 1000;
 const CLEANUP_BATCH_SIZE = 100;
 const CREATOR_CAPABILITY_HEADERS = {
+  "Cache-Control": "no-store",
   "Referrer-Policy": "no-referrer",
 } as const;
 const JSON_HEADERS = {
   "Cache-Control": "no-store",
   "Content-Type": "application/json; charset=utf-8",
+  "Referrer-Policy": "no-referrer",
 } as const;
 
 interface SyncArtifactRow {
@@ -105,6 +114,44 @@ export async function routeSyncRequest(
       );
     return readCreatorCapability(request, env, token);
   }
+
+  const creatorFileMatch = pathname.match(
+    /^\/api\/creator\/([^/]+)\/revisions\/(\d+)\/files\/(.+)$/u,
+  );
+  if (creatorFileMatch) {
+    const token = decodePathSegment(creatorFileMatch[1]);
+    const version = parseVersion(creatorFileMatch[2]);
+    const path = decodePathSegment(creatorFileMatch[3]);
+    if (!token || !ownerTokenSchema.safeParse(token).success)
+      return errorResponse(
+        404,
+        "NOT_FOUND",
+        "Creator link not found",
+        undefined,
+        CREATOR_CAPABILITY_HEADERS,
+      );
+    if (version instanceof Response) return version;
+    if (!path || !relativePathSchema.safeParse(path).success)
+      return errorResponse(
+        404,
+        "NOT_FOUND",
+        "Revision file not found",
+        undefined,
+        CREATOR_CAPABILITY_HEADERS,
+      );
+    if (request.method !== "GET" && request.method !== "HEAD")
+      return methodNotAllowed(["GET", "HEAD"], CREATOR_CAPABILITY_HEADERS);
+    return readCreatorFile(request, env, token, version, path);
+  }
+
+  if (pathname.startsWith("/api/creator/"))
+    return errorResponse(
+      404,
+      "NOT_FOUND",
+      "Creator route not found",
+      undefined,
+      CREATOR_CAPABILITY_HEADERS,
+    );
 
   const rotateMatch = pathname.match(
     /^\/api\/sync\/artifacts\/([^/]+)\/creator\/rotate$/u,
@@ -943,18 +990,82 @@ interface CreatorCapabilityRow {
   revoked_at: string | null;
 }
 
+interface CreatorRevisionRow {
+  id: string;
+  artifact_id: string;
+  version: number;
+  preview_entry: string;
+  approved_origins: string;
+  created_at: string;
+  cloud_manifest_key: string;
+}
+
 async function readCreatorCapability(
   request: Request,
   env: Env,
   token: string,
 ): Promise<Response> {
-  const row = await env.DB.prepare(
-    `SELECT a.cloud_artifact_id, a.cloud_project_id, a.slug, a.title, a.kind,
-            l.expires_at, l.revoked_at
-       FROM creator_links l
-       JOIN sync_artifacts a ON a.cloud_artifact_id = l.artifact_id
-      WHERE l.token_hash = ?`,
+  const row = await loadCreatorCapability(env.DB, token);
+  if (row instanceof Response) return row;
+  if (request.method !== "GET")
+    return methodNotAllowed(["GET"], CREATOR_CAPABILITY_HEADERS);
+  const revisions = await env.DB.prepare(
+    `SELECT id, artifact_id, version, preview_entry, approved_origins,
+            created_at, cloud_manifest_key
+       FROM local_revisions
+      WHERE artifact_id = ? AND committed_at IS NOT NULL
+      ORDER BY version DESC`,
   )
+    .bind(row.cloud_artifact_id)
+    .all<CreatorRevisionRow>();
+  const workspaceRevisions = await Promise.all(
+    revisions.results.map(async (revisionRow) => {
+      const manifestObject = await env.PRIVATE_ARTIFACTS.get(
+        revisionRow.cloud_manifest_key,
+      );
+      if (!manifestObject)
+        throw new Error("Committed Revision manifest missing");
+      const manifest = cloudManifestSchema.parse(await manifestObject.json());
+      if (
+        manifest.artifactId !== row.cloud_artifact_id ||
+        manifest.projectId !== row.cloud_project_id
+      ) {
+        throw new Error("Committed Revision manifest identity mismatch");
+      }
+      const revision = manifest.revisions.find(
+        (candidate) => candidate.version === revisionRow.version,
+      );
+      if (!revision) throw new Error("Committed Revision metadata missing");
+      return { ...revision, id: revisionRow.id };
+    }),
+  );
+  return jsonResponse(
+    creatorWorkspaceResponseSchema.parse({
+      cloudArtifactId: row.cloud_artifact_id,
+      cloudProjectId: row.cloud_project_id,
+      slug: row.slug,
+      title: row.title,
+      ...(row.kind ? { kind: row.kind } : {}),
+      creatorExpiresAt: row.expires_at,
+      revisions: workspaceRevisions,
+    }),
+    200,
+    CREATOR_CAPABILITY_HEADERS,
+  );
+}
+
+async function loadCreatorCapability(
+  db: D1Database,
+  token: string,
+): Promise<CreatorCapabilityRow | Response> {
+  const row = await db
+    .prepare(
+      `SELECT a.cloud_artifact_id, a.cloud_project_id, a.slug, a.title, a.kind,
+              l.expires_at, l.revoked_at
+         FROM creator_links l
+         JOIN sync_artifacts a ON a.cloud_artifact_id = l.artifact_id
+        WHERE l.token_hash = ?`,
+    )
     .bind(await hashToken(token))
     .first<CreatorCapabilityRow>();
   if (!row)
@@ -974,19 +1085,124 @@ async function readCreatorCapability(
       CREATOR_CAPABILITY_HEADERS,
     );
   }
-  if (request.method !== "GET") return methodNotAllowed(["GET"]);
-  return jsonResponse(
-    {
-      cloudArtifactId: row.cloud_artifact_id,
-      cloudProjectId: row.cloud_project_id,
-      slug: row.slug,
-      title: row.title,
-      ...(row.kind ? { kind: row.kind } : {}),
-      creatorExpiresAt: row.expires_at,
-    },
-    200,
+  return row;
+}
+
+async function readCreatorFile(
+  request: Request,
+  env: Env,
+  token: string,
+  version: number,
+  path: string,
+): Promise<Response> {
+  const artifact = await loadCreatorCapability(env.DB, token);
+  if (artifact instanceof Response) return artifact;
+  const row = await env.DB.prepare(
+    `SELECT f.object_key, f.sha256, f.media_type, f.byte_size,
+            r.preview_entry, r.approved_origins, r.cloud_manifest_key
+       FROM revision_files f
+       JOIN local_revisions r ON r.id = f.revision_id
+      WHERE r.artifact_id = ? AND r.version = ? AND r.committed_at IS NOT NULL
+        AND f.path = ?`,
+  )
+    .bind(artifact.cloud_artifact_id, version, path)
+    .first<{
+      object_key: string;
+      sha256: string;
+      media_type: string;
+      byte_size: number;
+      preview_entry: string;
+      approved_origins: string;
+      cloud_manifest_key: string;
+    }>();
+  if (!row) return capabilityFileNotFound();
+
+  const manifestObject = await env.PRIVATE_ARTIFACTS.get(
+    row.cloud_manifest_key,
+  );
+  if (!manifestObject) return capabilityFileNotFound();
+  const manifest = cloudManifestSchema.safeParse(await manifestObject.json());
+  const manifestRevision = manifest.success
+    ? manifest.data.revisions.find((candidate) => candidate.version === version)
+    : undefined;
+  const manifestFile = manifestRevision?.files.find(
+    (candidate) => candidate.kind === "file" && candidate.path === path,
+  );
+  if (
+    !manifestRevision ||
+    !manifestFile ||
+    manifestFile.kind !== "file" ||
+    manifestFile.sha256 !== row.sha256 ||
+    manifestFile.byteSize !== row.byte_size ||
+    manifestFile.mediaType !== row.media_type
+  ) {
+    return capabilityFileNotFound();
+  }
+
+  const storedPreview = previewEntrySchema.parse(JSON.parse(row.preview_entry));
+  const storedOrigins = approvedOriginsSchema.parse(
+    JSON.parse(row.approved_origins),
+  );
+  if (
+    JSON.stringify(storedPreview) !==
+      JSON.stringify(manifestRevision?.preview) ||
+    JSON.stringify(storedOrigins) !==
+      JSON.stringify(manifestRevision?.approvedOrigins)
+  ) {
+    return capabilityFileNotFound();
+  }
+
+  const objectMetadata = await env.PRIVATE_ARTIFACTS.head(row.object_key);
+  if (
+    !objectMetadata ||
+    objectMetadata.size !== row.byte_size ||
+    objectMetadata.customMetadata?.sha256 !== row.sha256 ||
+    objectMetadata.customMetadata?.byteSize !== String(row.byte_size) ||
+    objectMetadata.httpMetadata?.contentType !== row.media_type
+  )
+    return capabilityFileNotFound();
+  const object = await env.PRIVATE_ARTIFACTS.get(row.object_key);
+  if (!object || !("body" in object) || !object.body)
+    return capabilityFileNotFound();
+  const preview = manifestRevision.preview;
+  const origins = manifestRevision.approvedOrigins;
+  const headers = new Headers(CREATOR_CAPABILITY_HEADERS);
+  headers.set("Content-Type", normalizePreviewContentType(row.media_type));
+  headers.set("Content-Length", String(row.byte_size));
+  headers.set(
+    "Content-Security-Policy",
+    createPreviewCsp(new URL(request.url).origin, origins),
+  );
+  headers.set("X-Content-Type-Options", "nosniff");
+  if (
+    request.method === "GET" &&
+    new URL(request.url).searchParams.get("download") === "1"
+  ) {
+    headers.set(
+      "Content-Disposition",
+      `attachment; filename="${safeDownloadName(path)}"`,
+    );
+  }
+  if (!preview.entryPath) return capabilityFileNotFound();
+  return new Response(request.method === "HEAD" ? null : object.body, {
+    status: 200,
+    headers,
+  });
+}
+
+function capabilityFileNotFound(): Response {
+  return errorResponse(
+    404,
+    "NOT_FOUND",
+    "Revision file not found",
+    undefined,
     CREATOR_CAPABILITY_HEADERS,
   );
+}
+
+function safeDownloadName(path: string): string {
+  const name = path.split("/").at(-1) ?? "download";
+  return name.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 120) || "download";
 }
 
 async function rotateCreatorLink(
@@ -1544,7 +1760,7 @@ function validationResponse(issues: ErrorIssue[]): ParsedBody<never> {
   };
 }
 
-function methodNotAllowed(methods: string[]) {
+function methodNotAllowed(methods: string[], headers?: HeadersInit): Response {
   return errorResponse(
     405,
     "VALIDATION_ERROR",
@@ -1552,6 +1768,7 @@ function methodNotAllowed(methods: string[]) {
     undefined,
     {
       Allow: methods.join(", "),
+      ...headers,
     },
   );
 }

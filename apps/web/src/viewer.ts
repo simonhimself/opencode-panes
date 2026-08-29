@@ -3,6 +3,7 @@ import {
   workspaceTokenSchema,
   type Artifact,
   type ArtifactType,
+  type CreatorWorkspaceResponse,
   type Revision,
   type ShareResponse,
 } from "@opencode-panes/contracts";
@@ -13,6 +14,7 @@ const PUBLIC_REVISION_PREFIX = "opencode-panes:public-revision:";
 
 export type ViewerRoute =
   | { kind: "artifact"; artifactId: string }
+  | { kind: "creator"; token: string }
   | { kind: "shared"; token: string }
   | { kind: "home" }
   | { kind: "not-found" };
@@ -43,6 +45,8 @@ export interface PrivateWorkspaceData {
   current: ArtifactResponse;
   revisions: Revision[];
 }
+
+export type CreatorWorkspaceData = CreatorWorkspaceResponse;
 
 export interface RevisionSelection {
   followLatest: boolean;
@@ -115,6 +119,14 @@ export function parseViewerRoute(pathname: string): ViewerRoute {
     const artifactId = decodeSegment(artifactMatch[1]);
     if (artifactIdSchema.safeParse(artifactId).success) {
       return { kind: "artifact", artifactId: artifactId as string };
+    }
+  }
+
+  const creatorMatch = pathname.match(/^\/creator\/([^/]+)\/?$/);
+  if (creatorMatch) {
+    const token = decodeSegment(creatorMatch[1]);
+    if (workspaceTokenSchema.safeParse(token).success) {
+      return { kind: "creator", token: token as string };
     }
   }
 
@@ -366,6 +378,48 @@ export function fetchPublicArtifact(
   );
 }
 
+export function fetchCreatorWorkspace(
+  token: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<CreatorWorkspaceData> {
+  return requestJson<CreatorWorkspaceData>(
+    `/api/creator/${encodeURIComponent(token)}`,
+    signal ? { signal } : {},
+    fetcher,
+  );
+}
+
+export function creatorFileUrl(
+  token: string,
+  version: number,
+  path: string,
+  download = false,
+): string {
+  const encodedPath = path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = `/api/creator/${encodeURIComponent(token)}/revisions/${version}/files/${encodedPath}`;
+  return download ? `${url}?download=1` : url;
+}
+
+export async function fetchCreatorFile(
+  token: string,
+  version: number,
+  path: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+  download = false,
+): Promise<Response> {
+  const response = await fetcher(
+    creatorFileUrl(token, version, path, download),
+    signal ? { signal } : undefined,
+  );
+  if (!response.ok) await throwApiError(response);
+  return response;
+}
+
 export function publishRevision(
   artifactId: string,
   token: string,
@@ -459,25 +513,26 @@ async function requestJson<T>(
   fetcher: Fetcher,
 ): Promise<T> {
   const response = await fetcher(input, init);
-  if (!response.ok) {
-    let message = `Request failed with status ${response.status}`;
-    let code: string | undefined;
-    try {
-      const payload = (await response.json()) as {
-        error?: { code?: unknown; message?: unknown };
-      };
-      if (typeof payload.error?.message === "string") {
-        message = payload.error.message;
-      }
-      if (typeof payload.error?.code === "string") code = payload.error.code;
-    } catch {
-      // Keep the status-based fallback when the response is not JSON.
-    }
-    throw new ApiError(response.status, message, code);
-  }
+  if (!response.ok) await throwApiError(response);
 
   if (response.status === 204) return null as T;
   return (await response.json()) as T;
+}
+
+async function throwApiError(response: Response): Promise<never> {
+  let message = `Request failed with status ${response.status}`;
+  let code: string | undefined;
+  try {
+    const payload = (await response.json()) as {
+      error?: { code?: unknown; message?: unknown };
+    };
+    if (typeof payload.error?.message === "string")
+      message = payload.error.message;
+    if (typeof payload.error?.code === "string") code = payload.error.code;
+  } catch {
+    // Keep the status-based fallback when the response is not JSON.
+  }
+  throw new ApiError(response.status, message, code);
 }
 
 function downloadMimeType(type: ArtifactType): string {

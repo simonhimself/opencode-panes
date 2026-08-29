@@ -64,6 +64,19 @@ describe("first private Sync Worker HTTP seam", () => {
     expect(active.status).toBe(200);
     expect(active.headers.get("Cache-Control")).toBe("no-store");
     expect(active.headers.get("Referrer-Policy")).toBe("no-referrer");
+    const options = await api(`/api/creator/${token}`, {
+      method: "OPTIONS",
+      headers: { Origin: ORIGIN },
+    });
+    expect(options.status).toBe(204);
+    expect(options.headers.get("Cache-Control")).toBe("no-store");
+    expect(options.headers.get("Referrer-Policy")).toBe("no-referrer");
+    const activeMutation = await api(`/api/creator/${token}`, {
+      method: "POST",
+    });
+    expect(activeMutation.status).toBe(405);
+    expect(activeMutation.headers.get("Cache-Control")).toBe("no-store");
+    expect(activeMutation.headers.get("Referrer-Policy")).toBe("no-referrer");
 
     const replay = syncCreateResponseSchema.parse(
       await (
@@ -126,6 +139,12 @@ describe("first private Sync Worker HTTP seam", () => {
     expect(expired.status).toBe(410);
     expect(expired.headers.get("Cache-Control")).toBe("no-store");
     expect(expired.headers.get("Referrer-Policy")).toBe("no-referrer");
+    const expiredFile = await api(
+      `/api/creator/${rotatedBody.creatorToken}/revisions/1/files/index.html`,
+    );
+    expect(expiredFile.status).toBe(410);
+    expect(expiredFile.headers.get("Cache-Control")).toBe("no-store");
+    expect(expiredFile.headers.get("Referrer-Policy")).toBe("no-referrer");
     const unknown = await api("/api/creator/unknown-creator-token");
     expect(unknown.status).toBe(404);
     expect(unknown.headers.get("Cache-Control")).toBe("no-store");
@@ -490,6 +509,255 @@ describe("first private Sync Worker HTTP seam", () => {
       expect(response.status).toBe(200);
       expect(new Uint8Array(await response.arrayBuffer())).toEqual(expected);
     }
+  });
+
+  it("lists committed Creator revisions and mediates nested private files", async () => {
+    const create = await api(
+      "/api/sync/artifacts",
+      jsonRequest({
+        projectId: "project-creator-workspace",
+        artifactId: "artifact-creator-workspace",
+        slug: "creator-workspace",
+        title: "Creator workspace",
+        idempotencyKey: "creator-workspace-1",
+        ownerCredential: "owner-creator-workspace",
+        creatorToken: "creator-creator-workspace",
+      }),
+    );
+    const artifact = syncCreateResponseSchema.parse(await create.json());
+    const v1Bytes = new TextEncoder().encode(
+      '<!doctype html><script src="assets/app.js"></script>',
+    );
+    const v2Bytes = new TextEncoder().encode("version two");
+    const v1File = {
+      kind: "file" as const,
+      path: "index.html",
+      sha256: await sha256(v1Bytes),
+      byteSize: v1Bytes.byteLength,
+      mediaType: "text/html",
+    };
+    const v1Asset = {
+      kind: "file" as const,
+      path: "assets/app.js",
+      sha256: await sha256(new TextEncoder().encode("console.log('v1')")),
+      byteSize: 17,
+      mediaType: "application/javascript",
+    };
+    const first = cloudManifestSchema.parse({
+      schemaVersion: 1,
+      projectId: artifact.cloudProjectId,
+      artifactId: artifact.cloudArtifactId,
+      slug: "creator-workspace",
+      title: "Creator workspace",
+      revisions: [
+        {
+          id: "local-v1",
+          version: 1,
+          preview: { adapter: "browser", entryPath: "index.html" },
+          approvedOrigins: [],
+          files: [v1File, v1Asset],
+          createdAt: "2026-08-29T12:00:00.000Z",
+        },
+      ],
+    });
+    await uploadFile(
+      artifact.cloudArtifactId,
+      1,
+      "index.html",
+      v1Bytes,
+      "text/html",
+      "owner-creator-workspace",
+    );
+    await uploadFile(
+      artifact.cloudArtifactId,
+      1,
+      "assets/app.js",
+      new TextEncoder().encode("console.log('v1')"),
+      "application/javascript",
+      "owner-creator-workspace",
+    );
+    expect(
+      (
+        await api(
+          `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/commit`,
+          jsonRequest({ manifest: first }, "owner-creator-workspace"),
+        )
+      ).status,
+    ).toBe(201);
+
+    const second = cloudManifestSchema.parse({
+      ...first,
+      revisions: [
+        ...first.revisions,
+        {
+          id: "local-v2",
+          version: 2,
+          preview: {
+            adapter: "renderer",
+            renderer: "markdown",
+            entryPath: "README.md",
+          },
+          approvedOrigins: ["https://api.example"],
+          files: [
+            {
+              kind: "file" as const,
+              path: "README.md",
+              sha256: await sha256(v2Bytes),
+              byteSize: v2Bytes.byteLength,
+              mediaType: "text/markdown",
+            },
+          ],
+          createdAt: "2026-08-29T12:01:00.000Z",
+        },
+      ],
+    });
+    await uploadFile(
+      artifact.cloudArtifactId,
+      2,
+      "README.md",
+      v2Bytes,
+      "text/markdown",
+      "owner-creator-workspace",
+    );
+    expect(
+      (
+        await api(
+          `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/2/commit`,
+          jsonRequest({ manifest: second }, "owner-creator-workspace"),
+        )
+      ).status,
+    ).toBe(201);
+
+    const workspace = await api("/api/creator/creator-creator-workspace");
+    expect(workspace.status).toBe(200);
+    expect(workspace.headers.get("Cache-Control")).toBe("no-store");
+    expect(workspace.headers.get("Referrer-Policy")).toBe("no-referrer");
+    const body = (await workspace.json()) as {
+      revisions: Array<{ version: number; files: Array<{ path: string }> }>;
+    };
+    expect(body.revisions.map(({ version }) => version)).toEqual([2, 1]);
+    expect(JSON.stringify(body)).not.toContain("private/");
+    expect(body.revisions[1]?.files.map(({ path }) => path)).toContain(
+      "assets/app.js",
+    );
+    expect(JSON.stringify(body)).not.toContain("creator-creator-workspace");
+
+    const nested = await api(
+      "/api/creator/creator-creator-workspace/revisions/1/files/assets/app.js",
+    );
+    expect(nested.status).toBe(200);
+    expect(nested.headers.get("Content-Type")).toBe(
+      "application/javascript; charset=utf-8",
+    );
+    expect(nested.headers.get("Content-Security-Policy")).toContain(
+      "connect-src 'none'",
+    );
+    expect(nested.headers.get("Cache-Control")).toBe("no-store");
+    expect(nested.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(new TextDecoder().decode(await nested.arrayBuffer())).toContain(
+      "console.log",
+    );
+
+    await env.DB.prepare(
+      `UPDATE revision_files SET sha256 = ?
+         WHERE revision_id = (
+           SELECT id FROM local_revisions WHERE artifact_id = ? AND version = ?
+         ) AND path = ?`,
+    )
+      .bind("a".repeat(64), artifact.cloudArtifactId, 1, "assets/app.js")
+      .run();
+    const d1HashMismatch = await api(
+      "/api/creator/creator-creator-workspace/revisions/1/files/assets/app.js",
+    );
+    expect(d1HashMismatch.status).toBe(404);
+    await env.DB.prepare(
+      `UPDATE revision_files SET sha256 = ?
+         WHERE revision_id = (
+           SELECT id FROM local_revisions WHERE artifact_id = ? AND version = ?
+         ) AND path = ?`,
+    )
+      .bind(v1Asset.sha256, artifact.cloudArtifactId, 1, "assets/app.js")
+      .run();
+
+    const assetRow = await env.DB.prepare(
+      `SELECT f.object_key FROM revision_files f
+         JOIN local_revisions r ON r.id = f.revision_id
+        WHERE r.artifact_id = ? AND r.version = ? AND f.path = ?`,
+    )
+      .bind(artifact.cloudArtifactId, 1, "assets/app.js")
+      .first<{ object_key: string }>();
+    if (!assetRow) throw new Error("test asset row is missing");
+    await env.PRIVATE_ARTIFACTS.put(
+      assetRow.object_key,
+      new TextEncoder().encode("console.log('v1')"),
+      {
+        httpMetadata: { contentType: "application/javascript" },
+        customMetadata: {
+          byteSize: "17",
+          sha256: "b".repeat(64),
+        },
+      },
+    );
+    const r2HashMismatch = await api(
+      "/api/creator/creator-creator-workspace/revisions/1/files/assets/app.js",
+    );
+    expect(r2HashMismatch.status).toBe(404);
+    expect(r2HashMismatch.headers.get("Cache-Control")).toBe("no-store");
+    expect(r2HashMismatch.headers.get("Referrer-Policy")).toBe("no-referrer");
+
+    for (const path of [
+      "../index.html",
+      "%2e%2e%2findex.html",
+      "../../../../private/other",
+    ]) {
+      expect(
+        (
+          await api(
+            `/api/creator/creator-creator-workspace/revisions/1/files/${path}`,
+          )
+        ).status,
+      ).toBe(404);
+    }
+    expect(
+      (
+        await api(
+          "/api/creator/creator-creator-workspace/revisions/2/files/assets/app.js",
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await api(
+          "/api/creator/creator-creator-workspace/revisions/1/files/index.html",
+          { method: "POST" },
+        )
+      ).status,
+    ).toBe(405);
+    const malformedCreatorRoute = await api(
+      "/api/creator/creator-creator-workspace/revisions/not-a-version/files/index.html",
+    );
+    expect(malformedCreatorRoute.status).toBe(404);
+    expect(malformedCreatorRoute.headers.get("Cache-Control")).toBe("no-store");
+    expect(malformedCreatorRoute.headers.get("Referrer-Policy")).toBe(
+      "no-referrer",
+    );
+    const methodNotAllowedFile = await api(
+      "/api/creator/creator-creator-workspace/revisions/1/files/index.html",
+      { method: "POST" },
+    );
+    expect(methodNotAllowedFile.status).toBe(405);
+    expect(methodNotAllowedFile.headers.get("Cache-Control")).toBe("no-store");
+    expect(methodNotAllowedFile.headers.get("Referrer-Policy")).toBe(
+      "no-referrer",
+    );
+    expect(
+      (
+        await api(
+          `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/files/index.html`,
+          { headers: { Authorization: "Bearer creator-creator-workspace" } },
+        )
+      ).status,
+    ).toBe(403);
   });
 
   it("creates one idempotent cloud Artifact and commits exact files privately", async () => {

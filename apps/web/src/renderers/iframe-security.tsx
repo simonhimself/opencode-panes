@@ -1,5 +1,6 @@
 import { useEffect, useEffectEvent, useRef } from "react";
 import { createArtifactEgressGuardScript } from "@opencode-panes/renderers/iframe-security";
+import { createArtifactNetworkPolicy } from "@opencode-panes/renderers/preview-security";
 
 export const EXECUTABLE_IFRAME_SANDBOX = "allow-scripts";
 export const RENDERER_MESSAGE_CHANNEL = "opencode-panes-renderer";
@@ -10,7 +11,6 @@ export const RENDERER_ERROR_WINDOW_MS = 10_000;
 
 const SHARED_CSP_DIRECTIVES = [
   "default-src 'none'",
-  "connect-src 'none'",
   "frame-src 'none'",
   "child-src 'none'",
   "worker-src 'none'",
@@ -39,13 +39,27 @@ export interface SandboxedArtifactFrameProps {
   title: string;
 }
 
-export function createArtifactCsp(allowScripts: boolean): string {
+export function createArtifactCsp(
+  allowScripts: boolean,
+  approvedOrigins: readonly string[] = [],
+): string {
+  const policy = createArtifactNetworkPolicy(approvedOrigins);
+  const scriptOrigins = policy.scriptSrc.join(" ");
+  const styleOrigins = policy.styleSrc.join(" ");
+  const imageOrigins = policy.imageSrc.join(" ");
+  const fontOrigins = policy.fontSrc.join(" ");
+  const connectOrigins = policy.connectSrc.length
+    ? policy.connectSrc.join(" ")
+    : "'none'";
   return [
     ...SHARED_CSP_DIRECTIVES,
-    allowScripts ? "script-src 'unsafe-inline'" : "script-src 'none'",
-    "style-src 'unsafe-inline'",
-    allowScripts ? "img-src data: blob:" : "img-src 'none'",
-    "font-src data:",
+    allowScripts
+      ? `script-src 'unsafe-inline' ${scriptOrigins}`
+      : "script-src 'none'",
+    `style-src 'unsafe-inline' ${styleOrigins}`,
+    allowScripts ? `img-src data: blob: ${imageOrigins}` : "img-src 'none'",
+    `font-src data: ${fontOrigins}`,
+    `connect-src ${connectOrigins}`,
   ].join("; ");
 }
 
@@ -123,9 +137,15 @@ export function createErrorBridgeScript(nonce: string): string {
 
 export function createIsolatedDocument(
   body: string,
-  options: { allowScripts: boolean; head?: string },
+  options: {
+    allowScripts: boolean;
+    approvedOrigins?: readonly string[];
+    head?: string;
+  },
 ): string {
-  const csp = escapeHtmlAttribute(createArtifactCsp(options.allowScripts));
+  const csp = escapeHtmlAttribute(
+    createArtifactCsp(options.allowScripts, options.approvedOrigins),
+  );
   const guard = options.allowScripts
     ? `<script>${escapeInlineScript(createArtifactEgressGuardScript())}</script>`
     : "";

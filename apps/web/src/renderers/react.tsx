@@ -18,21 +18,27 @@ interface Preview {
 }
 
 export interface ReactArtifactRendererProps {
+  approvedOrigins?: readonly string[];
   onError?: ((error: string) => void) | undefined;
   source: string;
 }
 
-export function createReactSrcDoc(code: string, nonce: string): string {
+export function createReactSrcDoc(
+  code: string,
+  nonce: string,
+  approvedOrigins: readonly string[] = [],
+): string {
   const bridge = escapeInlineScript(createErrorBridgeScript(nonce));
   const runtime = escapeInlineScript(reactRuntimeSource);
   const compiled = escapeInlineScript(code);
   return createIsolatedDocument(
     `<div id="root"></div><script>${bridge}</script><script>${runtime}</script><script>${compiled}</script><script>globalThis.__PANES_MOUNT__(globalThis.__PANES_COMPONENT__);</script>`,
-    { allowScripts: true },
+    { allowScripts: true, approvedOrigins },
   );
 }
 
 export function ReactArtifactRenderer({
+  approvedOrigins = [],
   onError,
   source,
 }: ReactArtifactRendererProps) {
@@ -48,7 +54,10 @@ export function ReactArtifactRenderer({
     void task.promise.then(
       (code) => {
         const nonce = createMessageNonce();
-        setPreview({ nonce, srcDoc: createReactSrcDoc(code, nonce) });
+        setPreview({
+          nonce,
+          srcDoc: createReactSrcDoc(code, nonce, approvedOrigins),
+        });
         setStatus("Starting React artifact...");
       },
       (error: unknown) => {
@@ -60,7 +69,7 @@ export function ReactArtifactRenderer({
     );
 
     return () => task.stop();
-  }, [source]);
+  }, [approvedOrigins, source]);
 
   useEffect(() => {
     if (!preview || status !== "Starting React artifact...") return;

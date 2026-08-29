@@ -449,6 +449,18 @@ export const syncCreatorRotateResponseSchema = z.strictObject({
   creatorExpiresAt: timestampSchema,
 });
 
+export const creatorWorkspaceRevisionSchema = finalizedRevisionSchema;
+
+export const creatorWorkspaceResponseSchema = z.strictObject({
+  cloudArtifactId: identifierSchema,
+  cloudProjectId: identifierSchema,
+  slug: artifactSlugSchema,
+  title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
+  kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).optional(),
+  creatorExpiresAt: timestampSchema,
+  revisions: z.array(creatorWorkspaceRevisionSchema),
+});
+
 export type ArtifactManifest = z.infer<typeof artifactManifestSchema>;
 export type CloudArtifactMapping = z.infer<typeof cloudArtifactMappingSchema>;
 export type CloudManifest = z.infer<typeof cloudManifestSchema>;
@@ -473,6 +485,12 @@ export type SyncRevisionCommitResponse = z.infer<
 >;
 export type SyncCreatorRotateResponse = z.infer<
   typeof syncCreatorRotateResponseSchema
+>;
+export type CreatorWorkspaceRevision = z.infer<
+  typeof creatorWorkspaceRevisionSchema
+>;
+export type CreatorWorkspaceResponse = z.infer<
+  typeof creatorWorkspaceResponseSchema
 >;
 
 export const deriveCloudManifest = (

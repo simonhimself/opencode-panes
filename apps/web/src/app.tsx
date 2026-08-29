@@ -9,6 +9,7 @@ import {
 } from "react";
 import { ArtifactRenderer } from "./renderers";
 import { SourceCode } from "./renderers/source-code";
+import { CreatorWorkspace } from "./creator-workspace";
 import {
   ApiError,
   clearStoredPublicUrl,
@@ -18,6 +19,7 @@ import {
   fetchPrivateCurrent,
   fetchPrivateRevisions,
   fetchPrivateWorkspace,
+  fetchCreatorWorkspace,
   fetchPublicArtifact,
   followCurrentRevision,
   getStoredPublicUrl,
@@ -66,6 +68,8 @@ export function App({ route, workspaceAccess }: AppProps) {
       />
     );
   }
+  if (route.kind === "creator")
+    return <CreatorArtifactView token={route.token} />;
   if (route.kind === "shared")
     return <PublicArtifactView token={route.token} />;
   if (route.kind === "not-found") {
@@ -85,6 +89,61 @@ export function App({ route, workspaceAccess }: AppProps) {
       <code>/artifacts/:id</code>; public links use <code>/shared/:token</code>.
     </EntryState>
   );
+}
+
+function CreatorArtifactView({ token }: { token: string }) {
+  const [workspace, setWorkspace] =
+    useState<Awaited<ReturnType<typeof fetchCreatorWorkspace>>>();
+  const [error, setError] = useState<unknown>();
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchCreatorWorkspace(token, fetch, controller.signal).then(
+      (loaded) => {
+        setWorkspace(loaded);
+        setError(undefined);
+      },
+      (caught: unknown) => {
+        if (!controller.signal.aborted) {
+          setWorkspace(undefined);
+          setError(caught);
+        }
+      },
+    );
+    return () => controller.abort();
+  }, [token]);
+
+  if (error) {
+    const status = error instanceof ApiError ? error.status : 0;
+    const expired = status === 410;
+    const missing = status === 404;
+    return (
+      <EntryState
+        eyebrow={
+          expired
+            ? "Creator link expired"
+            : missing
+              ? "Creator link not found"
+              : "Creator workspace unavailable"
+        }
+        title={
+          expired
+            ? "This creator workspace has expired."
+            : missing
+              ? "This creator workspace does not exist."
+              : "The creator workspace could not be loaded."
+        }
+      >
+        {expired
+          ? "Reopen the artifact through OpenCode or the Cloud inventory to request a fresh Creator link."
+          : missing
+            ? "Check the Creator link and open it again."
+            : `${apiErrorMessage(error)} Reload the page or try again later.`}
+      </EntryState>
+    );
+  }
+  if (!workspace) return <LoadingState label="Loading creator workspace" />;
+  return <CreatorWorkspace token={token} workspace={workspace} />;
 }
 
 function PrivateArtifactView({

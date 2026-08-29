@@ -58,3 +58,24 @@ export function isAllowedArtifactNetworkRequest(value, origins) {
     return false;
   }
 }
+
+export function createPreviewCsp(origin, origins) {
+  const policy = createArtifactNetworkPolicy(origins);
+  const scriptSrc = [origin, ...policy.scriptSrc].join(" ");
+  const styleSrc = [origin, ...policy.styleSrc].join(" ");
+  const imageSrc = [origin, ...policy.imageSrc, "data:", "blob:"].join(" ");
+  const fontSrc = [origin, ...policy.fontSrc, "data:"].join(" ");
+  const mediaSrc = [origin, ...policy.mediaSrc].join(" ");
+  const connectSrc = policy.connectSrc.length
+    ? policy.connectSrc.join(" ")
+    : "'none'";
+  return `sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' ${scriptSrc}; style-src 'unsafe-inline' ${styleSrc}; img-src ${imageSrc}; font-src ${fontSrc}; connect-src ${connectSrc}; frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; base-uri ${origin}; form-action 'none'; manifest-src 'none'; media-src ${mediaSrc}; navigate-to 'none'`;
+}
+
+export function normalizePreviewContentType(mediaType) {
+  return /^(?:text\/|application\/(?:javascript|json|typescript|xml)|image\/svg\+xml)/u.test(
+    mediaType,
+  )
+    ? `${mediaType}; charset=utf-8`
+    : mediaType;
+}

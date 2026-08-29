@@ -84,6 +84,168 @@ select,
   background: #171817;
 }
 
+.creator-workspace-shell {
+  display: grid;
+  min-height: 100vh;
+  grid-template-rows: auto minmax(460px, 1fr);
+  background: #171817;
+}
+
+.creator-expiry {
+  margin-left: auto;
+  color: #8f928b;
+  font-size: 11px;
+}
+
+.creator-stage {
+  min-height: 0;
+  padding: 12px;
+  background: #20221f;
+}
+
+.creator-preview-frame,
+.creator-renderer-canvas {
+  min-height: calc(100vh - 150px);
+  overflow: hidden;
+  border: 1px solid #4c4e49;
+  background: #f1f0ea;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 24%);
+}
+
+.creator-preview-frame iframe {
+  display: block;
+  width: 100%;
+  min-height: calc(100vh - 150px);
+  border: 0;
+}
+
+.creator-renderer-canvas > [data-renderer],
+.creator-renderer-canvas > [data-renderer] > iframe,
+.creator-renderer-canvas > [data-renderer] > section {
+  width: 100%;
+  min-height: calc(100vh - 150px);
+  border: 0;
+}
+
+.creator-files-layout {
+  display: grid;
+  min-height: calc(100vh - 150px);
+  grid-template-columns: minmax(210px, 0.3fr) minmax(0, 1fr);
+  border: 1px solid #4c4e49;
+  background: #1c1e1c;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 24%);
+}
+
+.creator-file-tree {
+  min-width: 0;
+  padding: 18px 0;
+  border-right: 1px solid #3e403d;
+}
+
+.creator-file-tree > .eyebrow {
+  display: block;
+  padding: 0 16px 12px;
+}
+
+.creator-file-tree ul {
+  display: grid;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.creator-file-tree li {
+  min-width: 0;
+}
+
+.creator-file-tree button,
+.creator-directory {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  overflow: hidden;
+  padding: 7px 16px;
+  border: 0;
+  border-radius: 0;
+  color: #b8bbb3;
+  background: transparent;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.creator-file-tree button:hover:not(:disabled),
+.creator-file-tree button.is-selected {
+  color: #fff4e9;
+  background: #3c2b20;
+}
+
+.creator-directory {
+  color: #777a74;
+}
+
+.creator-file-detail {
+  min-width: 0;
+  overflow: auto;
+  background: #111311;
+}
+
+.creator-file-card {
+  min-height: 100%;
+  color: #e9e7df;
+}
+
+.creator-file-card > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 22px;
+  border-bottom: 1px solid #343633;
+  background: #1c1e1c;
+}
+
+.creator-file-card h2 {
+  margin: 5px 0 0;
+  color: #f4f2eb;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.file-size {
+  color: #9a9d96;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+}
+
+.creator-file-card .source-code {
+  min-height: calc(100vh - 220px);
+}
+
+.binary-file,
+.creator-loading,
+.creator-empty-file,
+.creator-file-error {
+  padding: 28px 22px;
+  color: #b6b8b1;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.binary-file a {
+  display: inline-block;
+  margin-top: 8px;
+  color: #ffc293;
+}
+
+.creator-file-error {
+  color: #ffcab9;
+}
+
 .workspace-header {
   position: relative;
   z-index: 2;
@@ -493,6 +655,26 @@ select,
   .renderer-error {
     grid-template-columns: 1fr;
   }
+
+  .creator-expiry {
+    width: 100%;
+    margin-left: 0;
+    order: 4;
+  }
+
+  .creator-files-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .creator-file-tree {
+    border-right: 0;
+    border-bottom: 1px solid #3e403d;
+  }
+
+  .creator-file-tree ul {
+    max-height: 190px;
+    overflow: auto;
+  }
 }
 
 @media (max-width: 560px) {
@@ -547,6 +729,23 @@ select,
 
   .artifact-canvas > [data-renderer="markdown"] {
     width: calc(100% - 32px);
+  }
+
+  .creator-stage {
+    padding: 7px;
+  }
+
+  .creator-files-layout,
+  .creator-preview-frame,
+  .creator-renderer-canvas {
+    min-height: calc(100vh - 210px);
+  }
+
+  .creator-preview-frame iframe,
+  .creator-renderer-canvas > [data-renderer],
+  .creator-renderer-canvas > [data-renderer] > iframe,
+  .creator-renderer-canvas > [data-renderer] > section {
+    min-height: calc(100vh - 210px);
   }
 }
 

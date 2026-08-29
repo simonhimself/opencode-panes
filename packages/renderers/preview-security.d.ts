@@ -18,3 +18,8 @@ export declare function isAllowedArtifactNetworkRequest(
   value: string,
   origins: readonly string[],
 ): boolean;
+export declare function createPreviewCsp(
+  origin: string,
+  origins: readonly string[],
+): string;
+export declare function normalizePreviewContentType(mediaType: string): string;

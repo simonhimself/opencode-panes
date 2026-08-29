@@ -9,24 +9,31 @@ import {
 } from "./iframe-security";
 
 export interface HtmlArtifactRendererProps {
+  approvedOrigins?: readonly string[];
   onError?: ((error: string) => void) | undefined;
   source: string;
 }
 
-export function createHtmlSrcDoc(source: string, nonce: string): string {
+export function createHtmlSrcDoc(
+  source: string,
+  nonce: string,
+  approvedOrigins: readonly string[] = [],
+): string {
   const bridge = escapeInlineScript(createErrorBridgeScript(nonce));
   return createIsolatedDocument(`<script>${bridge}</script>${source}`, {
     allowScripts: true,
+    approvedOrigins,
   });
 }
 
 export function HtmlArtifactRenderer({
+  approvedOrigins = [],
   onError,
   source,
 }: HtmlArtifactRendererProps) {
   const [nonce] = useState(createMessageNonce);
   const [error, setError] = useState<string>();
-  const srcDoc = createHtmlSrcDoc(source, nonce);
+  const srcDoc = createHtmlSrcDoc(source, nonce, approvedOrigins);
   const handleMessage = (message: RendererMessage) => {
     if (message.type === "error") {
       const detail = message.stack
