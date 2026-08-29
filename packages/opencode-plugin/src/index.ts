@@ -14,6 +14,7 @@ import {
   open,
   readFile,
   readdir,
+  realpath,
   rename,
   rm,
   unlink,
@@ -34,6 +35,7 @@ import {
   type ReactBrowserRuntime,
 } from "@opencode-panes/renderers/react-browser-runtime";
 import { createArtifactEgressGuardScript } from "@opencode-panes/renderers/iframe-security";
+import { createArtifactNetworkPolicy } from "@opencode-panes/renderers/preview-security";
 import {
   MAX_ARTIFACT_SOURCE_BYTES,
   MAX_ARTIFACT_KIND_LENGTH,
@@ -114,6 +116,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
   const options = resolveOptions(pluginOptions);
   const previewServer = new LocalPreviewServer();
   const locks = new Map<string, Promise<void>>();
+  const originApprovals = new Map<string, OriginApproval>();
   const importReceipts = new Map<string, ImportReceipt>();
 
   return {
@@ -394,9 +397,33 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             .enum(["react", "markdown", "mermaid", "code"])
             .optional()
             .describe("Panes renderer when adapter is renderer."),
+          requestedOrigins: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe("Normalized origins declared by the Draft."),
+          approvedOrigins: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe("Exact origins approved for a nonce-confirmed Finalize."),
+          approvalNonce: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(512)
+            .optional()
+            .describe(
+              "One-time nonce returned when origin approval is required.",
+            ),
         },
         async execute(args, context) {
-          return finalizeArtifact(args, context, previewServer, locks, options);
+          return finalizeArtifact(
+            args,
+            context,
+            previewServer,
+            locks,
+            originApprovals,
+            options,
+          );
         },
       }),
     },
@@ -1723,6 +1750,9 @@ type FinalizeArguments = {
   entryPath: string;
   adapter: "browser" | "renderer";
   renderer?: "react" | "markdown" | "mermaid" | "code" | undefined;
+  requestedOrigins?: string[] | undefined;
+  approvedOrigins?: string[] | undefined;
+  approvalNonce?: string | undefined;
 };
 
 interface FinalizeResult {
@@ -1735,6 +1765,25 @@ interface FinalizeResult {
   manifestPath: string;
   preview: PreviewEntry;
   previewUrl: string;
+}
+
+interface OriginApprovalResult {
+  operation: "approval-required";
+  projectId: string;
+  artifactId: string;
+  title: string;
+  preview: PreviewEntry;
+  requestedOrigins: string[];
+  approvalNonce: string;
+}
+
+interface OriginApproval {
+  schemaVersion: 1;
+  artifactId: string;
+  approvalNonce: string;
+  draftFingerprint: string;
+  requestedOrigins: string[];
+  preview: PreviewEntry;
 }
 
 interface FinalizationJournal {
@@ -1753,6 +1802,7 @@ async function finalizeArtifact(
   context: ToolContext,
   previewServer: LocalPreviewServer,
   locks: Map<string, Promise<void>>,
+  originApprovals: Map<string, OriginApproval>,
   options: ResolvedOptions,
 ) {
   const request = validateFinalizeArguments(args);
@@ -1775,7 +1825,13 @@ async function finalizeArtifact(
     const draftPath = join(artifact.artifactDirectory, "draft");
     const draftMetadataPath = join(artifact.artifactDirectory, "draft.json");
     if (!(await pathExists(draftPath))) {
+      if (request.approvalNonce && !recoveredRevision) {
+        throw new Error(
+          "The origin approval nonce is unknown or already consumed.",
+        );
+      }
       if (recoveredRevision) {
+        if (request.approvalNonce) originApprovals.delete(request.artifactId);
         await verifyRevisionFiles(
           join(artifact.artifactDirectory, `v${recoveredRevision.version}`),
           recoveredRevision.files,
@@ -1790,6 +1846,7 @@ async function finalizeArtifact(
           ),
           files: recoveredRevision.files,
           preview: recoveredRevision.preview,
+          approvedOrigins: recoveredRevision.approvedOrigins,
           reactRuntime: await reactRuntimeFor(recoveredRevision.preview),
           manifest: artifact.manifest,
         });
@@ -1829,13 +1886,13 @@ async function finalizeArtifact(
         "Draft is based on an older Revision. Prepare a new Draft before finalizing.",
       );
     }
-    if (draft.requestedOrigins.length > 0) {
-      throw new Error(
-        "This Draft requests external origins. Origin approval is not available during local finalization.",
-      );
-    }
+    const requestedOrigins = resolveFinalizeOrigins(
+      request,
+      draft.requestedOrigins,
+    );
 
     const files = await scanRevisionFiles(draftPath);
+    const draftFingerprint = fingerprintDraft(files);
     const entryFile = files.find(
       (file) => file.kind === "file" && file.path === request.preview.entryPath,
     );
@@ -1846,6 +1903,63 @@ async function finalizeArtifact(
     }
     validatePreviewFile(request.preview, entryFile);
 
+    const approval = originApprovals.get(request.artifactId);
+    if (requestedOrigins.length > 0) {
+      if (!request.approvalNonce) {
+        const validationToken = await previewServer.register({
+          artifactId: request.artifactId,
+          artifactDirectory: artifact.artifactDirectory,
+          version: (latestRevision?.version ?? 0) + 1,
+          root: draftPath,
+          files,
+          preview: request.preview,
+          approvedOrigins: [],
+          reactRuntime: await reactRuntimeFor(request.preview),
+        });
+        try {
+          await previewServer.probe(validationToken, request.preview.entryPath);
+        } finally {
+          previewServer.remove(validationToken);
+        }
+        const approvalNonce = randomUUID();
+        originApprovals.set(request.artifactId, {
+          schemaVersion: 1,
+          artifactId: request.artifactId,
+          approvalNonce,
+          draftFingerprint,
+          requestedOrigins,
+          preview: request.preview,
+        });
+        const result: OriginApprovalResult = {
+          operation: "approval-required",
+          projectId: artifact.manifest.projectId,
+          artifactId: artifact.manifest.artifactId,
+          title: artifact.manifest.title,
+          preview: request.preview,
+          requestedOrigins,
+          approvalNonce,
+        };
+        return originApprovalToolResult(result);
+      }
+      if (
+        !approval ||
+        approval.approvalNonce !== request.approvalNonce ||
+        approval.artifactId !== request.artifactId ||
+        approval.draftFingerprint !== draftFingerprint ||
+        !sameOriginSet(approval.requestedOrigins, requestedOrigins) ||
+        JSON.stringify(approval.preview) !== JSON.stringify(request.preview)
+      ) {
+        originApprovals.delete(request.artifactId);
+        throw new Error(
+          "The origin approval nonce is invalid because the Draft, Preview, or origin set changed.",
+        );
+      }
+    } else if (request.approvalNonce) {
+      throw new Error(
+        "An origin approval nonce requires the same non-empty approved origin set.",
+      );
+    }
+
     const targetVersion = (latestRevision?.version ?? 0) + 1;
     const revisionPath = join(artifact.artifactDirectory, `v${targetVersion}`);
     if (await pathExists(revisionPath)) {
@@ -1855,7 +1969,7 @@ async function finalizeArtifact(
       id: `revision-${randomUUID()}`,
       version: targetVersion,
       preview: request.preview,
-      approvedOrigins: [],
+      approvedOrigins: requestedOrigins,
       files,
       createdAt: new Date().toISOString(),
     };
@@ -1886,6 +2000,7 @@ async function finalizeArtifact(
       root: draftPath,
       files,
       preview: request.preview,
+      approvedOrigins: requestedOrigins,
       reactRuntime: await reactRuntimeFor(request.preview),
     });
     try {
@@ -1906,6 +2021,7 @@ async function finalizeArtifact(
       injectFailure(options, "before-cleanup");
       await unlink(journalPath);
       await removeDraftMetadata(artifact.artifactDirectory);
+      originApprovals.delete(request.artifactId);
       previewServer.updateRoot(previewToken, revisionPath, nextManifest);
       return finalizeToolResult({
         operation: "finalized",
@@ -1948,7 +2064,83 @@ function validateFinalizeArguments(args: FinalizeArguments) {
         : "A browser adapter cannot specify a renderer",
     );
   }
-  return { artifactId: artifactId.data, preview: preview.data };
+  const requestedOrigins = parseFinalizeOrigins(args.requestedOrigins);
+  const approvedOrigins = parseFinalizeOrigins(args.approvedOrigins);
+  if (
+    args.requestedOrigins !== undefined &&
+    args.approvedOrigins !== undefined
+  ) {
+    throw validationError(
+      "Finalize accepts requestedOrigins before approval or approvedOrigins with an approval nonce, not both",
+    );
+  }
+  if (args.approvedOrigins !== undefined && !args.approvalNonce) {
+    throw validationError("Approved origins require an approval nonce");
+  }
+  return {
+    artifactId: artifactId.data,
+    preview: preview.data,
+    requestedOrigins,
+    approvedOrigins,
+    approvalNonce: args.approvalNonce,
+  };
+}
+
+function parseFinalizeOrigins(origins: string[] | undefined) {
+  if (origins === undefined) return undefined;
+  const parsed = requestedOriginsSchema.safeParse(origins);
+  if (!parsed.success)
+    throw validationError("Finalize origins must be unique HTTP(S) origins");
+  return parsed.data;
+}
+
+function resolveFinalizeOrigins(
+  request: ReturnType<typeof validateFinalizeArguments>,
+  draftOrigins: string[],
+) {
+  const declaredOrigins =
+    request.requestedOrigins ?? request.approvedOrigins ?? draftOrigins;
+  if (!sameOriginSet(declaredOrigins, draftOrigins)) {
+    throw new Error(
+      "Finalize origin declarations must exactly match the Draft requested origins.",
+    );
+  }
+  return declaredOrigins;
+}
+
+function sameOriginSet(left: readonly string[], right: readonly string[]) {
+  return (
+    left.length === right.length &&
+    [...left]
+      .sort()
+      .every((origin, index) => origin === [...right].sort()[index])
+  );
+}
+
+function fingerprintDraft(files: readonly ArtifactFile[]) {
+  return sha256(
+    JSON.stringify(
+      files.map((file) =>
+        file.kind === "file"
+          ? {
+              kind: file.kind,
+              path: file.path,
+              sha256: file.sha256,
+              byteSize: file.byteSize,
+            }
+          : { kind: file.kind, path: file.path },
+      ),
+    ),
+  );
+}
+
+function originApprovalToolResult(result: OriginApprovalResult) {
+  const metadata = { ...result };
+  return {
+    title: `Approval required for ${result.title} v1 preview`,
+    output: JSON.stringify(metadata),
+    metadata,
+  };
 }
 
 function validatePreviewFile(
@@ -2152,6 +2344,7 @@ async function reopenExistingArtifact(
     root: revisionPath,
     files: revision.files,
     preview: revision.preview,
+    approvedOrigins: revision.approvedOrigins,
     reactRuntime: await reactRuntimeFor(revision.preview),
     manifest: artifact.manifest,
   });
@@ -2574,12 +2767,12 @@ async function readFinalizationJournal(
   };
 }
 
-async function writeJsonDurable(path: string, value: unknown) {
+async function writeJsonDurable(path: string, value: unknown, mode = 0o644) {
   const temporary = join(
     dirname(path),
     `.${basename(path)}.${randomUUID()}.tmp`,
   );
-  const handle = await open(temporary, "wx", 0o644);
+  const handle = await open(temporary, "wx", mode);
   try {
     await handle.writeFile(`${JSON.stringify(value)}\n`, { encoding: "utf8" });
     await handle.sync();
@@ -2809,6 +3002,7 @@ interface PreviewRoute {
   root: string;
   files: ArtifactFile[];
   preview: PreviewEntry;
+  approvedOrigins: string[];
   reactRuntime?: ReactBrowserRuntime | undefined;
   manifest?: ArtifactManifest | undefined;
 }
@@ -2975,9 +3169,13 @@ class LocalPreviewServer {
           route.preview.adapter === "browser"
             ? createBrowserFrame(
                 (
-                  await readFile(join(route.root, route.preview.entryPath))
+                  await readLockedPreviewFile(
+                    route.root,
+                    route.preview.entryPath,
+                  )
                 ).toString("utf8"),
                 this.baseUrl(token),
+                route.approvedOrigins,
               )
             : await rendererWrapper(
                 route.preview.renderer,
@@ -2985,12 +3183,13 @@ class LocalPreviewServer {
                 route.preview.entryPath,
                 route.reactRuntime,
                 this.baseUrl(token),
+                route.approvedOrigins,
               );
         this.sendHtml(
           response,
           request.method,
           body,
-          createFrameCsp(this.origin()),
+          createFrameCsp(this.origin(), route.approvedOrigins),
         );
       } catch {
         response.writeHead(409, {
@@ -3011,7 +3210,7 @@ class LocalPreviewServer {
     }
     let body: Buffer;
     try {
-      body = await readFile(join(route.root, relativePath));
+      body = await readLockedPreviewFile(route.root, relativePath);
     } catch {
       response.writeHead(409, {
         "content-type": "text/plain; charset=utf-8",
@@ -3029,7 +3228,10 @@ class LocalPreviewServer {
     response.writeHead(200, {
       "access-control-allow-origin": "*",
       "cache-control": "no-store",
-      "content-security-policy": createFrameCsp(this.origin()),
+      "content-security-policy": createFrameCsp(
+        this.origin(),
+        route.approvedOrigins,
+      ),
       "content-type": contentTypeHeader,
       "content-length": body.byteLength,
       "referrer-policy": "no-referrer",
@@ -3080,26 +3282,48 @@ function renderPreviewShell(frameUrl: string, preview: PreviewEntry) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(label)}</title><style>html,body{height:100%;margin:0}iframe{display:block;border:0;width:100%;height:100%}</style></head><body><iframe sandbox="allow-scripts" referrerpolicy="no-referrer" src="${escapeHtmlAttribute(frameUrl)}" title="${escapeHtmlAttribute(label)}"></iframe></body></html>`;
 }
 
-function createBrowserFrame(source: string, baseUrl: string) {
+function createBrowserFrame(
+  source: string,
+  baseUrl: string,
+  approvedOrigins: readonly string[],
+) {
   return createArtifactFrameDocument(
     source,
     baseUrl,
     "<title>Panes browser artifact</title>",
+    approvedOrigins,
   );
 }
 
-function createArtifactFrameDocument(body: string, baseUrl: string, head = "") {
+function createArtifactFrameDocument(
+  body: string,
+  baseUrl: string,
+  head = "",
+  approvedOrigins: readonly string[] = [],
+) {
   const origin = new URL(baseUrl).origin;
-  const csp = createFrameCsp(origin);
-  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeHtmlAttribute(csp)}"><meta http-equiv="x-dns-prefetch-control" content="off"><base href="${escapeHtmlAttribute(baseUrl)}"><script>${escapeInlineScript(createArtifactEgressGuardScript())}</script>${head}</head><body>${body}</body></html>`;
+  const csp = createFrameCsp(origin, approvedOrigins);
+  const guard = createArtifactEgressGuardScript({
+    allowHttpNetwork: approvedOrigins.length > 0,
+  });
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeHtmlAttribute(csp)}"><meta http-equiv="x-dns-prefetch-control" content="off"><base href="${escapeHtmlAttribute(baseUrl)}"><script>${escapeInlineScript(guard)}</script>${head}</head><body>${body}</body></html>`;
 }
 
 function createShellCsp(origin: string) {
   return `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; frame-src ${origin}; child-src ${origin}; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; referrer-policy no-referrer`;
 }
 
-function createFrameCsp(origin: string) {
-  return `sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' ${origin}; style-src 'unsafe-inline' ${origin}; img-src ${origin} data: blob:; font-src ${origin} data:; connect-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; base-uri ${origin}; form-action 'none'; manifest-src 'none'; media-src ${origin}`;
+function createFrameCsp(origin: string, approvedOrigins: readonly string[]) {
+  const policy = createArtifactNetworkPolicy(approvedOrigins);
+  const scriptSrc = [origin, ...policy.scriptSrc].join(" ");
+  const styleSrc = [origin, ...policy.styleSrc].join(" ");
+  const imageSrc = [origin, ...policy.imageSrc, "data:", "blob:"].join(" ");
+  const fontSrc = [origin, ...policy.fontSrc, "data:"].join(" ");
+  const mediaSrc = [origin, ...policy.mediaSrc].join(" ");
+  const connectSrc = policy.connectSrc.length
+    ? policy.connectSrc.join(" ")
+    : "'none'";
+  return `sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' ${scriptSrc}; style-src 'unsafe-inline' ${styleSrc}; img-src ${imageSrc}; font-src ${fontSrc}; connect-src ${connectSrc}; frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; base-uri ${origin}; form-action 'none'; manifest-src 'none'; media-src ${mediaSrc}; navigate-to 'none'`;
 }
 
 async function rendererWrapper(
@@ -3108,8 +3332,11 @@ async function rendererWrapper(
   entryPath: string,
   reactRuntime: ReactBrowserRuntime | undefined,
   baseUrl: string,
+  approvedOrigins: readonly string[],
 ) {
-  const source = (await readFile(join(root, entryPath))).toString("utf8");
+  const source = (await readLockedPreviewFile(root, entryPath)).toString(
+    "utf8",
+  );
   const rendered = await (renderer === "markdown"
     ? renderMarkdown(source)
     : renderer === "mermaid"
@@ -3121,6 +3348,7 @@ async function rendererWrapper(
     `<main data-panes-renderer="${renderer}">${rendered}</main>`,
     baseUrl,
     `<meta name="panes-adapter" content="renderer:${renderer}"><title>Panes ${renderer} preview</title><style>body{margin:0;padding:2rem;background:#fff;color:#111;font:16px/1.5 system-ui,sans-serif}pre{white-space:pre-wrap}svg{max-width:100%;height:auto}</style>`,
+    approvedOrigins,
   );
 }
 
@@ -3332,6 +3560,28 @@ function requestLoopback(url: string) {
     });
     request.once("error", reject);
   });
+}
+
+async function readLockedPreviewFile(root: string, relativePath: string) {
+  const target = join(root, relativePath);
+  const [resolvedRoot, resolvedTarget] = await Promise.all([
+    realpath(root),
+    realpath(target),
+  ]);
+  if (!isPathWithin(resolvedTarget, resolvedRoot)) {
+    throw new Error("Preview path escapes the locked Revision snapshot.");
+  }
+  const handle = await open(
+    target,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) throw new Error("Preview path is not a regular file.");
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
 }
 
 async function writeJson(path: string, value: unknown) {

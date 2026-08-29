@@ -10,6 +10,11 @@
       "import": "./iframe-security.js",
       "default": "./iframe-security.js"
     },
+    "./preview-security": {
+      "types": "./preview-security.d.ts",
+      "import": "./preview-security.js",
+      "default": "./preview-security.js"
+    },
     "./react-build": {
       "types": "./react-build.d.ts",
       "import": "./react-build.js",

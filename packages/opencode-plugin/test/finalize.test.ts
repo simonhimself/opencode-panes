@@ -278,6 +278,188 @@ export default function Counter() {
     );
   });
 
+  it("requires origin approval before promotion and applies the approved policy to the HTTP frame", async () => {
+    const context = toolContext();
+    const plugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const prepare = await executePluginTool(
+      plugin,
+      "artifact_prepare",
+      {
+        title: "Approved origins",
+        requestedOrigins: [
+          "HTTPS://API.Example.com:443/",
+          "https://cdn.example.com/",
+        ],
+      },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "index.html"),
+      '<img src="https://cdn.example.com/image.png"><script>fetch("https://api.example.com/data");</script>',
+    );
+
+    const approval = await executePluginTool(
+      plugin,
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+    );
+    expect(metadata(approval)).toMatchObject({
+      operation: "approval-required",
+      artifactId,
+      requestedOrigins: ["https://api.example.com", "https://cdn.example.com"],
+    });
+    expect(metadata(approval).approvalNonce).toEqual(expect.any(String));
+    expect(
+      JSON.parse(
+        await readFile(
+          join(project, "artifacts", "approved-origins", "artifact.json"),
+          "utf8",
+        ),
+      ).revisions,
+    ).toEqual([]);
+
+    const result = await executePluginTool(
+      plugin,
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "index.html",
+        adapter: "browser",
+        approvedOrigins: ["https://cdn.example.com", "https://api.example.com"],
+        approvalNonce: metadata(approval).approvalNonce,
+      },
+      context,
+    );
+    expect(metadata(result)).toMatchObject({
+      operation: "finalized",
+      version: 1,
+      preview: { adapter: "browser", entryPath: "index.html" },
+    });
+
+    const previewUrl = metadata(result).previewUrl as string;
+    const shell = await getText(previewUrl);
+    expect(shell.body).toContain('sandbox="allow-scripts"');
+    expect(shell.body).not.toContain("allow-same-origin");
+    const frame = await getText(frameUrl(shell.body, previewUrl));
+    expect(frame.contentSecurityPolicy).toContain(
+      "connect-src https://api.example.com https://cdn.example.com",
+    );
+    for (const directive of [
+      "img-src",
+      "media-src",
+      "font-src",
+      "style-src",
+      "script-src",
+    ]) {
+      expect(frame.contentSecurityPolicy).toMatch(
+        new RegExp(
+          `${directive}[^;]*https://api\\.example\\.com[^;]*https://cdn\\.example\\.com`,
+        ),
+      );
+    }
+    expect(frame.contentSecurityPolicy).not.toContain("ws:");
+    expect(frame.contentSecurityPolicy).not.toContain("wss:");
+    expect(frame.contentSecurityPolicy).toContain("navigate-to 'none'");
+    expect(frame.body).toContain('"WebSocket"');
+    expect(frame.body).not.toContain('lock(globalThis, "fetch"');
+
+    const manifest = JSON.parse(
+      await readFile(
+        join(project, "artifacts", "approved-origins", "artifact.json"),
+        "utf8",
+      ),
+    );
+    expect(manifest.revisions[0].approvedOrigins).toEqual([
+      "https://api.example.com",
+      "https://cdn.example.com",
+    ]);
+    expect(
+      await readdir(join(project, "artifacts", "approved-origins")),
+    ).not.toContain(".panes-origin-approval.json");
+  });
+
+  it("invalidates an origin approval when the Draft changes and consumes the nonce after promotion", async () => {
+    const context = toolContext();
+    const plugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const prepare = await executePluginTool(
+      plugin,
+      "artifact_prepare",
+      { title: "Nonce binding", requestedOrigins: ["https://api.example.com"] },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    const draftPath = metadata(prepare).draftPath as string;
+    await writeFile(join(draftPath, "index.html"), "<h1>one</h1>");
+    const approval = await executePluginTool(
+      plugin,
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+    );
+    await writeFile(join(draftPath, "index.html"), "<h1>changed</h1>");
+    await expect(
+      executePluginTool(
+        plugin,
+        "artifact_finalize",
+        {
+          artifactId,
+          entryPath: "index.html",
+          adapter: "browser",
+          approvedOrigins: ["https://api.example.com"],
+          approvalNonce: metadata(approval).approvalNonce,
+        },
+        context,
+      ),
+    ).rejects.toThrow(/Draft changed|approval nonce/i);
+    expect(
+      stat(join(project, "artifacts", "nonce-binding", "v1")),
+    ).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    const freshApproval = await executePluginTool(
+      plugin,
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+    );
+    const finalized = await executePluginTool(
+      plugin,
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "index.html",
+        adapter: "browser",
+        approvedOrigins: ["https://api.example.com"],
+        approvalNonce: metadata(freshApproval).approvalNonce,
+      },
+      context,
+    );
+    expect(metadata(finalized).version).toBe(1);
+    await expect(
+      executePluginTool(
+        plugin,
+        "artifact_finalize",
+        {
+          artifactId,
+          entryPath: "index.html",
+          adapter: "browser",
+          approvedOrigins: ["https://api.example.com"],
+          approvalNonce: metadata(freshApproval).approvalNonce,
+        },
+        context,
+      ),
+    ).rejects.toThrow(/nonce|Draft/i);
+  });
+
   it("serves a supported renderer through a generated wrapper without rewriting stored source", async () => {
     const context = toolContext();
     const prepare = await executeTool(
@@ -799,6 +981,17 @@ async function executeTool(
     {} as Parameters<typeof OpenCodePanesPlugin>[0],
     options,
   );
+  const definition = plugin.tool?.[name] as ToolDefinition | undefined;
+  if (!definition) throw new Error(`${name} was not registered`);
+  return definition.execute(args, context);
+}
+
+async function executePluginTool(
+  plugin: Awaited<ReturnType<typeof OpenCodePanesPlugin>>,
+  name: "artifact_prepare" | "artifact_finalize",
+  args: Record<string, unknown>,
+  context: ToolContext,
+) {
   const definition = plugin.tool?.[name] as ToolDefinition | undefined;
   if (!definition) throw new Error(`${name} was not registered`);
   return definition.execute(args, context);

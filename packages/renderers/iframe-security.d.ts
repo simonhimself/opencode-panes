@@ -1,1 +1,3 @@
-export declare function createArtifactEgressGuardScript(): string;
+export declare function createArtifactEgressGuardScript(options?: {
+  allowHttpNetwork?: boolean;
+}): string;

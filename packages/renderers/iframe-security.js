@@ -1,4 +1,5 @@
-export function createArtifactEgressGuardScript() {
+export function createArtifactEgressGuardScript(options = {}) {
+  const allowHttpNetwork = options.allowHttpNetwork === true;
   return `(() => {
     const securityError = (name) => new DOMException(name + " is disabled in artifact previews", "SecurityError");
     const fail = (name) => function () { throw securityError(name); };
@@ -6,12 +7,13 @@ export function createArtifactEgressGuardScript() {
       try { Object.defineProperty(target, name, { configurable: false, writable: false, value }); }
       catch { try { target[name] = value; } catch {} }
     };
-    lock(globalThis, "fetch", () => Promise.reject(securityError("fetch")));
-    for (const name of ["XMLHttpRequest", "WebSocket", "EventSource", "RTCPeerConnection", "webkitRTCPeerConnection"]) lock(globalThis, name, fail(name));
+    ${allowHttpNetwork ? "" : 'lock(globalThis, "fetch", () => Promise.reject(securityError("fetch")));'}
+    for (const name of [${allowHttpNetwork ? '"WebSocket", ' : '"XMLHttpRequest", "WebSocket", '}"RTCPeerConnection", "webkitRTCPeerConnection"]) lock(globalThis, name, fail(name));
+    ${allowHttpNetwork ? "" : 'lock(globalThis, "EventSource", fail("EventSource"));'}
     lock(globalThis, "open", fail("window.open"));
-    lock(navigator, "sendBeacon", () => false);
+    ${allowHttpNetwork ? "" : 'lock(navigator, "sendBeacon", () => false);'}
     const navigatorPrototype = Object.getPrototypeOf(navigator);
-    if (navigatorPrototype) lock(navigatorPrototype, "sendBeacon", () => false);
+    if (navigatorPrototype) ${allowHttpNetwork ? "" : 'lock(navigatorPrototype, "sendBeacon", () => false);'}
     const hints = new Set(["dns-prefetch", "modulepreload", "preconnect", "prefetch", "preload", "prerender"]);
     const isHint = (value) => String(value).toLowerCase().split(/\s+/).some((token) => hints.has(token));
     const removeHint = (node) => {

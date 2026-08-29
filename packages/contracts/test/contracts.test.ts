@@ -238,6 +238,15 @@ describe("local-first artifact manifests", () => {
     expect(
       approvedOriginsSchema.safeParse(["https://api.example.com/path"]).success,
     ).toBe(false);
+    expect(
+      approvedOriginsSchema.safeParse(["https://ｅxample.com"]).success,
+    ).toBe(false);
+    expect(
+      approvedOriginsSchema.safeParse(["https://example.com."]).success,
+    ).toBe(false);
+    expect(
+      approvedOriginsSchema.safeParse(["https://xn--eample-9ua.com"]).success,
+    ).toBe(false);
   });
 
   it("does not apply legacy revision-count limits to local manifests", () => {

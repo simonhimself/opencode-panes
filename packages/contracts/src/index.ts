@@ -80,7 +80,16 @@ const originValueSchema = z
   .string()
   .url()
   .superRefine((value, context) => {
-    const origin = new URL(value);
+    let origin: URL;
+    try {
+      origin = new URL(value);
+    } catch {
+      context.addIssue({
+        code: "custom",
+        message: "Origin must be a valid URL",
+      });
+      return;
+    }
     if (origin.protocol !== "http:" && origin.protocol !== "https:") {
       context.addIssue({
         code: "custom",
@@ -100,23 +109,46 @@ const originValueSchema = z
           "Origin must not contain a path, query, fragment, or credentials",
       });
     }
+    const authority =
+      value.match(/^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/iu)?.[1] ?? "";
+    const hostname = authority.slice(authority.lastIndexOf("@") + 1);
+    if (/[^\x00-\x7f]/u.test(hostname)) {
+      context.addIssue({
+        code: "custom",
+        message: "Origins must use an ASCII hostname",
+      });
+    }
+    if (
+      origin.hostname.endsWith(".") ||
+      origin.hostname
+        .split(".")
+        .some((label) => label.toLowerCase().startsWith("xn--"))
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Origins must not use ambiguous hostname aliases",
+      });
+    }
   })
   .transform((value) => new URL(value).origin);
 
 const originListSchema = () =>
-  z.array(originValueSchema).superRefine((origins, context) => {
-    const seen = new Set<string>();
-    for (const [index, origin] of origins.entries()) {
-      if (seen.has(origin)) {
-        context.addIssue({
-          code: "custom",
-          path: [index],
-          message: "Origins must be unique after normalization",
-        });
+  z
+    .array(originValueSchema)
+    .superRefine((origins, context) => {
+      const seen = new Set<string>();
+      for (const [index, origin] of origins.entries()) {
+        if (seen.has(origin)) {
+          context.addIssue({
+            code: "custom",
+            path: [index],
+            message: "Origins must be unique after normalization",
+          });
+        }
+        seen.add(origin);
       }
-      seen.add(origin);
-    }
-  });
+    })
+    .transform((origins) => [...origins].sort());
 
 export const requestedOriginsSchema = originListSchema();
 export const approvedOriginsSchema = originListSchema();
