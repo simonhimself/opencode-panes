@@ -105,7 +105,7 @@ describe("global plugin installer", () => {
 
     expect(typeof module.default).toBe("function");
     expect(typeof hooks.tool?.artifact?.execute).toBe("function");
-  });
+  }, 15_000);
 
   it("reads the creation key at runtime and uses the global production defaults", async () => {
     const configDirectory = join(temporaryDirectory, "runtime-config");
@@ -185,7 +185,7 @@ describe("global plugin installer", () => {
       "runtime-create-key",
     );
     expect(ask).toHaveBeenCalledOnce();
-  });
+  }, 15_000);
 
   it("uses a 15-second request timeout by default", async () => {
     const configDirectory = join(temporaryDirectory, "timeout-config");

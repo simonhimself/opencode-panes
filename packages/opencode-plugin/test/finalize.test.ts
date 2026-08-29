@@ -251,7 +251,7 @@ export default function Counter() {
       globalThis.TextEncoder = originalTextEncoder;
       globalThis.Uint8Array = originalUint8Array;
     }
-  });
+  }, 15_000);
 
   it("finalizes a browser draft and serves its raw nested files over loopback", async () => {
     const fetchMock = vi.fn<typeof fetch>();

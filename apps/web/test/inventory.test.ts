@@ -78,6 +78,24 @@ describe("authenticated cloud inventory", () => {
     expect(await response.text()).not.toContain("timeout");
   });
 
+  it("accepts a valid signed Access JWT without an nbf claim", async () => {
+    const material = await accessMaterial("without-nbf");
+    stubJwks(material);
+    const response = await api(
+      "/api/inventory",
+      {
+        headers: {
+          "Cf-Access-Jwt-Assertion": await accessToken(material, {
+            email: "simonhimself@gmail.com",
+            missingNbf: true,
+          }),
+        },
+      },
+      accessEnv(material),
+    );
+    expect(response.status).toBe(200);
+  });
+
   it("accepts only a valid signed Access JWT and groups committed Artifacts", async () => {
     const material = await accessMaterial("one");
     const fetchJwks = stubJwks(material);
@@ -231,10 +249,6 @@ describe("authenticated cloud inventory", () => {
     ["wrong email", { email: "other@example.com" }],
     ["expired", { email: "simonhimself@gmail.com", expired: true }],
     ["not yet valid", { email: "simonhimself@gmail.com", notYetValid: true }],
-    [
-      "missing not-before",
-      { email: "simonhimself@gmail.com", missingNbf: true },
-    ],
   ] as const)("fails closed for %s", async (name, options) => {
     const material = await accessMaterial(`invalid-${name}`);
     const other = await accessMaterial(`other-${name}`);

@@ -37,7 +37,7 @@ export async function verifyAccessRequest(
       algorithms: ACCESS_ALGORITHMS,
       audience: config.audience,
       issuer: config.issuer,
-      requiredClaims: ["exp", "nbf"],
+      requiredClaims: ["exp"],
     });
     const email = normalizeEmail(payload.email);
     if (!email || email !== config.allowedEmail) {
