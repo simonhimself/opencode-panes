@@ -21,7 +21,6 @@ import {
 import { homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { execFile, spawn } from "node:child_process";
-import { runInNewContext } from "node:vm";
 import { promisify } from "node:util";
 
 import { parseHTML } from "linkedom";
@@ -29,7 +28,10 @@ import * as React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { createReactBuildOptions } from "@opencode-panes/renderers/react-build";
+import {
+  getReactBrowserRuntime,
+  type ReactBrowserRuntime,
+} from "@opencode-panes/renderers/react-browser-runtime";
 import {
   MAX_ARTIFACT_SOURCE_BYTES,
   MAX_ARTIFACT_KIND_LENGTH,
@@ -66,7 +68,7 @@ const PROJECT_ID_FILE_NAME = ".panes-project.json";
 const PREPARE_STATE_FILE_NAME = ".panes-prepare.json";
 const FINALIZE_JOURNAL_FILE_NAME = ".panes-finalize.json";
 const execFileAsync = promisify(execFile);
-const ESBUILD_PACKAGE = "esbuild";
+const REACT_WASM_ASSET_PATH = "__panes__/esbuild.wasm";
 
 const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description. After success, present viewerUrl exactly as returned, including its fragment; never shorten, sanitize, or rewrite that URL.`;
 
@@ -631,6 +633,7 @@ async function finalizeArtifact(
           ),
           files: recoveredRevision.files,
           preview: recoveredRevision.preview,
+          reactRuntime: await reactRuntimeFor(recoveredRevision.preview),
           manifest: artifact.manifest,
         });
         await previewServer.probe(
@@ -726,6 +729,7 @@ async function finalizeArtifact(
       root: draftPath,
       files,
       preview: request.preview,
+      reactRuntime: await reactRuntimeFor(request.preview),
     });
     try {
       await previewServer.probe(previewToken, request.preview.entryPath);
@@ -826,6 +830,12 @@ function validatePreviewFile(
   ) {
     throw new Error("Renderer Preview entries must contain text source.");
   }
+}
+
+function reactRuntimeFor(preview: PreviewEntry) {
+  return preview.adapter === "renderer" && preview.renderer === "react"
+    ? getReactBrowserRuntime()
+    : undefined;
 }
 
 function finalizeToolResult(result: FinalizeResult) {
@@ -1257,6 +1267,7 @@ interface PreviewRoute {
   root: string;
   files: ArtifactFile[];
   preview: PreviewEntry;
+  reactRuntime?: ReactBrowserRuntime | undefined;
   manifest?: ArtifactManifest | undefined;
 }
 
@@ -1393,6 +1404,22 @@ class LocalPreviewServer {
       response.end("Finalized Revision files no longer match artifact.json.");
       return;
     }
+    if (
+      relativePath === REACT_WASM_ASSET_PATH &&
+      route.preview.adapter === "renderer" &&
+      route.preview.renderer === "react" &&
+      route.reactRuntime
+    ) {
+      response.writeHead(200, {
+        "cache-control": "no-store",
+        "content-length": route.reactRuntime.wasm.byteLength,
+        "content-type": "application/wasm",
+        "x-content-type-options": "nosniff",
+      });
+      if (request.method === "GET") response.end(route.reactRuntime.wasm);
+      else response.end();
+      return;
+    }
     const file = route.files.find(
       (candidate) =>
         candidate.kind === "file" && candidate.path === relativePath,
@@ -1410,7 +1437,13 @@ class LocalPreviewServer {
         route.preview.entryPath === relativePath
       ) {
         body = Buffer.from(
-          await rendererWrapper(route.preview.renderer, route.root, file.path),
+          await rendererWrapper(
+            route.preview.renderer,
+            route.root,
+            file.path,
+            route.reactRuntime,
+            this.url(token, REACT_WASM_ASSET_PATH),
+          ),
         );
         contentType = "text/html";
       } else {
@@ -1433,7 +1466,7 @@ class LocalPreviewServer {
     response.writeHead(200, {
       "cache-control": "no-store",
       "content-security-policy":
-        "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'none'",
+        "default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'none'",
       "content-type": contentTypeHeader,
       "content-length": body.byteLength,
       "referrer-policy": "no-referrer",
@@ -1448,6 +1481,8 @@ async function rendererWrapper(
   renderer: "react" | "markdown" | "mermaid" | "code",
   root: string,
   entryPath: string,
+  reactRuntime: ReactBrowserRuntime | undefined,
+  wasmUrl: string,
 ) {
   const source = (await readFile(join(root, entryPath))).toString("utf8");
   const rendered = await (renderer === "markdown"
@@ -1455,14 +1490,26 @@ async function rendererWrapper(
     : renderer === "mermaid"
       ? renderMermaid(source)
       : renderer === "react"
-        ? renderReact(source)
+        ? renderReactWrapper(source, reactRuntime, wasmUrl)
         : `<pre data-renderer="code"><code>${escapeHtml(source)}</code></pre>`);
   return `<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="panes-adapter" content="renderer:${renderer}">
 <title>Panes ${renderer} preview</title>
 <style>body{margin:0;padding:2rem;background:#fff;color:#111;font:16px/1.5 system-ui,sans-serif}pre{white-space:pre-wrap}svg{max-width:100%;height:auto}</style></head>
-<body><main data-panes-renderer="${renderer}">${rendered}</main></body></html>`;
+ <body><main data-panes-renderer="${renderer}">${rendered}</main></body></html>`;
+}
+
+function renderReactWrapper(
+  source: string,
+  runtime: ReactBrowserRuntime | undefined,
+  wasmUrl: string,
+) {
+  if (!runtime) throw new Error("React browser runtime is unavailable");
+  const setup = escapeInlineScript(
+    `globalThis.__PANES_REACT_SOURCE__=${JSON.stringify(source)};globalThis.__PANES_WASM_BASE64__=${JSON.stringify(Buffer.from(runtime.wasm).toString("base64"))};globalThis.__PANES_WASM_URL__=${JSON.stringify(wasmUrl)};`,
+  );
+  return `<div id="root"></div><script>${setup}</script><script>${escapeInlineScript(runtime.source)}</script>`;
 }
 
 const MARKDOWN_COMPONENTS: Components = {
@@ -1627,41 +1674,6 @@ function sanitizeMermaidSvg(
   return root.toString();
 }
 
-async function renderReact(source: string) {
-  const { build } = await import(ESBUILD_PACKAGE);
-  const result = await build(
-    createReactBuildOptions(source) as Parameters<typeof build>[0],
-  );
-  const compiled = result.outputFiles?.[0]?.text;
-  if (!compiled) throw new Error("React compiler did not emit JavaScript");
-
-  const sandbox: {
-    __PANES_COMPONENT__?: unknown;
-    __PANES_REACT__: typeof React;
-    __PANES_RENDERED__?: unknown;
-    __PANES_RENDER_TO_STATIC_MARKUP__: typeof renderToStaticMarkup;
-    globalThis?: unknown;
-  } = {
-    __PANES_REACT__: React,
-    __PANES_RENDER_TO_STATIC_MARKUP__: renderToStaticMarkup,
-  };
-  sandbox.globalThis = sandbox;
-  runInNewContext(compiled, sandbox, { timeout: 3_000 });
-  if (typeof sandbox.__PANES_COMPONENT__ !== "function") {
-    throw new Error("React compiler did not produce a component");
-  }
-  runInNewContext(
-    "globalThis.__PANES_RENDERED__ = __PANES_RENDER_TO_STATIC_MARKUP__(__PANES_REACT__.createElement(__PANES_COMPONENT__))",
-    sandbox,
-    { timeout: 3_000 },
-  );
-  if (typeof sandbox.__PANES_RENDERED__ !== "string") {
-    throw new Error("React runtime did not render a string");
-  }
-  const content = sandbox.__PANES_RENDERED__;
-  return `<div id="root" data-react-mounted="true">${content}</div>`;
-}
-
 function escapeHtml(value: string) {
   return value
     .replaceAll("&", "&amp;")
@@ -1669,6 +1681,10 @@ function escapeHtml(value: string) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function escapeInlineScript(source: string) {
+  return source.replace(/<\/script/gi, "<\\/script");
 }
 
 function encodePreviewPath(path: string) {

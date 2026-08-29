@@ -55,6 +55,11 @@ describe("global plugin installer", () => {
     );
     expect(await readFile(unrelatedPath, "utf8")).toBe('{"keep":true}\n');
     expect((await stat(installedPath)).isFile()).toBe(true);
+    expect(
+      (
+        await stat(join(xdgConfigHome, "opencode/plugins/react-compiler.wasm"))
+      ).isFile(),
+    ).toBe(true);
   });
 
   it("supports an explicit plugin directory override", async () => {

@@ -9,6 +9,11 @@
       "types": "./react-build.d.ts",
       "import": "./react-build.js",
       "default": "./react-build.js"
+    },
+    "./react-browser-runtime": {
+      "types": "./react-browser-runtime.d.ts",
+      "import": "./react-browser-runtime.js",
+      "default": "./react-browser-runtime.js"
     }
   }
 }

@@ -267,7 +267,7 @@ describe("artifact_finalize tool", () => {
     expect(response.body).toContain("no");
   });
 
-  it("mounts a React entry as rendered DOM rather than a source listing", async () => {
+  it("serves a browser React runtime rather than evaluating the entry in Node", async () => {
     const context = toolContext();
     const prepare = await executeTool(
       "artifact_prepare",
@@ -295,10 +295,19 @@ describe("artifact_finalize tool", () => {
     const response = await getText(metadata(result).previewUrl as string);
 
     expect(response.status).toBe(200);
-    expect(response.body).toContain(
-      '<div id="root" data-react-mounted="true"><button>Click me</button></div>',
-    );
+    expect(response.body).toContain('<div id="root"></div>');
+    expect(response.body).toContain("__PANES_REACT_SOURCE__");
+    expect(response.body).toContain("__PANES_WASM_URL__");
     expect(response.body).not.toContain("<pre>");
+    const wasm = await getText(
+      (metadata(result).previewUrl as string).replace(
+        "App.tsx",
+        "__panes__/esbuild.wasm",
+      ),
+    );
+    expect(wasm.status).toBe(200);
+    expect(wasm.contentType).toBe("application/wasm");
+    expect(wasm.body.length).toBeGreaterThan(1_000_000);
   });
 
   it("executes nested JSX, expressions, props, and state through the React compiler/runtime", async () => {
@@ -344,10 +353,42 @@ describe("artifact_finalize tool", () => {
     const response = await getText(metadata(result).previewUrl as string);
 
     expect(response.status).toBe(200);
-    expect(response.body).toContain("<section>");
-    expect(response.body).toContain("<h1>Count: 2</h1>");
-    expect(response.body).toContain('<strong data-kind="badge">Ready</strong>');
+    expect(response.body).toContain("__PANES_REACT_SOURCE__");
+    expect(response.body).toContain("Count:");
     expect(response.body).not.toContain("React component rendered without");
+  });
+
+  it("does not evaluate malicious React source in the plugin process", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Untrusted React" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    const source = `
+      throw new Error("artifact source was evaluated in Node");
+      export default function App() { return <button>Never rendered in Node</button>; }
+    `;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "App.tsx"),
+      source,
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "App.tsx",
+        adapter: "renderer",
+        renderer: "react",
+      },
+      context,
+    );
+    const response = await getText(metadata(result).previewUrl as string);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toContain("artifact source was evaluated in Node");
   });
 
   it("keeps code entries source-oriented", async () => {

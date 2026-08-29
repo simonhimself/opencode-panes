@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
+import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const entry = pathToFileURL(
@@ -58,3 +60,69 @@ assert.equal(typeof globalHooks.tool?.artifact?.execute, "function");
 console.log(
   "Bundled global plugin smoke check passed: artifact tool registered.",
 );
+
+const isolatedDirectory = await mkdtemp(
+  join(tmpdir(), "opencode-panes-smoke-"),
+);
+try {
+  const isolatedPluginPath = join(isolatedDirectory, "plugin.js");
+  await cp(
+    resolve("packages/opencode-plugin/dist/global.js"),
+    isolatedPluginPath,
+  );
+  await cp(
+    resolve("packages/opencode-plugin/dist/react-compiler.wasm"),
+    join(isolatedDirectory, "react-compiler.wasm"),
+  );
+  const isolatedModule = await import(
+    `${pathToFileURL(isolatedPluginPath).href}?isolated`
+  );
+  const isolatedHooks = await isolatedModule.default(
+    {},
+    {
+      apiBaseUrl: "http://127.0.0.1:5173",
+      autoOpen: false,
+      requestTimeoutMs: 15000,
+      createApiKey: "smoke-check-only",
+    },
+  );
+  const context = {
+    sessionID: "isolated-smoke",
+    messageID: "isolated-smoke",
+    agent: "build",
+    directory: isolatedDirectory,
+    worktree: isolatedDirectory,
+    abort: new AbortController().signal,
+    metadata() {},
+    ask: async () => {},
+  };
+  const prepare = await isolatedHooks.tool.artifact_prepare.execute(
+    { title: "Isolated React" },
+    context,
+  );
+  const draftPath = toolMetadata(prepare).draftPath;
+  await writeFile(
+    join(draftPath, "App.tsx"),
+    'throw new Error("React artifact must run in the browser"); export default function App() { return <button>Ready</button>; }',
+  );
+  const finalized = await isolatedHooks.tool.artifact_finalize.execute(
+    {
+      artifactId: toolMetadata(prepare).artifactId,
+      entryPath: "App.tsx",
+      adapter: "renderer",
+      renderer: "react",
+    },
+    context,
+  );
+  assert.equal(toolMetadata(finalized).operation, "finalized");
+  console.log(
+    "Isolated global plugin smoke check passed: no repository dependencies required.",
+  );
+} finally {
+  await rm(isolatedDirectory, { recursive: true, force: true });
+}
+
+function toolMetadata(result) {
+  assert.ok(result && typeof result === "object" && result.metadata);
+  return result.metadata;
+}
