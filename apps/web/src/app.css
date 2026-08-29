@@ -16,6 +16,21 @@
   box-sizing: border-box;
 }
 
+.skip-link {
+  position: absolute;
+  z-index: 10;
+  top: 8px;
+  left: 8px;
+  padding: 8px 10px;
+  color: #171817;
+  background: #ffc293;
+  transform: translateY(-150%);
+}
+
+.skip-link:focus-visible {
+  transform: translateY(0);
+}
+
 html,
 body,
 #root {
@@ -189,6 +204,12 @@ select,
 }
 
 .creator-expiry {
+  margin-left: auto;
+  color: #8f928b;
+  font-size: 11px;
+}
+
+.public-expiry {
   margin-left: auto;
   color: #8f928b;
   font-size: 11px;
@@ -754,6 +775,12 @@ select,
   }
 
   .creator-expiry {
+    width: 100%;
+    margin-left: 0;
+    order: 4;
+  }
+
+  .public-expiry {
     width: 100%;
     margin-left: 0;
     order: 4;

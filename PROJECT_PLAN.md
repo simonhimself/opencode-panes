@@ -49,6 +49,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 - [x] Publish a selected revision
 - [x] Read-only public artifact page
 - [x] Mobile-friendly public viewer
+- [x] Isolate public publications to one selected Revision and mediated files
 - [x] Runtime error display
 - [x] Copy error details for use in an OpenCode follow-up prompt
 - [x] Stop or reload a misbehaving preview

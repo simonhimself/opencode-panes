@@ -9,3 +9,7 @@
 /creator/*
   Cache-Control: no-store
   Referrer-Policy: no-referrer
+
+/published/*
+  Cache-Control: no-store
+  Referrer-Policy: no-referrer

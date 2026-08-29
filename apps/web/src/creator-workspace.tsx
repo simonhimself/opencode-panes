@@ -4,7 +4,7 @@ import type {
   CreatorWorkspaceRevision,
 } from "@opencode-panes/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArtifactRenderer } from "./renderers";
 import {
   SandboxedArtifactFrame,
@@ -24,6 +24,32 @@ import {
 } from "./viewer";
 
 type WorkspaceMode = "preview" | "files";
+
+export type CapabilityFile =
+  | {
+      kind: "file";
+      path: string;
+      byteSize: number;
+      mediaType: string;
+    }
+  | { kind: "directory"; path: string; byteSize: 0 };
+
+export type CapabilityRevision = {
+  version: number;
+  preview: CreatorWorkspaceRevision["preview"];
+  approvedOrigins: readonly string[];
+  files: readonly CapabilityFile[];
+  createdAt: string;
+};
+
+export interface CapabilityFileClient {
+  fileUrl: (path: string, download?: boolean) => string;
+  fetchFile: (
+    path: string,
+    signal?: AbortSignal,
+    download?: boolean,
+  ) => Promise<Response>;
+}
 
 export function CreatorWorkspace({
   token,
@@ -47,6 +73,22 @@ export function CreatorWorkspace({
       (candidate) => candidate.version === version,
     ) ?? currentWorkspace.revisions[0];
   const activePublication = currentWorkspace.publication ?? null;
+  const fileClient = useMemo<CapabilityFileClient>(
+    () => ({
+      fileUrl: (path, download) =>
+        creatorFileUrl(token, revision?.version ?? 0, path, download),
+      fetchFile: (path, signal, download) =>
+        fetchCreatorFile(
+          token,
+          revision?.version ?? 0,
+          path,
+          fetch,
+          signal,
+          download,
+        ),
+    }),
+    [revision?.version, token],
+  );
 
   useEffect(() => {
     setCurrentWorkspace(workspace);
@@ -191,9 +233,9 @@ export function CreatorWorkspace({
         className="creator-stage"
       >
         {mode === "preview" ? (
-          <CreatorPreview revision={revision} token={token} />
+          <CapabilityPreview client={fileClient} revision={revision} />
         ) : (
-          <CreatorFiles revision={revision} token={token} />
+          <CapabilityFiles client={fileClient} revision={revision} />
         )}
       </section>
     </main>
@@ -322,12 +364,12 @@ function PublicationControls({
   );
 }
 
-function CreatorPreview({
+export function CapabilityPreview({
   revision,
-  token,
+  client,
 }: {
-  revision: CreatorWorkspaceRevision;
-  token: string;
+  revision: CapabilityRevision;
+  client: CapabilityFileClient;
 }) {
   const label =
     revision.preview.adapter === "browser"
@@ -339,39 +381,35 @@ function CreatorPreview({
         <iframe
           referrerPolicy="no-referrer"
           sandbox="allow-scripts"
-          src={creatorFileUrl(
-            token,
-            revision.version,
-            revision.preview.entryPath,
-          )}
+          src={client.fileUrl(revision.preview.entryPath)}
           title={label}
         />
       </div>
     );
   }
   return (
-    <CreatorRendererPreview
+    <CapabilityRendererPreview
       entryPath={revision.preview.entryPath}
       renderer={revision.preview.renderer}
       revision={revision}
-      token={token}
+      client={client}
     />
   );
 }
 
-function CreatorRendererPreview({
+function CapabilityRendererPreview({
   entryPath,
   renderer,
   revision,
-  token,
+  client,
 }: {
   entryPath: string;
   renderer: Extract<
-    CreatorWorkspaceRevision["preview"],
+    CapabilityRevision["preview"],
     { adapter: "renderer" }
   >["renderer"];
-  revision: CreatorWorkspaceRevision;
-  token: string;
+  revision: CapabilityRevision;
+  client: CapabilityFileClient;
 }) {
   const [source, setSource] = useState<string>();
   const [error, setError] = useState<string>();
@@ -379,13 +417,8 @@ function CreatorRendererPreview({
     const controller = new AbortController();
     setSource(undefined);
     setError(undefined);
-    void fetchCreatorFile(
-      token,
-      revision.version,
-      entryPath,
-      fetch,
-      controller.signal,
-    )
+    void client
+      .fetchFile(entryPath, controller.signal)
       .then(async (response) => {
         const bytes = await response.arrayBuffer();
         try {
@@ -400,7 +433,7 @@ function CreatorRendererPreview({
         }
       });
     return () => controller.abort();
-  }, [entryPath, revision.version, token]);
+  }, [client, entryPath, revision.version]);
 
   if (error)
     return (
@@ -462,19 +495,22 @@ function CreatorTextRenderer({
   );
 }
 
-function CreatorFiles({
+export function CapabilityFiles({
   revision,
-  token,
+  client,
 }: {
-  revision: CreatorWorkspaceRevision;
-  token: string;
+  revision: CapabilityRevision;
+  client: CapabilityFileClient;
 }) {
   const files = [...revision.files].sort((left, right) => {
     if (left.kind !== right.kind) return left.kind === "directory" ? -1 : 1;
     return left.path.localeCompare(right.path);
   });
   const [selectedPath, setSelectedPath] = useState(revision.preview.entryPath);
-  useEffect(() => setSelectedPath(revision.preview.entryPath), [revision.id]);
+  useEffect(
+    () => setSelectedPath(revision.preview.entryPath),
+    [revision.preview.entryPath, revision.version],
+  );
   const selectedEntry = files.find(
     (file) => file.kind === "file" && file.path === selectedPath,
   );
@@ -507,10 +543,10 @@ function CreatorFiles({
       </nav>
       <div className="creator-file-detail">
         {selected ? (
-          <CreatorFileDetail
+          <CapabilityFileDetail
             file={selected}
             revision={revision}
-            token={token}
+            client={client}
           />
         ) : (
           <div className="creator-empty-file">Select a file to inspect.</div>
@@ -520,14 +556,14 @@ function CreatorFiles({
   );
 }
 
-function CreatorFileDetail({
+function CapabilityFileDetail({
   file,
   revision,
-  token,
+  client,
 }: {
-  file: Extract<CreatorWorkspaceRevision["files"][number], { kind: "file" }>;
-  revision: CreatorWorkspaceRevision;
-  token: string;
+  file: Extract<CapabilityRevision["files"][number], { kind: "file" }>;
+  revision: CapabilityRevision;
+  client: CapabilityFileClient;
 }) {
   const text = isTextMediaType(file.mediaType);
   const [content, setContent] = useState<string | undefined>(
@@ -542,13 +578,8 @@ function CreatorFileDetail({
       return () => controller.abort();
     }
     setContent(undefined);
-    void fetchCreatorFile(
-      token,
-      revision.version,
-      file.path,
-      fetch,
-      controller.signal,
-    )
+    void client
+      .fetchFile(file.path, controller.signal)
       .then(async (response) => {
         const bytes = await response.arrayBuffer();
         try {
@@ -563,7 +594,7 @@ function CreatorFileDetail({
         }
       });
     return () => controller.abort();
-  }, [file.path, revision.version, text, token]);
+  }, [client, file.path, revision.version, text]);
 
   return (
     <article className="creator-file-card">
@@ -589,7 +620,8 @@ function CreatorFileDetail({
           <p>This binary file is not decoded as text.</p>
           <a
             download
-            href={creatorFileUrl(token, revision.version, file.path, true)}
+            href={client.fileUrl(file.path, true)}
+            referrerPolicy="no-referrer"
           >
             Download {file.path.split("/").at(-1)}
           </a>

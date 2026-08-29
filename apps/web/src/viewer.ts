@@ -2,10 +2,10 @@ import {
   artifactIdSchema,
   workspaceTokenSchema,
   type Publication,
-  type PublicationStatusResponse,
   type Artifact,
   type ArtifactType,
   type CreatorWorkspaceResponse,
+  type PublicPublicationResponse,
   type Revision,
   type ShareResponse,
 } from "@opencode-panes/contracts";
@@ -50,6 +50,7 @@ export interface PrivateWorkspaceData {
 }
 
 export type CreatorWorkspaceData = CreatorWorkspaceResponse;
+export type PublicWorkspaceData = PublicPublicationResponse;
 export type PublicationDuration = 1 | 7 | 30;
 
 export interface RevisionSelection {
@@ -394,12 +395,40 @@ export function fetchPublicationStatus(
   token: string,
   fetcher: Fetcher = fetch,
   signal?: AbortSignal,
-): Promise<PublicationStatusResponse> {
-  return requestJson<PublicationStatusResponse>(
+): Promise<PublicWorkspaceData> {
+  return requestJson<PublicWorkspaceData>(
     `/api/publications/${encodeURIComponent(token)}`,
     signal ? { signal } : {},
     fetcher,
   );
+}
+
+export function publicFileUrl(
+  token: string,
+  path: string,
+  download = false,
+): string {
+  const encodedPath = path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = `/api/publications/${encodeURIComponent(token)}/files/${encodedPath}`;
+  return download ? `${url}?download=1` : url;
+}
+
+export async function fetchPublicFile(
+  token: string,
+  path: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+  download = false,
+): Promise<Response> {
+  const response = await fetcher(
+    publicFileUrl(token, path, download),
+    signal ? { signal } : undefined,
+  );
+  if (!response.ok) await throwApiError(response);
+  return response;
 }
 
 export function fetchCreatorWorkspace(

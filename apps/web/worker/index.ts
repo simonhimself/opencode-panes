@@ -26,6 +26,7 @@ const JSON_HEADERS = {
   "Cache-Control": "no-store",
   "Content-Type": "application/json; charset=utf-8",
   "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
 } as const;
 
 interface ArtifactRow {
@@ -897,6 +898,9 @@ function routeTemplate(pathname: string): string {
     /^\/api\/sync\/artifacts\/[^/]+\/revisions\/\d+\/files\/.+$/u.test(pathname)
   ) {
     return "/api/sync/artifacts/:artifactId/revisions/:version/files/:path";
+  }
+  if (/^\/api\/publications\/[^/]+\/files\/.+$/u.test(pathname)) {
+    return "/api/publications/:token/files/:path";
   }
   if (/^\/api\/creator\/[^/]+\/revisions\/\d+\/files\/.+$/u.test(pathname)) {
     return "/api/creator/:token/revisions/:version/files/:path";

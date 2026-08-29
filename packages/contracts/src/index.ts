@@ -482,6 +482,41 @@ export const creatorWorkspaceResponseSchema = z.strictObject({
   publicationHistory: z.array(publicationSchema).optional(),
 });
 
+const publicArtifactFileSchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("file"),
+    path: relativePathSchema,
+    byteSize: rawByteSizeSchema,
+    mediaType: z.string().min(1).max(MAX_MEDIA_TYPE_LENGTH),
+  }),
+  z.strictObject({
+    kind: z.literal("directory"),
+    path: relativePathSchema,
+    byteSize: z.literal(0),
+  }),
+]);
+
+export const publicPublicationRevisionSchema = z.strictObject({
+  version: revisionNumberSchema,
+  preview: previewEntrySchema,
+  approvedOrigins: approvedOriginsSchema,
+  files: z.array(publicArtifactFileSchema),
+  createdAt: timestampSchema,
+});
+
+export const publicArtifactPresentationSchema = z.strictObject({
+  slug: artifactSlugSchema,
+  title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
+  kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).optional(),
+});
+
+export const publicPublicationResponseSchema = z.strictObject({
+  status: z.literal("active"),
+  expiresAt: timestampSchema,
+  artifact: publicArtifactPresentationSchema,
+  revision: publicPublicationRevisionSchema,
+});
+
 export type ArtifactManifest = z.infer<typeof artifactManifestSchema>;
 export type CloudArtifactMapping = z.infer<typeof cloudArtifactMappingSchema>;
 export type CloudManifest = z.infer<typeof cloudManifestSchema>;
@@ -521,6 +556,15 @@ export type CreatorWorkspaceRevision = z.infer<
 >;
 export type CreatorWorkspaceResponse = z.infer<
   typeof creatorWorkspaceResponseSchema
+>;
+export type PublicPublicationRevision = z.infer<
+  typeof publicPublicationRevisionSchema
+>;
+export type PublicArtifactPresentation = z.infer<
+  typeof publicArtifactPresentationSchema
+>;
+export type PublicPublicationResponse = z.infer<
+  typeof publicPublicationResponseSchema
 >;
 
 export const deriveCloudManifest = (

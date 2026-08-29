@@ -10,6 +10,7 @@ import {
 import { ArtifactRenderer } from "./renderers";
 import { SourceCode } from "./renderers/source-code";
 import { CreatorWorkspace } from "./creator-workspace";
+import { PublicWorkspace } from "./public-workspace";
 import {
   ApiError,
   clearStoredPublicUrl,
@@ -416,36 +417,50 @@ function PublicArtifactView({ token }: { token: string }) {
 function PublishedArtifactView({ token }: { token: string }) {
   const [status, setStatus] =
     useState<Awaited<ReturnType<typeof fetchPublicationStatus>>>();
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<unknown>();
 
   useEffect(() => {
     const controller = new AbortController();
     void fetchPublicationStatus(token, fetch, controller.signal).then(
       (loaded) => setStatus(loaded),
       (caught: unknown) => {
-        if (!controller.signal.aborted) setError(apiErrorMessage(caught));
+        if (!controller.signal.aborted) setError(caught);
       },
     );
     return () => controller.abort();
   }, [token]);
 
   if (error) {
+    const statusCode = error instanceof ApiError ? error.status : 0;
+    const expired = statusCode === 410;
+    const missing = statusCode === 404;
     return (
       <EntryState
-        eyebrow="Publication unavailable"
-        title="This publication cannot be opened."
+        eyebrow={
+          expired
+            ? "Publication inactive"
+            : missing
+              ? "Publication not found"
+              : "Publication unavailable"
+        }
+        title={
+          expired
+            ? "This publication is no longer active."
+            : missing
+              ? "This publication does not exist."
+              : "This publication cannot be opened."
+        }
       >
-        {error} The link may have expired or been revoked.
+        {expired
+          ? "The public link has expired or was revoked."
+          : missing
+            ? "Check the publication link and open it again."
+            : `${apiErrorMessage(error)} Reload the page or try again later.`}
       </EntryState>
     );
   }
   if (!status) return <LoadingState label="Loading publication" />;
-  return (
-    <EntryState eyebrow="Publication active" title="Published preview pending.">
-      This public link is active until{" "}
-      {new Date(status.expiresAt).toLocaleString()}.
-    </EntryState>
-  );
+  return <PublicWorkspace token={token} workspace={status} />;
 }
 
 function ArtifactWorkspace({

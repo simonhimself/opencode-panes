@@ -391,6 +391,114 @@ describe("artifact workspace", () => {
     );
   });
 
+  it("renders a public publication without private actions or eager binary fetches", async () => {
+    const fileRequests: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/publications/public-token")) {
+          return new Response(
+            JSON.stringify({
+              artifact: { slug: "public-demo", title: "Public demo" },
+              expiresAt: "2026-09-05T12:00:00.000Z",
+              revision: {
+                approvedOrigins: [],
+                createdAt: "2026-08-29T12:00:00.000Z",
+                files: [
+                  {
+                    byteSize: 18,
+                    kind: "file",
+                    mediaType: "text/html",
+                    path: "index.html",
+                  },
+                  {
+                    byteSize: 4,
+                    kind: "file",
+                    mediaType: "application/octet-stream",
+                    path: "assets/data.bin",
+                  },
+                ],
+                preview: { adapter: "browser", entryPath: "index.html" },
+                version: 3,
+              },
+              status: "active",
+            }),
+          );
+        }
+        fileRequests.push(url);
+        return new Response("<h1>Public</h1>");
+      }),
+    );
+
+    await act(async () => {
+      root.render(<App route={{ kind: "published", token: "public-token" }} />);
+      await settle();
+    });
+
+    expect(container.textContent).toContain("Public demo");
+    expect(container.textContent).toContain("Available until");
+    expect(container.textContent).not.toContain("Revision");
+    expect(container.textContent).not.toContain("Publish");
+    expect(container.textContent).not.toContain("Unpublish");
+    expect(container.textContent).not.toContain("Creator");
+    expect(container.querySelectorAll("select")).toHaveLength(0);
+
+    const filesButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Files",
+    );
+    await act(async () => {
+      filesButton?.click();
+      await settle();
+    });
+    const binaryButton = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "assets/data.bin",
+    );
+    await act(async () => {
+      binaryButton?.click();
+      await settle();
+    });
+    expect(container.textContent).toContain("Download data.bin");
+    expect(fileRequests.some((url) => url.includes("assets/data.bin"))).toBe(
+      false,
+    );
+  });
+
+  it.each([
+    [404, "Publication not found", "This publication does not exist."],
+    [410, "Publication inactive", "This publication is no longer active."],
+  ] as const)(
+    "keeps public publication status %s in the status view",
+    async (status, eyebrow, title) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                error: {
+                  code: "NOT_FOUND",
+                  message: "Publication unavailable",
+                },
+              }),
+              { status },
+            ),
+        ),
+      );
+
+      await act(async () => {
+        root.render(
+          <App route={{ kind: "published", token: "public-token" }} />,
+        );
+        await settle();
+      });
+
+      expect(container.textContent).toContain(eyebrow);
+      expect(container.textContent).toContain(title);
+      expect(container.textContent).not.toContain("public-token");
+    },
+  );
+
   it.each([
     [404, "Creator link not found", "This creator workspace does not exist."],
     [410, "Creator link expired", "This creator workspace has expired."],

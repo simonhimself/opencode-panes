@@ -26,7 +26,19 @@ async function api(path: string, init?: RequestInit, workerEnv: Env = env) {
   return worker.fetch(new Request(`${ORIGIN}${path}`, init), workerEnv);
 }
 
-async function syncedArtifact() {
+async function syncedArtifact(
+  inputFiles: Array<{
+    path: string;
+    bytes: Uint8Array;
+    mediaType: string;
+  }> = [
+    {
+      path: "index.html",
+      bytes: new TextEncoder().encode("<h1>publication</h1>"),
+      mediaType: "text/html",
+    },
+  ],
+) {
   const slug = `publication-${crypto.randomUUID()}`;
   const create = await api(
     "/api/sync/artifacts",
@@ -46,15 +58,15 @@ async function syncedArtifact() {
     version: 1,
     preview: { adapter: "browser" as const, entryPath: "index.html" },
     approvedOrigins: [],
-    files: [
-      {
+    files: await Promise.all(
+      inputFiles.map(async ({ path, bytes, mediaType }) => ({
         kind: "file" as const,
-        path: "index.html",
-        sha256: await hash("<h1>publication</h1>"),
-        byteSize: new TextEncoder().encode("<h1>publication</h1>").byteLength,
-        mediaType: "text/html",
-      },
-    ],
+        path,
+        sha256: await hash(bytes),
+        byteSize: bytes.byteLength,
+        mediaType,
+      })),
+    ),
     createdAt: "2026-08-29T12:00:00.000Z",
   };
   const manifest = {
@@ -65,23 +77,25 @@ async function syncedArtifact() {
     title: "Publication test",
     revisions: [revision],
   };
-  const bytes = new TextEncoder().encode("<h1>publication</h1>");
-  const file = revision.files[0];
-  if (!file) throw new Error("publication test file is missing");
-  const upload = await api(
-    `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/files/index.html`,
-    {
-      method: "PUT",
-      headers: {
-        Authorization: "Bearer publication-owner",
-        "Content-Type": "text/html",
-        "X-Panes-File-SHA256": file.sha256,
-        "X-Panes-File-Byte-Size": String(bytes.byteLength),
+  for (const file of revision.files) {
+    const input = inputFiles.find((candidate) => candidate.path === file.path);
+    if (!input)
+      throw new Error(`publication test file is missing: ${file.path}`);
+    const upload = await api(
+      `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/files/${encodePath(file.path)}`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: "Bearer publication-owner",
+          "Content-Type": file.mediaType,
+          "X-Panes-File-SHA256": file.sha256,
+          "X-Panes-File-Byte-Size": String(file.byteSize),
+        },
+        body: input.bytes.buffer as ArrayBuffer,
       },
-      body: bytes,
-    },
-  );
-  expect(upload.status).toBe(204);
+    );
+    expect(upload.status).toBe(204);
+  }
   const commit = await api(
     `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/commit`,
     jsonRequest({ manifest }, "publication-owner"),
@@ -101,6 +115,7 @@ async function syncedArtifact() {
   return {
     ...artifact,
     creatorToken: artifact.creatorUrl.split("/").at(-1)!,
+    initialRevision: revision,
     revisionId: revision.id,
     slug,
   };
@@ -164,26 +179,7 @@ async function syncRevision(
     artifactId: artifact.cloudArtifactId,
     slug: artifact.slug,
     title: "Publication test",
-    revisions: [
-      {
-        id: artifact.revisionId,
-        version: 1,
-        preview: { adapter: "browser" as const, entryPath: "index.html" },
-        approvedOrigins: [],
-        files: [
-          {
-            kind: "file" as const,
-            path: "index.html",
-            sha256: await hash("<h1>publication</h1>"),
-            byteSize: new TextEncoder().encode("<h1>publication</h1>")
-              .byteLength,
-            mediaType: "text/html",
-          },
-        ],
-        createdAt: "2026-08-29T12:00:00.000Z",
-      },
-      revision,
-    ],
+    revisions: [artifact.initialRevision, revision],
   };
   const commit = await api(
     `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/${version}/commit`,
@@ -675,15 +671,148 @@ describe("local-first publication lifecycle", () => {
       ).status,
     ).toBe(200);
   });
+
+  it("isolates a public multi-file Revision and authenticates by hash only", async () => {
+    const artifact = await syncedArtifact([
+      {
+        path: "index.html",
+        bytes: new TextEncoder().encode(
+          '<script src="assets/app.js"></script><img src="assets/logo.svg">',
+        ),
+        mediaType: "text/html",
+      },
+      {
+        path: "assets/app.js",
+        bytes: new TextEncoder().encode("document.body.dataset.ready = 'yes';"),
+        mediaType: "text/javascript",
+      },
+      {
+        path: "assets/data.bin",
+        bytes: Uint8Array.from([0, 255, 1, 254]),
+        mediaType: "application/octet-stream",
+      },
+    ]);
+    await syncRevision(artifact, 2, "<h1>private later revision</h1>");
+    const publication = publicationSchema.parse(
+      await (
+        await api(
+          `/api/creator/${artifact.creatorToken}/publish`,
+          jsonRequest({ revisionVersion: 1, durationDays: 7 }),
+        )
+      ).json(),
+    );
+    const token = publication.publicUrl!.split("/").at(-1)!;
+
+    const workspaceResponse = await api(`/api/publications/${token}`);
+    expect(workspaceResponse.status).toBe(200);
+    expect(workspaceResponse.headers.get("Cache-Control")).toBe("no-store");
+    expect(workspaceResponse.headers.get("Referrer-Policy")).toBe(
+      "no-referrer",
+    );
+    const workspace = (await workspaceResponse.json()) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(workspace).sort()).toEqual([
+      "artifact",
+      "expiresAt",
+      "revision",
+      "status",
+    ]);
+    expect(workspace.artifact).toEqual({
+      slug: artifact.slug,
+      title: "Publication test",
+    });
+    const publicRevision = workspace.revision as Record<string, unknown>;
+    expect(publicRevision.version).toBe(1);
+    expect(
+      (publicRevision.files as Array<Record<string, unknown>>).map(
+        (file) => file.path,
+      ),
+    ).toEqual(["index.html", "assets/app.js", "assets/data.bin"]);
+    expect(JSON.stringify(workspace)).not.toContain(artifact.cloudArtifactId);
+    expect(JSON.stringify(workspace)).not.toContain(artifact.cloudProjectId);
+    expect(JSON.stringify(workspace)).not.toContain("object_key");
+
+    const nested = await api(`/api/publications/${token}/files/assets/app.js`);
+    expect(nested.status).toBe(200);
+    expect(await nested.text()).toContain("dataset.ready");
+    expect(nested.headers.get("Content-Security-Policy")).toContain(
+      "sandbox allow-scripts",
+    );
+    expect(nested.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(
+      (await api(`/api/publications/${token}/files/assets/data.bin`)).status,
+    ).toBe(200);
+    expect(
+      (
+        await api(`/api/publications/${token}/files/assets/data.bin?download=1`)
+      ).headers.get("Content-Disposition"),
+    ).toContain("attachment");
+
+    for (const path of [
+      "v1/index.html",
+      "v2/index.html",
+      "../index.html",
+      "%2e%2e/index.html",
+      "assets%2Fapp.js",
+      "missing.txt",
+    ]) {
+      expect(
+        (await api(`/api/publications/${token}/files/${path}`)).status,
+      ).toBe(404);
+    }
+
+    const noEncryptionKey: Env = {
+      DB: env.DB,
+      PRIVATE_ARTIFACTS: env.PRIVATE_ARTIFACTS,
+    };
+    await env.DB.prepare(
+      "UPDATE publications SET token_ciphertext = ? WHERE id = ?",
+    )
+      .bind("tampered-ciphertext", publication.id)
+      .run();
+    expect(
+      (await api(`/api/publications/${token}`, undefined, noEncryptionKey))
+        .status,
+    ).toBe(200);
+    expect(
+      (
+        await api(
+          `/api/publications/${token}/files/assets/app.js`,
+          undefined,
+          noEncryptionKey,
+        )
+      ).status,
+    ).toBe(200);
+
+    await env.DB.prepare(
+      "UPDATE publications SET status = 'revoked', revoked_at = ? WHERE id = ?",
+    )
+      .bind(new Date().toISOString(), publication.id)
+      .run();
+    expect((await api(`/api/publications/${token}`)).status).toBe(410);
+  });
 });
 
-async function hash(value: string) {
+async function hash(value: Uint8Array): Promise<string>;
+async function hash(value: string): Promise<string>;
+async function hash(value: string | Uint8Array) {
+  const bytes =
+    typeof value === "string" ? new TextEncoder().encode(value) : value;
   return Array.from(
     new Uint8Array(
-      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+      await crypto.subtle.digest("SHA-256", bytes.buffer as ArrayBuffer),
     ),
     (byte) => byte.toString(16).padStart(2, "0"),
   ).join("");
+}
+
+function encodePath(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
 }
 
 function hexBytes(value: string) {

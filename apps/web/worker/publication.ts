@@ -1,11 +1,21 @@
 import {
   creatorPublicationExtendRequestSchema,
   creatorPublicationRequestSchema,
+  approvedOriginsSchema,
+  cloudManifestSchema,
   ownerTokenSchema,
   publicationSchema,
-  publicationStatusResponseSchema,
+  previewEntrySchema,
+  publicPublicationResponseSchema,
+  relativePathSchema,
+  type CloudManifest,
   type Publication,
 } from "@opencode-panes/contracts";
+import {
+  createPreviewCsp,
+  normalizePreviewContentType,
+} from "@opencode-panes/renderers/preview-security";
+import { privateRevisionObjectKey } from "./storage";
 
 const PUBLICATION_KEY_VERSION = 1;
 const PUBLICATION_LEASE_TTL_MS = 15_000;
@@ -13,6 +23,7 @@ const PUBLICATION_BODY_LIMIT = 16 * 1024;
 const CAPABILITY_HEADERS = {
   "Cache-Control": "no-store",
   "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
 } as const;
 
 interface CreatorArtifactRow {
@@ -46,22 +57,60 @@ interface RevisionRow {
   committed_at: string | null;
 }
 
+interface PublicPublicationRow {
+  id: string;
+  artifact_id: string;
+  revision_version: number;
+  status: "active" | "expired" | "revoked";
+  expires_at: string;
+  cloud_project_id: string;
+  slug: string;
+  title: string;
+  kind: string | null;
+  revision_id: string;
+  preview_entry: string;
+  approved_origins: string;
+  cloud_manifest_key: string;
+}
+
+interface PublicRevisionFileRow {
+  path: string;
+  sha256: string;
+  byte_size: number;
+  media_type: string;
+  object_key: string;
+}
+
 type Parsed<T> = { ok: true; data: T } | { ok: false; response: Response };
 
 export async function routePublicationRequest(
   request: Request,
   env: Env,
 ): Promise<Response | undefined> {
-  const publicMatch = new URL(request.url).pathname.match(
-    /^\/api\/publications\/([^/]+)$/u,
+  const pathname = new URL(request.url).pathname;
+  const publicFileMatch = pathname.match(
+    /^\/api\/publications\/([^/]+)\/files\/(.+)$/u,
   );
+  if (publicFileMatch) {
+    const token = decodeSegment(publicFileMatch[1]);
+    const path = decodePublicPath(publicFileMatch[2]);
+    if (!token || !ownerTokenSchema.safeParse(token).success || !path) {
+      return publicFileNotFound();
+    }
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return methodNotAllowed(["GET", "HEAD"]);
+    }
+    return publicPublicationFile(request, env, token, path);
+  }
+
+  const publicMatch = pathname.match(/^\/api\/publications\/([^/]+)$/u);
   if (publicMatch) {
     if (request.method !== "GET" && request.method !== "HEAD") {
       return methodNotAllowed(["GET", "HEAD"]);
     }
     const token = decodeSegment(publicMatch[1]);
     if (!token || !ownerTokenSchema.safeParse(token).success) return notFound();
-    return publicPublicationStatus(token, env.DB);
+    return publicPublicationStatus(token, env);
   }
 
   const match = new URL(request.url).pathname.match(
@@ -375,26 +424,270 @@ async function publicationResponse(
   );
 }
 
-async function publicPublicationStatus(token: string, db: D1Database) {
-  const row = await db
+async function publicPublicationStatus(token: string, env: Env) {
+  const lookup = await lookupPublicPublication(token, env.DB);
+  if (!lookup) return notFound();
+  if (lookup.status !== "active") return gone();
+  if (Date.parse(lookup.expires_at) <= Date.now()) {
+    await expirePublication(env.DB, lookup.id, new Date().toISOString());
+    return gone();
+  }
+
+  const workspace = await publicWorkspace(env, lookup);
+  if (!workspace) return notFound();
+  return jsonResponse(workspace);
+}
+
+async function lookupPublicPublication(
+  token: string,
+  db: D1Database,
+): Promise<PublicPublicationRow | null> {
+  return db
     .prepare(
-      `SELECT id, status, expires_at FROM publications WHERE token_hash = ?
-        ORDER BY created_at DESC LIMIT 1`,
+      `SELECT p.id, p.artifact_id, p.revision_version, p.status, p.expires_at,
+              a.cloud_project_id, a.slug, a.title, a.kind,
+              r.id AS revision_id, r.preview_entry, r.approved_origins,
+              r.cloud_manifest_key
+         FROM publications p
+         JOIN sync_artifacts a ON a.cloud_artifact_id = p.artifact_id
+         JOIN local_revisions r
+           ON r.artifact_id = p.artifact_id
+          AND r.version = p.revision_version
+          AND r.committed_at IS NOT NULL
+        WHERE p.token_hash = ?
+        ORDER BY p.created_at DESC LIMIT 1`,
     )
     .bind(await hashToken(token))
-    .first<Pick<PublicationRow, "id" | "status" | "expires_at">>();
-  if (!row) return notFound();
-  if (row.status !== "active") return gone("Publication is no longer active");
-  if (Date.parse(row.expires_at) <= Date.now()) {
-    await expirePublication(db, row.id, new Date().toISOString());
-    return gone("Publication is no longer active");
-  }
-  return jsonResponse(
-    publicationStatusResponseSchema.parse({
-      status: "active",
-      expiresAt: row.expires_at,
-    }),
+    .first<PublicPublicationRow>();
+}
+
+async function publicWorkspace(env: Env, publication: PublicPublicationRow) {
+  const manifestObject = await env.PRIVATE_ARTIFACTS.get(
+    publication.cloud_manifest_key,
   );
+  if (!manifestObject) return undefined;
+
+  let manifest;
+  try {
+    manifest = cloudManifestSchema.parse(await manifestObject.json());
+  } catch {
+    return undefined;
+  }
+  if (
+    manifest.projectId !== publication.cloud_project_id ||
+    manifest.artifactId !== publication.artifact_id ||
+    manifest.slug !== publication.slug ||
+    manifest.title !== publication.title ||
+    (manifest.kind ?? null) !== publication.kind
+  )
+    return undefined;
+
+  const manifestRevision = manifest.revisions.find(
+    (revision) => revision.version === publication.revision_version,
+  );
+  if (!manifestRevision) return undefined;
+
+  let preview;
+  let approvedOrigins;
+  try {
+    preview = previewEntrySchema.parse(JSON.parse(publication.preview_entry));
+    approvedOrigins = approvedOriginsSchema.parse(
+      JSON.parse(publication.approved_origins),
+    );
+  } catch {
+    return undefined;
+  }
+  if (
+    JSON.stringify(preview) !== JSON.stringify(manifestRevision.preview) ||
+    JSON.stringify(approvedOrigins) !==
+      JSON.stringify(manifestRevision.approvedOrigins)
+  )
+    return undefined;
+
+  const rows = await env.DB.prepare(
+    `SELECT path, sha256, byte_size, media_type, object_key
+       FROM revision_files WHERE revision_id = ?`,
+  )
+    .bind(publication.revision_id)
+    .all<PublicRevisionFileRow>();
+  const manifestFiles = manifestRevision.files.filter(
+    (file) => file.kind === "file",
+  );
+  if (rows.results.length !== manifestFiles.length) return undefined;
+  for (const file of manifestFiles) {
+    const row = rows.results.find((candidate) => candidate.path === file.path);
+    if (
+      !row ||
+      row.sha256 !== file.sha256 ||
+      row.byte_size !== file.byteSize ||
+      row.media_type !== file.mediaType ||
+      row.object_key !==
+        privateRevisionObjectKey(
+          publication.cloud_project_id,
+          publication.artifact_id,
+          publicRevisionId(
+            publication.artifact_id,
+            publication.revision_version,
+          ),
+          file.path,
+        )
+    )
+      return undefined;
+  }
+
+  return publicPublicationResponseSchema.parse({
+    status: "active",
+    expiresAt: publication.expires_at,
+    artifact: {
+      slug: publication.slug,
+      title: publication.title,
+      ...(publication.kind ? { kind: publication.kind } : {}),
+    },
+    revision: {
+      version: manifestRevision.version,
+      preview: manifestRevision.preview,
+      approvedOrigins: manifestRevision.approvedOrigins,
+      files: manifestRevision.files.map((file) =>
+        file.kind === "file"
+          ? {
+              kind: "file" as const,
+              path: file.path,
+              byteSize: file.byteSize,
+              mediaType: file.mediaType,
+            }
+          : { kind: "directory" as const, path: file.path, byteSize: 0 },
+      ),
+      createdAt: manifestRevision.createdAt,
+    },
+  });
+}
+
+async function publicPublicationFile(
+  request: Request,
+  env: Env,
+  token: string,
+  path: string,
+) {
+  const publication = await lookupPublicPublication(token, env.DB);
+  if (!publication) return publicFileNotFound();
+  if (publication.status !== "active") return gone();
+  if (Date.parse(publication.expires_at) <= Date.now()) {
+    await expirePublication(env.DB, publication.id, new Date().toISOString());
+    return gone();
+  }
+
+  const workspace = await publicWorkspace(env, publication);
+  const file = workspace?.revision.files.find(
+    (candidate) => candidate.kind === "file" && candidate.path === path,
+  );
+  if (!workspace || !file || file.kind !== "file") return publicFileNotFound();
+
+  const manifestObject = await env.PRIVATE_ARTIFACTS.get(
+    publication.cloud_manifest_key,
+  );
+  let manifestFile:
+    | Extract<
+        CloudManifest["revisions"][number]["files"][number],
+        { kind: "file" }
+      >
+    | undefined;
+  try {
+    const manifest = cloudManifestSchema.parse(await manifestObject?.json());
+    manifestFile = manifest.revisions
+      .find((revision) => revision.version === publication.revision_version)
+      ?.files.find(
+        (candidate) => candidate.kind === "file" && candidate.path === path,
+      ) as typeof manifestFile;
+  } catch {
+    return publicFileNotFound();
+  }
+  if (!manifestFile) return publicFileNotFound();
+
+  const row = await env.DB.prepare(
+    `SELECT path, sha256, byte_size, media_type, object_key
+       FROM revision_files WHERE revision_id = ? AND path = ?`,
+  )
+    .bind(publication.revision_id, path)
+    .first<PublicRevisionFileRow>();
+  if (!row || row.sha256 !== manifestFile.sha256) return publicFileNotFound();
+
+  const expectedObjectKey = privateRevisionObjectKey(
+    publication.cloud_project_id,
+    publication.artifact_id,
+    publicRevisionId(publication.artifact_id, publication.revision_version),
+    path,
+  );
+  if (
+    row.object_key !== expectedObjectKey ||
+    row.byte_size !== file.byteSize ||
+    row.media_type !== file.mediaType
+  )
+    return publicFileNotFound();
+
+  const metadata = await env.PRIVATE_ARTIFACTS.head(row.object_key);
+  if (
+    !metadata ||
+    metadata.size !== row.byte_size ||
+    metadata.customMetadata?.sha256 !== row.sha256 ||
+    metadata.customMetadata?.byteSize !== String(row.byte_size) ||
+    (metadata.httpMetadata?.contentType ?? "application/octet-stream") !==
+      row.media_type
+  )
+    return publicFileNotFound();
+  const object =
+    request.method === "HEAD"
+      ? undefined
+      : await env.PRIVATE_ARTIFACTS.get(row.object_key);
+  if (request.method === "GET" && !object?.body) return publicFileNotFound();
+
+  const headers = new Headers(CAPABILITY_HEADERS);
+  headers.set("Content-Type", normalizePreviewContentType(row.media_type));
+  headers.set("Content-Length", String(row.byte_size));
+  headers.set(
+    "Content-Security-Policy",
+    createPreviewCsp(
+      new URL(request.url).origin,
+      workspace.revision.approvedOrigins,
+    ),
+  );
+  if (
+    request.method === "GET" &&
+    new URL(request.url).searchParams.get("download") === "1"
+  ) {
+    headers.set(
+      "Content-Disposition",
+      `attachment; filename="${safeDownloadName(path)}"`,
+    );
+  }
+  return new Response(request.method === "HEAD" ? null : object?.body, {
+    status: 200,
+    headers,
+  });
+}
+
+function publicRevisionId(artifactId: string, version: number): string {
+  return `sync_revision_${artifactId}_${version}`;
+}
+
+function decodePublicPath(value: string | undefined): string | undefined {
+  if (!value || /%(?:2f|5c)/iu.test(value)) return undefined;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return undefined;
+  }
+  if (/%[0-9a-f]{2}/iu.test(decoded) || decoded.includes("\\"))
+    return undefined;
+  const segments = decoded.split("/");
+  if (
+    segments.some(
+      (segment) => segment.length === 0 || segment === "." || segment === "..",
+    )
+  )
+    return undefined;
+  const parsed = relativePathSchema.safeParse(decoded);
+  return parsed.success && parsed.data === decoded ? parsed.data : undefined;
 }
 
 async function acquirePublicationLease(
@@ -627,6 +920,16 @@ function conflict(message: string) {
 }
 function notFound(message = "Publication not found") {
   return jsonResponse({ error: { code: "NOT_FOUND", message } }, 404);
+}
+function publicFileNotFound() {
+  return jsonResponse(
+    { error: { code: "NOT_FOUND", message: "File not found" } },
+    404,
+  );
+}
+function safeDownloadName(path: string): string {
+  const name = path.split("/").at(-1) ?? "download";
+  return name.replace(/[^A-Za-z0-9._-]/gu, "_").slice(0, 120) || "download";
 }
 function gone(message = "Publication is no longer active") {
   return jsonResponse({ error: { code: "NOT_FOUND", message } }, 410);
