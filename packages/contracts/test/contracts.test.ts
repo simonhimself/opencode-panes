@@ -2,17 +2,32 @@ import { describe, expect, it } from "vitest";
 
 import {
   ARTIFACT_TYPES,
+  artifactManifestSchema,
+  artifactFilesSchema,
+  artifactIdSchema,
+  cloudManifestSchema,
+  creatorLinkSchema,
+  deriveCloudManifest,
+  draftSchema,
   MAX_ARTIFACT_REVISIONS,
   MAX_ARTIFACT_SOURCE_BYTES,
   MAX_ARTIFACT_TOTAL_SOURCE_BYTES,
+  ownerCredentialSchema,
+  publicationSchema,
+  PUBLICATION_DURATIONS,
   WORKSPACE_TOKEN_FRAGMENT_KEY,
   artifactResponseSchema,
   artifactSourceSchema,
+  approvedOriginsSchema,
   createArtifactRequestSchema,
   createArtifactResponseSchema,
   createRevisionRequestSchema,
   errorEnvelopeSchema,
   revisionResponseSchema,
+  relativePathSchema,
+  revisionNumberSchema,
+  requestedOriginsSchema,
+  syncStateSchema,
   shareResponseSchema,
   workspaceTokenSchema,
 } from "../src/index.js";
@@ -69,6 +84,289 @@ describe("artifact request contracts", () => {
         title: "Changed title",
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("local-first artifact manifests", () => {
+  it("accepts a multi-file manifest with a finalized browser revision", () => {
+    const result = artifactManifestSchema.safeParse({
+      schemaVersion: 1,
+      projectId: "project-1",
+      artifactId: "artifact-1",
+      slug: "landing-page",
+      title: "Landing page",
+      revisions: [
+        {
+          id: "revision-1",
+          version: 1,
+          preview: { adapter: "browser", entryPath: "src/index.html" },
+          approvedOrigins: [],
+          files: [
+            {
+              kind: "file",
+              path: "src/index.html",
+              sha256: "a".repeat(64),
+              byteSize: 42,
+              mediaType: "text/html",
+            },
+            {
+              kind: "directory",
+              path: "src/assets",
+              byteSize: 0,
+            },
+          ],
+          createdAt: "2026-08-17T12:00:00.000Z",
+        },
+      ],
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  it("normalizes relative POSIX paths and rejects unsafe or colliding entries", () => {
+    expect(relativePathSchema.parse("./src//index.html")).toBe(
+      "src/index.html",
+    );
+    expect(relativePathSchema.safeParse("/src/index.html").success).toBe(false);
+    expect(relativePathSchema.safeParse("C:/src/index.html").success).toBe(
+      false,
+    );
+    expect(relativePathSchema.safeParse("src/../index.html").success).toBe(
+      false,
+    );
+    expect(relativePathSchema.safeParse("src\\index.html").success).toBe(false);
+    expect(relativePathSchema.safeParse("src/\u0000index.html").success).toBe(
+      false,
+    );
+    expect(relativePathSchema.safeParse("CON/index.html").success).toBe(false);
+    expect(relativePathSchema.safeParse("src/file.").success).toBe(false);
+
+    expect(
+      artifactFilesSchema.safeParse([
+        {
+          kind: "file",
+          path: "src/index.html",
+          sha256: "a".repeat(64),
+          byteSize: 1,
+          mediaType: "text/html",
+        },
+        {
+          kind: "file",
+          path: "SRC/./index.html",
+          sha256: "b".repeat(64),
+          byteSize: 1,
+          mediaType: "text/html",
+        },
+      ]).success,
+    ).toBe(false);
+
+    expect(
+      artifactFilesSchema.safeParse([
+        {
+          kind: "file",
+          path: "assets",
+          sha256: "a".repeat(64),
+          byteSize: 1,
+          mediaType: "application/octet-stream",
+        },
+        {
+          kind: "directory",
+          path: "assets/images",
+          byteSize: 0,
+        },
+      ]).success,
+    ).toBe(false);
+  });
+
+  it("validates raw-byte hashes and unbounded local file sizes", () => {
+    expect(
+      artifactFilesSchema.safeParse([
+        {
+          kind: "file",
+          path: "large.bin",
+          sha256: "a".repeat(64),
+          byteSize: MAX_ARTIFACT_SOURCE_BYTES + 1,
+          mediaType: "application/octet-stream",
+        },
+      ]).success,
+    ).toBe(true);
+    expect(
+      artifactFilesSchema.safeParse([
+        {
+          kind: "file",
+          path: "bad.bin",
+          sha256: "A".repeat(64),
+          byteSize: 0,
+          mediaType: "application/octet-stream",
+        },
+      ]).success,
+    ).toBe(false);
+    expect(
+      artifactFilesSchema.safeParse([
+        {
+          kind: "file",
+          path: "negative.bin",
+          sha256: "a".repeat(64),
+          byteSize: -1,
+          mediaType: "application/octet-stream",
+        },
+      ]).success,
+    ).toBe(false);
+  });
+
+  it("validates identifiers and revision numbers without a local count cap", () => {
+    expect(artifactIdSchema.safeParse("artifact-1").success).toBe(true);
+    expect(artifactIdSchema.safeParse("artifact-\u0000-1").success).toBe(false);
+    expect(revisionNumberSchema.safeParse(1).success).toBe(true);
+    expect(revisionNumberSchema.safeParse(0).success).toBe(false);
+    expect(revisionNumberSchema.safeParse(1.5).success).toBe(false);
+    expect(
+      revisionNumberSchema.safeParse(Number.MAX_SAFE_INTEGER + 1).success,
+    ).toBe(false);
+  });
+
+  it("keeps requested Draft origins separate from approved Revision origins", () => {
+    expect(requestedOriginsSchema.parse(["https://api.example.com/"])).toEqual([
+      "https://api.example.com",
+    ]);
+    expect(approvedOriginsSchema.parse(["http://localhost:8787"])).toEqual([
+      "http://localhost:8787",
+    ]);
+    expect(
+      requestedOriginsSchema.safeParse(["wss://api.example.com"]).success,
+    ).toBe(false);
+    expect(
+      approvedOriginsSchema.safeParse(["https://api.example.com/path"]).success,
+    ).toBe(false);
+  });
+
+  it("does not apply legacy revision-count limits to local manifests", () => {
+    const revisions = Array.from({ length: 17 }, (_, index) => ({
+      id: `revision-${index + 1}`,
+      version: index + 1,
+      preview: { adapter: "browser", entryPath: "index.html" },
+      approvedOrigins: [],
+      files: [
+        {
+          kind: "file",
+          path: "index.html",
+          sha256: "a".repeat(64),
+          byteSize: 1,
+          mediaType: "text/html",
+        },
+      ],
+      createdAt: "2026-08-17T12:00:00.000Z",
+    }));
+
+    expect(
+      artifactManifestSchema.safeParse({
+        schemaVersion: 1,
+        projectId: "project-1",
+        artifactId: "artifact-1",
+        slug: "many-revisions",
+        title: "Many revisions",
+        revisions,
+      }).success,
+    ).toBe(true);
+  });
+});
+
+describe("local-first lifecycle contracts", () => {
+  it("validates Draft, Sync, Owner, Creator, and Publication state", () => {
+    expect(
+      draftSchema.safeParse({
+        artifactId: "artifact-1",
+        baseRevision: null,
+        requestedOrigins: ["https://api.example.com"],
+        createdAt: "2026-08-17T12:00:00.000Z",
+        updatedAt: "2026-08-17T12:00:00.000Z",
+      }).success,
+    ).toBe(true);
+    expect(
+      syncStateSchema.safeParse({
+        status: "pending",
+        syncedRevisionVersions: [],
+        updatedAt: "2026-08-17T12:00:00.000Z",
+      }).success,
+    ).toBe(true);
+    expect(
+      ownerCredentialSchema.safeParse({
+        artifactId: "artifact-1",
+        credential: "owner-secret",
+        createdAt: "2026-08-17T12:00:00.000Z",
+      }).success,
+    ).toBe(true);
+    expect(
+      creatorLinkSchema.safeParse({
+        artifactId: "artifact-1",
+        url: "https://panes.example/creator/creator-token",
+        status: "active",
+        createdAt: "2026-08-17T12:00:00.000Z",
+        expiresAt: "2026-09-16T12:00:00.000Z",
+      }).success,
+    ).toBe(true);
+    expect(
+      publicationSchema.safeParse({
+        id: "publication-1",
+        artifactId: "artifact-1",
+        revisionVersion: 1,
+        durationDays: 7,
+        publicUrl: "https://panes.example/public/public-token",
+        status: "active",
+        createdAt: "2026-08-17T12:00:00.000Z",
+        expiresAt: "2026-08-24T12:00:00.000Z",
+      }).success,
+    ).toBe(true);
+    expect(PUBLICATION_DURATIONS).toEqual([1, 7, 30]);
+  });
+
+  it("derives a cloud manifest from only the selected upload files", () => {
+    const manifest = {
+      schemaVersion: 1,
+      projectId: "project-1",
+      artifactId: "artifact-1",
+      slug: "landing-page",
+      title: "Landing page",
+      revisions: [
+        {
+          id: "revision-1",
+          version: 1,
+          preview: { adapter: "browser", entryPath: "index.html" },
+          approvedOrigins: [],
+          files: [
+            {
+              kind: "file",
+              path: "index.html",
+              sha256: "a".repeat(64),
+              byteSize: 42,
+              mediaType: "text/html",
+            },
+            {
+              kind: "file",
+              path: ".env",
+              sha256: "b".repeat(64),
+              byteSize: 12,
+              mediaType: "text/plain",
+            },
+          ],
+          createdAt: "2026-08-17T12:00:00.000Z",
+        },
+      ],
+    } as const;
+
+    const cloudManifest = deriveCloudManifest(manifest, [
+      { version: 1, paths: ["index.html"] },
+    ]);
+
+    expect(cloudManifestSchema.safeParse(cloudManifest).success).toBe(true);
+    expect(cloudManifest.revisions[0]?.files.map((file) => file.path)).toEqual([
+      "index.html",
+    ]);
+    expect(() =>
+      deriveCloudManifest(manifest, [
+        { version: 1, paths: ["index.html", "missing.js"] },
+      ]),
+    ).toThrow("outside revision v1");
   });
 });
 
