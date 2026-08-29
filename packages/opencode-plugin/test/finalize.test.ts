@@ -26,6 +26,7 @@ let project: string;
 
 beforeEach(async () => {
   project = await mkdtemp(join(tmpdir(), "opencode-panes-finalize-"));
+  vi.stubEnv("NODE_ENV", "test");
 });
 
 afterEach(async () => {
@@ -76,6 +77,7 @@ describe("artifact_finalize tool", () => {
     const preview = await getText(String(resultMetadata.previewUrl));
     expect(preview.status).toBe(200);
     expect(preview.contentType).toMatch(/^text\/html/);
+    expect(preview.contentSecurityPolicy).toContain("connect-src 'none'");
     expect(preview.body).toBe(
       '<script type="module" src="assets/app.js"></script>',
     );
@@ -154,14 +156,138 @@ describe("artifact_finalize tool", () => {
 
     expect(response.status).toBe(200);
     expect(response.contentType).toMatch(/^text\/html/);
-    expect(response.body).toContain('data-panes-renderer="markdown"');
-    expect(response.body).toContain("# Hello");
+    expect(response.body).toContain('<article data-renderer="markdown">');
+    expect(response.body).toContain("<h1>Hello</h1>");
+    expect(response.body).toContain("<strong>markdown</strong>");
     expect(
       await readFile(
         join(project, "artifacts", "notes", "v1", "README.md"),
         "utf8",
       ),
     ).toBe(source);
+  });
+
+  it("renders Mermaid as an SVG diagram surface", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Diagram" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "diagram.mmd"),
+      "flowchart LR\n  A[Start] --> B[Finish]",
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "diagram.mmd",
+        adapter: "renderer",
+        renderer: "mermaid",
+      },
+      context,
+    );
+    const response = await getText(metadata(result).previewUrl as string);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toContain('<svg data-renderer="mermaid"');
+    expect(response.body).toContain(">Start</text>");
+    expect(response.body).toContain(">Finish</text>");
+  });
+
+  it("mounts a React entry as rendered DOM rather than a source listing", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "React" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    const source =
+      "export default function App() { return <button>Click me</button> }";
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "App.tsx"),
+      source,
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "App.tsx",
+        adapter: "renderer",
+        renderer: "react",
+      },
+      context,
+    );
+    const response = await getText(metadata(result).previewUrl as string);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toContain(
+      '<div id="root" data-react-mounted="true"><button>Click me</button></div>',
+    );
+    expect(response.body).not.toContain("<pre>");
+  });
+
+  it("keeps code entries source-oriented", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Code" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "example.py"),
+      "print('hello')",
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "example.py",
+        adapter: "renderer",
+        renderer: "code",
+      },
+      context,
+    );
+    const response = await getText(metadata(result).previewUrl as string);
+
+    expect(response.body).toContain(
+      '<pre data-renderer="code"><code>print(&#39;hello&#39;)</code></pre>',
+    );
+  });
+
+  it("does not activate the injected failure boundary outside test mode", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Production" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "index.html"),
+      "<h1>Production</h1>",
+    );
+    const failureInjector = vi.fn(() => {
+      throw new Error("should not run");
+    });
+
+    const result = await executeTool(
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+      { failureInjector },
+    );
+
+    expect(metadata(result).version).toBe(1);
+    expect(failureInjector).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -209,15 +335,19 @@ describe("artifact_finalize tool", () => {
       const draftPath = metadata(prepare).draftPath as string;
       await writeFile(join(draftPath, "index.html"), `<h1>${phase}</h1>`);
 
-      vi.stubEnv("OPENCODE_PANES_TEST_CRASH_PHASE", phase);
+      const failureInjector = (injectedPhase: string) => {
+        if (injectedPhase === phase) {
+          throw new Error(`Simulated finalization crash at ${phase}`);
+        }
+      };
       await expect(
         executeTool(
           "artifact_finalize",
           { artifactId, entryPath: "index.html", adapter: "browser" },
           context,
+          { failureInjector },
         ),
       ).rejects.toThrow(`Simulated finalization crash at ${phase}`);
-      vi.unstubAllEnvs();
 
       const recovered = await executeTool(
         "artifact_finalize",
@@ -349,10 +479,11 @@ async function executeTool(
   name: "artifact_prepare" | "artifact_finalize",
   args: Record<string, unknown>,
   context: ToolContext,
+  options: { failureInjector?: (phase: string) => void } = {},
 ) {
   const plugin = await OpenCodePanesPlugin(
     {} as Parameters<typeof OpenCodePanesPlugin>[0],
-    {},
+    options,
   );
   const definition = plugin.tool?.[name] as ToolDefinition | undefined;
   if (!definition) throw new Error(`${name} was not registered`);
@@ -373,22 +504,28 @@ function toolContext(): ToolContext {
 }
 
 function getText(url: string) {
-  return new Promise<{ status: number; contentType: string; body: string }>(
-    (resolve, reject) => {
-      const request = get(url, (response) => {
-        const chunks: Buffer[] = [];
-        response.on("data", (chunk: Buffer) => chunks.push(chunk));
-        response.once("end", () =>
-          resolve({
-            status: response.statusCode ?? 0,
-            contentType: String(response.headers["content-type"] ?? ""),
-            body: Buffer.concat(chunks).toString("utf8"),
-          }),
-        );
-      });
-      request.once("error", reject);
-    },
-  );
+  return new Promise<{
+    status: number;
+    contentType: string;
+    contentSecurityPolicy: string;
+    body: string;
+  }>((resolve, reject) => {
+    const request = get(url, (response) => {
+      const chunks: Buffer[] = [];
+      response.on("data", (chunk: Buffer) => chunks.push(chunk));
+      response.once("end", () =>
+        resolve({
+          status: response.statusCode ?? 0,
+          contentType: String(response.headers["content-type"] ?? ""),
+          contentSecurityPolicy: String(
+            response.headers["content-security-policy"] ?? "",
+          ),
+          body: Buffer.concat(chunks).toString("utf8"),
+        }),
+      );
+    });
+    request.once("error", reject);
+  });
 }
 
 function metadata(result: ToolResult) {

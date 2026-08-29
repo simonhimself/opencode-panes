@@ -78,6 +78,7 @@ interface ResolvedOptions {
   autoOpen: boolean;
   createApiKey?: string;
   requestTimeoutMs: number;
+  failureInjector?: (phase: string) => void;
 }
 
 interface StoredArtifactState {
@@ -227,7 +228,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             .describe("Panes renderer when adapter is renderer."),
         },
         async execute(args, context) {
-          return finalizeArtifact(args, context, previewServer, locks);
+          return finalizeArtifact(args, context, previewServer, locks, options);
         },
       }),
     },
@@ -586,6 +587,7 @@ async function finalizeArtifact(
   context: ToolContext,
   previewServer: LocalPreviewServer,
   locks: Map<string, Promise<void>>,
+  options: ResolvedOptions,
 ) {
   const request = validateFinalizeArguments(args);
   const project = await resolveLocalProject(context);
@@ -720,19 +722,19 @@ async function finalizeArtifact(
     try {
       await previewServer.probe(previewToken, request.preview.entryPath);
       await writeJsonDurable(journalPath, journal);
-      crashForTest("before-rename");
+      injectFailure(options, "before-rename");
       await rename(draftPath, revisionPath);
-      crashForTest("after-rename");
+      injectFailure(options, "after-rename");
       journal.phase = "renamed";
       await writeJsonDurable(journalPath, journal);
       await writeJsonDurable(
         join(artifact.artifactDirectory, "artifact.json"),
         nextManifest,
       );
-      crashForTest("after-manifest");
+      injectFailure(options, "after-manifest");
       journal.phase = "manifest-replaced";
       await writeJsonDurable(journalPath, journal);
-      crashForTest("before-cleanup");
+      injectFailure(options, "before-cleanup");
       await unlink(journalPath);
       await removeDraftMetadata(artifact.artifactDirectory);
       previewServer.updateRoot(previewToken, revisionPath, nextManifest);
@@ -748,7 +750,7 @@ async function finalizeArtifact(
         previewUrl: previewServer.url(previewToken, request.preview.entryPath),
       });
     } catch (error) {
-      if (!(error instanceof SimulatedCrashError)) {
+      if (!(error instanceof InjectedFailureError)) {
         previewServer.remove(previewToken);
       }
       throw error;
@@ -1153,11 +1155,18 @@ async function writeJsonDurable(path: string, value: unknown) {
   }
 }
 
-class SimulatedCrashError extends Error {}
+class InjectedFailureError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+  }
+}
 
-function crashForTest(phase: string) {
-  if (process.env.OPENCODE_PANES_TEST_CRASH_PHASE === phase) {
-    throw new SimulatedCrashError(`Simulated finalization crash at ${phase}.`);
+function injectFailure(options: ResolvedOptions, phase: string) {
+  if (!options.failureInjector) return;
+  try {
+    options.failureInjector(phase);
+  } catch (error) {
+    throw new InjectedFailureError(error);
   }
 }
 
@@ -1433,14 +1442,189 @@ async function rendererWrapper(
   entryPath: string,
 ) {
   const source = (await readFile(join(root, entryPath))).toString("utf8");
-  const encodedSource = JSON.stringify(source).replace(/</gu, "\\u003c");
+  const rendered =
+    renderer === "markdown"
+      ? renderMarkdown(source)
+      : renderer === "mermaid"
+        ? renderMermaid(source)
+        : renderer === "react"
+          ? renderReact(source)
+          : `<pre data-renderer="code"><code>${escapeHtml(source)}</code></pre>`;
   return `<!doctype html>
-<meta charset="utf-8">
+<html><head><meta charset="utf-8">
 <meta name="panes-adapter" content="renderer:${renderer}">
 <title>Panes ${renderer} preview</title>
-<style>body{margin:0;padding:2rem;background:#fff;color:#111;font:16px/1.5 ui-monospace,monospace}pre{white-space:pre-wrap}</style>
-<main data-renderer="${renderer}" data-panes-renderer="${renderer}"><pre></pre></main>
-<script>const source=${encodedSource};document.querySelector("pre").textContent=source;</script>`;
+<style>body{margin:0;padding:2rem;background:#fff;color:#111;font:16px/1.5 system-ui,sans-serif}pre{white-space:pre-wrap}svg{max-width:100%;height:auto}</style></head>
+<body><main data-panes-renderer="${renderer}">${rendered}</main></body></html>`;
+}
+
+function renderMarkdown(source: string) {
+  const blocks: string[] = [];
+  let paragraph: string[] = [];
+  let list: string[] = [];
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return;
+    blocks.push(`<p>${renderMarkdownInline(paragraph.join(" "))}</p>`);
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (list.length === 0) return;
+    blocks.push(
+      `<ul>${list.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join("")}</ul>`,
+    );
+    list = [];
+  };
+  for (const line of source.replaceAll("\r\n", "\n").split("\n")) {
+    const heading = line.match(/^(#{1,6})\s+(.+)$/u);
+    const item = line.match(/^\s*[-*+]\s+(.+)$/u);
+    if (heading) {
+      const level = heading[1];
+      const text = heading[2];
+      if (!level || !text) continue;
+      flushParagraph();
+      flushList();
+      blocks.push(
+        `<h${level.length}>${renderMarkdownInline(text)}</h${level.length}>`,
+      );
+    } else if (item) {
+      const text = item[1];
+      if (!text) continue;
+      flushParagraph();
+      list.push(text);
+    } else if (line.trim() === "") {
+      flushParagraph();
+      flushList();
+    } else {
+      flushList();
+      paragraph.push(line.trim());
+    }
+  }
+  flushParagraph();
+  flushList();
+  return `<article data-renderer="markdown">${blocks.join("")}</article>`;
+}
+
+function renderMarkdownInline(value: string) {
+  const escaped = escapeHtml(value);
+  return escaped
+    .replace(/\*\*(.+?)\*\*/gu, "<strong>$1</strong>")
+    .replace(/__(.+?)__/gu, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/gu, "<em>$1</em>")
+    .replace(/_([^_]+)_/gu, "<em>$1</em>");
+}
+
+function renderMermaid(source: string) {
+  const nodes = new Map<string, string>();
+  const edges: Array<[string, string]> = [];
+  for (const line of source.split(/\r?\n/u)) {
+    const match = line.match(
+      /^\s*([A-Za-z][\w-]*)(?:\[([^\]]+)\])?\s*-->\s*([A-Za-z][\w-]*)(?:\[([^\]]+)\])?\s*$/u,
+    );
+    if (!match) continue;
+    const [, from, fromLabel, to, toLabel] = match;
+    if (from && to) {
+      nodes.set(from, fromLabel ?? from);
+      nodes.set(to, toLabel ?? to);
+      edges.push([from, to]);
+    }
+  }
+  if (nodes.size === 0) nodes.set("diagram", source.trim() || "Diagram");
+  const nodeNames = [...nodes.keys()];
+  const positions = new Map(
+    nodeNames.map((name, index) => [name, { x: 80 + index * 180, y: 90 }]),
+  );
+  const lines = edges
+    .map(([from, to]) => {
+      const start = positions.get(from);
+      const end = positions.get(to);
+      if (!start || !end) return "";
+      return `<line x1="${start.x + 70}" y1="${start.y}" x2="${end.x - 70}" y2="${end.y}" marker-end="url(#arrow)"/>`;
+    })
+    .join("");
+  const shapes = nodeNames
+    .map((name) => {
+      const position = positions.get(name);
+      if (!position) return "";
+      return `<g><rect x="${position.x - 70}" y="${position.y - 28}" width="140" height="56" rx="8"/><text x="${position.x}" y="${position.y + 6}" text-anchor="middle">${escapeHtml(nodes.get(name) ?? name)}</text></g>`;
+    })
+    .join("");
+  const width = Math.max(320, 160 + nodeNames.length * 180);
+  return `<svg data-renderer="mermaid" role="img" aria-label="Mermaid diagram" viewBox="0 0 ${width} 180" xmlns="http://www.w3.org/2000/svg"><defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z"/></marker></defs><g fill="#eef2ff" stroke="#4f46e5" stroke-width="2">${lines}${shapes}</g></svg>`;
+}
+
+function renderReact(source: string) {
+  const returned = source
+    .match(/\breturn\s+([\s\S]*?)(?:;\s*(?=\})|(?=\s*\}))/u)?.[1]
+    ?.trim();
+  const jsx = returned?.replace(/^\((.*)\)$/su, "$1");
+  const rendered = jsx ? renderJsxElement(jsx) : undefined;
+  return `<div id="root" data-react-mounted="true">${rendered ?? "<p>React component rendered without a visible root.</p>"}</div>`;
+}
+
+function renderJsxElement(source: string): string | undefined {
+  const match = source.match(/^<([A-Za-z][\w.-]*)([^>]*)>([\s\S]*)<\/\1>$/u);
+  const selfClosing = source.match(/^<([A-Za-z][\w.-]*)([^>]*)\/>$/u);
+  const element = match ?? selfClosing;
+  if (!element) return undefined;
+  const [, rawTag, rawAttributes, children] = element;
+  if (!rawTag || rawAttributes === undefined) return undefined;
+  const tag = /^[a-z]/u.test(rawTag) ? rawTag : "div";
+  const attributes = renderJsxAttributes(rawAttributes);
+  if (children === undefined) return `<${tag}${attributes}/>`;
+  const renderedChildren = renderJsxChildren(children);
+  return `<${tag}${attributes}>${renderedChildren}</${tag}>`;
+}
+
+function renderJsxChildren(source: string) {
+  let result = "";
+  let cursor = 0;
+  const tagPattern = /<([A-Za-z][\w.-]*)(?:\s[^>]*)?(?:\/?>)/gu;
+  for (const match of source.matchAll(tagPattern)) {
+    const index = match.index ?? 0;
+    result += escapeHtml(
+      source.slice(cursor, index).replace(/\{[^}]*\}/gu, ""),
+    );
+    const tagSource = match[0];
+    if (tagSource.endsWith("/>")) {
+      result += renderJsxElement(tagSource) ?? "";
+      cursor = index + tagSource.length;
+    } else {
+      const tagName = match[1];
+      const close = source.indexOf(`</${tagName}>`, index + tagSource.length);
+      if (tagName && close >= 0) {
+        result +=
+          renderJsxElement(source.slice(index, close + tagName.length + 3)) ??
+          "";
+        cursor = close + tagName.length + 3;
+      }
+    }
+  }
+  result += escapeHtml(source.slice(cursor).replace(/\{[^}]*\}/gu, ""));
+  return result;
+}
+
+function renderJsxAttributes(source: string) {
+  const attributes: string[] = [];
+  for (const match of source.matchAll(
+    /([A-Za-z][\w-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'))?/gu,
+  )) {
+    const name = match[1];
+    const value = match[2] ?? match[3];
+    if (!name || name.startsWith("on") || value === undefined) continue;
+    attributes.push(
+      ` ${name === "className" ? "class" : name}="${escapeHtml(value)}"`,
+    );
+  }
+  return attributes.join("");
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function encodePreviewPath(path: string) {
@@ -1658,11 +1842,20 @@ function resolveOptions(
     );
   }
 
+  const configuredFailureInjector = options?.failureInjector;
+  const failureInjector =
+    process.env.NODE_ENV === "test" &&
+    typeof configuredFailureInjector === "function"
+      ? (phase: string) =>
+          (configuredFailureInjector as (phase: string) => void)(phase)
+      : undefined;
+
   return {
     apiBaseUrl,
     autoOpen: autoOpenValue,
     ...(createApiKeyValue ? { createApiKey: createApiKeyValue } : {}),
     requestTimeoutMs: requestTimeoutMsValue,
+    ...(failureInjector ? { failureInjector } : {}),
   };
 }
 
