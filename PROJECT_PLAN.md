@@ -57,7 +57,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 
 - [x] Install the OpenCode server plugin as a private local plugin file
 - [x] Register one `artifact` custom tool
-- [x] Register the local-first `artifact_prepare` tool
+- [x] Register the local-first `artifact_prepare` and `artifact_finalize` tools
 - [x] Associate artifacts with the current OpenCode session ID
 - [x] Return artifact ID, revision, and browser URL in the tool result
 - [x] Request permission before uploading source for the first time
@@ -87,6 +87,13 @@ artifact_prepare({
   draftAction?: "resume" | "discard",
   idempotencyKey?: string,
 })
+
+artifact_finalize({
+  artifactId: string,
+  entryPath: string,
+  adapter: "browser" | "renderer",
+  renderer?: "react" | "markdown" | "mermaid" | "code",
+})
 ```
 
 Behavior:
@@ -97,7 +104,7 @@ Behavior:
 - The tool result contains the artifact ID, revision number, and private viewer URL.
 - The source is not repeated in the tool result.
 
-The local-first `artifact_prepare` tool creates a project-local `artifact.json` and writable `draft/` under the Git worktree's `artifacts/` directory, or under the session directory when Git is unavailable. It does not contact Cloudflare or modify Git state. Finalization of these Drafts is a later local-first milestone.
+The local-first `artifact_prepare` tool creates a project-local `artifact.json` and writable `draft/` under the Git worktree's `artifacts/` directory, or under the session directory when Git is unavailable. The `artifact_finalize` tool validates a declared Preview entry, promotes the Draft to the next immutable `vN`, records raw file metadata, and returns a temporary loopback Local preview URL. Neither tool contacts Cloudflare or modifies Git state.
 
 Initial tool guidance:
 

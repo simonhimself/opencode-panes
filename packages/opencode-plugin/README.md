@@ -1,6 +1,6 @@
 # @opencode-panes/plugin
 
-OpenCode plugin that registers the legacy cloud `artifact` tool and the local-first `artifact_prepare` tool for OpenCode Panes artifacts. This MIT-licensed workspace package is intentionally private and local-only.
+OpenCode plugin that registers the legacy cloud `artifact` tool and the local-first `artifact_prepare` and `artifact_finalize` tools for OpenCode Panes artifacts. This MIT-licensed workspace package is intentionally private and local-only.
 
 ## Build
 
@@ -46,6 +46,8 @@ The current test service uses `https://opencode-panes.simons.workers.dev` and re
 Every upload requests `artifact_upload` permission for the exact API origin. Browser opening is disabled by default and uses a separate `artifact_open` permission. Owner tokens are stored atomically under `$XDG_STATE_HOME/opencode-panes`, or the platform state-directory fallback, and never appear in tool output. Titles and types remain immutable across revisions.
 
 `artifact_prepare` creates a local Artifact under `<git-worktree>/artifacts/`, or under `<session-directory>/artifacts/` when the session is not in Git. It writes `artifact.json`, a writable `draft/`, and Draft metadata without contacting Cloudflare or changing Git state. Omit `artifactId` to create a safe-slugged Artifact, or provide one to copy its latest finalized revision into a new Draft. Existing slugs and Drafts require an explicit different slug, `draftAction: "resume"`, or `draftAction: "discard"`. Repeating the same request returns the existing preparation state.
+
+`artifact_finalize` validates a Draft's normalized relative entry path through either the direct `browser` adapter or a supported `renderer` adapter (`react`, `markdown`, `mermaid`, or `code`). It records raw-byte hashes, sizes, media types, directories, and portable modes, then promotes the Draft to the next contiguous `vN` directory through a recoverable finalization journal. The returned URL is a temporary, unguessable `127.0.0.1` Local preview for that finalized Revision. Direct browser files remain byte-identical; renderer entries use generated response-time wrappers and do not rewrite stored source. Finalize never contacts Cloudflare. Modified finalized files, deleted entries, unexpected Revision directories, and manifest mismatches block finalization and preview.
 
 Creator URLs contain a workspace capability in the URL fragment. The tool instructs models to preserve that URL exactly. If a model rewrites the final Markdown link without its fragment, use the structured tool result URL or enable `autoOpen` and approve the separate exact-origin browser permission.
 

@@ -19,10 +19,13 @@ const hooks = await plugin(
   },
 );
 const artifact = hooks.tool?.artifact;
+const finalize = hooks.tool?.artifact_finalize;
 
 assert.ok(artifact, "plugin must register the artifact tool");
 assert.equal(typeof artifact.description, "string");
 assert.equal(typeof artifact.execute, "function");
+assert.ok(finalize, "plugin must register the artifact_finalize tool");
+assert.equal(typeof finalize.execute, "function");
 assert.deepEqual(Object.keys(artifact.args).sort(), [
   "artifactId",
   "source",

@@ -1,5 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  createServer,
+  get,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import {
   chmod,
   cp,
   lstat,
@@ -21,11 +27,15 @@ import {
   MAX_ARTIFACT_SOURCE_BYTES,
   MAX_ARTIFACT_KIND_LENGTH,
   artifactManifestSchema,
+  artifactFilesSchema,
   artifactSlugSchema,
   WORKSPACE_TOKEN_FRAGMENT_KEY,
   artifactIdSchema,
   artifactTypeSchema,
   draftSchema,
+  finalizedRevisionSchema,
+  previewEntrySchema,
+  relativePathSchema,
   createArtifactRequestSchema,
   createArtifactResponseSchema,
   createRevisionRequestSchema,
@@ -35,7 +45,10 @@ import {
   revisionResponseSchema,
   workspaceTokenSchema,
   type ArtifactManifest,
+  type ArtifactFile,
   type ArtifactType,
+  type FinalizedRevision,
+  type PreviewEntry,
 } from "@opencode-panes/contracts";
 import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin";
 
@@ -44,6 +57,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const STATE_DIRECTORY_NAME = "opencode-panes";
 const PROJECT_ID_FILE_NAME = ".panes-project.json";
 const PREPARE_STATE_FILE_NAME = ".panes-prepare.json";
+const FINALIZE_JOURNAL_FILE_NAME = ".panes-finalize.json";
 const execFileAsync = promisify(execFile);
 
 const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description. After success, present viewerUrl exactly as returned, including its fragment; never shorten, sanitize, or rewrite that URL.`;
@@ -79,6 +93,8 @@ type AutoOpenStatus = "disabled" | "opened" | "permission-denied" | "failed";
 
 export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
   const options = resolveOptions(pluginOptions);
+  const previewServer = new LocalPreviewServer();
+  const locks = new Map<string, Promise<void>>();
 
   return {
     tool: {
@@ -187,6 +203,33 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
           return prepareArtifact(args, context);
         },
       }),
+      artifact_finalize: tool({
+        description:
+          "Finalize a prepared local Panes Draft after validating its Preview entry, then return a temporary loopback Local preview URL. This never contacts Cloudflare.",
+        args: {
+          artifactId: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^\S+$/)
+            .describe("Local artifact ID returned by artifact_prepare."),
+          entryPath: tool.schema
+            .string()
+            .min(1)
+            .max(1024)
+            .describe("Relative POSIX path to the Preview entry in Draft."),
+          adapter: tool.schema
+            .enum(["browser", "renderer"])
+            .describe("Preview adapter to validate and serve."),
+          renderer: tool.schema
+            .enum(["react", "markdown", "mermaid", "code"])
+            .optional()
+            .describe("Panes renderer when adapter is renderer."),
+        },
+        async execute(args, context) {
+          return finalizeArtifact(args, context, previewServer, locks);
+        },
+      }),
     },
   };
 };
@@ -292,7 +335,11 @@ async function prepareExistingArtifact(
   existing: LocalArtifact,
   request: ValidatedPrepareArguments,
 ) {
-  const { artifactDirectory, manifest } = existing;
+  await recoverFinalization(existing);
+  const recovered = await readArtifactDirectory(existing.artifactDirectory);
+  if (!recovered)
+    throw new Error("The local artifact disappeared during recovery.");
+  const { artifactDirectory, manifest } = recovered;
   if (request.title && request.title !== manifest.title) {
     throw new Error(
       `Artifact title is ${JSON.stringify(manifest.title)}. Retry with the stored title or omit title when preparing a revision.`,
@@ -504,6 +551,282 @@ function prepareToolResult(result: PrepareResult) {
   };
 }
 
+type FinalizeArguments = {
+  artifactId: string;
+  entryPath: string;
+  adapter: "browser" | "renderer";
+  renderer?: "react" | "markdown" | "mermaid" | "code" | undefined;
+};
+
+interface FinalizeResult {
+  operation: "finalized";
+  projectId: string;
+  artifactId: string;
+  title: string;
+  version: number;
+  revisionPath: string;
+  manifestPath: string;
+  preview: PreviewEntry;
+  previewUrl: string;
+}
+
+interface FinalizationJournal {
+  schemaVersion: 1;
+  phase: "prepared" | "renamed" | "manifest-replaced";
+  artifactId: string;
+  targetVersion: number;
+  draftPath: string;
+  revisionPath: string;
+  revision: FinalizedRevision;
+  manifest: ArtifactManifest;
+}
+
+async function finalizeArtifact(
+  args: FinalizeArguments,
+  context: ToolContext,
+  previewServer: LocalPreviewServer,
+  locks: Map<string, Promise<void>>,
+) {
+  const request = validateFinalizeArguments(args);
+  const project = await resolveLocalProject(context);
+  const existing = await findArtifact(project.artifactRoot, request.artifactId);
+  if (!existing) {
+    throw new Error(
+      `No local artifact with ID ${request.artifactId} was found under ${project.artifactRoot}.`,
+    );
+  }
+
+  return withArtifactLock(locks, existing.artifactDirectory, async () => {
+    const recoveredRevision = await recoverFinalization(existing);
+    const artifact = await readArtifactDirectory(existing.artifactDirectory);
+    if (!artifact)
+      throw new Error("The local artifact disappeared during finalization.");
+
+    await verifyFinalizedRevisions(artifact);
+    const draftPath = join(artifact.artifactDirectory, "draft");
+    const draftMetadataPath = join(artifact.artifactDirectory, "draft.json");
+    if (!(await pathExists(draftPath))) {
+      if (recoveredRevision) {
+        await verifyRevisionFiles(
+          join(artifact.artifactDirectory, `v${recoveredRevision.version}`),
+          recoveredRevision.files,
+        );
+        const previewToken = await previewServer.register({
+          artifactId: artifact.manifest.artifactId,
+          artifactDirectory: artifact.artifactDirectory,
+          version: recoveredRevision.version,
+          root: join(
+            artifact.artifactDirectory,
+            `v${recoveredRevision.version}`,
+          ),
+          files: recoveredRevision.files,
+          preview: recoveredRevision.preview,
+          manifest: artifact.manifest,
+        });
+        await previewServer.probe(
+          previewToken,
+          recoveredRevision.preview.entryPath,
+        );
+        return finalizeToolResult({
+          operation: "finalized",
+          projectId: artifact.manifest.projectId,
+          artifactId: artifact.manifest.artifactId,
+          title: artifact.manifest.title,
+          version: recoveredRevision.version,
+          revisionPath: join(
+            artifact.artifactDirectory,
+            `v${recoveredRevision.version}`,
+          ),
+          manifestPath: join(artifact.artifactDirectory, "artifact.json"),
+          preview: recoveredRevision.preview,
+          previewUrl: previewServer.url(
+            previewToken,
+            recoveredRevision.preview.entryPath,
+          ),
+        });
+      }
+      throw new Error(
+        `No writable Draft exists for artifact ${request.artifactId}. Prepare one before finalizing.`,
+      );
+    }
+    const draft = await readDraftMetadata(draftMetadataPath);
+    if (draft.artifactId !== request.artifactId) {
+      throw new Error("Draft metadata does not belong to this artifact.");
+    }
+    const latestRevision = artifact.manifest.revisions.at(-1);
+    if (draft.baseRevision !== (latestRevision?.version ?? null)) {
+      throw new Error(
+        "Draft is based on an older Revision. Prepare a new Draft before finalizing.",
+      );
+    }
+    if (draft.requestedOrigins.length > 0) {
+      throw new Error(
+        "This Draft requests external origins. Origin approval is not available during local finalization.",
+      );
+    }
+
+    const files = await scanRevisionFiles(draftPath);
+    const entryFile = files.find(
+      (file) => file.kind === "file" && file.path === request.preview.entryPath,
+    );
+    if (!entryFile || entryFile.kind !== "file") {
+      throw new Error(
+        `Preview entry ${JSON.stringify(request.preview.entryPath)} must be an existing file in the Draft.`,
+      );
+    }
+    validatePreviewFile(request.preview, entryFile);
+
+    const targetVersion = (latestRevision?.version ?? 0) + 1;
+    const revisionPath = join(artifact.artifactDirectory, `v${targetVersion}`);
+    if (await pathExists(revisionPath)) {
+      throw new Error(`Revision v${targetVersion} already exists.`);
+    }
+    const revision: FinalizedRevision = {
+      id: `revision-${randomUUID()}`,
+      version: targetVersion,
+      preview: request.preview,
+      approvedOrigins: [],
+      files,
+      createdAt: new Date().toISOString(),
+    };
+    const manifest = artifact.manifest;
+    const nextManifest = artifactManifestSchema.parse({
+      ...manifest,
+      revisions: [...manifest.revisions, revision],
+    });
+    const journalPath = join(
+      artifact.artifactDirectory,
+      FINALIZE_JOURNAL_FILE_NAME,
+    );
+    const journal: FinalizationJournal = {
+      schemaVersion: 1,
+      phase: "prepared",
+      artifactId: request.artifactId,
+      targetVersion,
+      draftPath,
+      revisionPath,
+      revision,
+      manifest: nextManifest,
+    };
+
+    const previewToken = await previewServer.register({
+      artifactId: request.artifactId,
+      artifactDirectory: artifact.artifactDirectory,
+      version: targetVersion,
+      root: draftPath,
+      files,
+      preview: request.preview,
+    });
+    try {
+      await previewServer.probe(previewToken, request.preview.entryPath);
+      await writeJsonDurable(journalPath, journal);
+      crashForTest("before-rename");
+      await rename(draftPath, revisionPath);
+      crashForTest("after-rename");
+      journal.phase = "renamed";
+      await writeJsonDurable(journalPath, journal);
+      await writeJsonDurable(
+        join(artifact.artifactDirectory, "artifact.json"),
+        nextManifest,
+      );
+      crashForTest("after-manifest");
+      journal.phase = "manifest-replaced";
+      await writeJsonDurable(journalPath, journal);
+      crashForTest("before-cleanup");
+      await unlink(journalPath);
+      await removeDraftMetadata(artifact.artifactDirectory);
+      previewServer.updateRoot(previewToken, revisionPath, nextManifest);
+      return finalizeToolResult({
+        operation: "finalized",
+        projectId: nextManifest.projectId,
+        artifactId: nextManifest.artifactId,
+        title: nextManifest.title,
+        version: targetVersion,
+        revisionPath,
+        manifestPath: join(artifact.artifactDirectory, "artifact.json"),
+        preview: request.preview,
+        previewUrl: previewServer.url(previewToken, request.preview.entryPath),
+      });
+    } catch (error) {
+      if (!(error instanceof SimulatedCrashError)) {
+        previewServer.remove(previewToken);
+      }
+      throw error;
+    }
+  });
+}
+
+function validateFinalizeArguments(args: FinalizeArguments) {
+  const artifactId = artifactIdSchema.safeParse(args.artifactId);
+  if (!artifactId.success) throw validationError("Artifact ID is invalid");
+  const entryPath = relativePathSchema.safeParse(args.entryPath);
+  if (!entryPath.success) {
+    throw validationError(
+      "Preview entry path must be a safe relative POSIX path",
+    );
+  }
+  const preview = previewEntrySchema.safeParse({
+    adapter: args.adapter,
+    entryPath: entryPath.data,
+    ...(args.renderer === undefined ? {} : { renderer: args.renderer }),
+  });
+  if (!preview.success) {
+    throw validationError(
+      args.adapter === "renderer"
+        ? "A renderer adapter requires one supported renderer"
+        : "A browser adapter cannot specify a renderer",
+    );
+  }
+  return { artifactId: artifactId.data, preview: preview.data };
+}
+
+function validatePreviewFile(
+  preview: PreviewEntry,
+  file: Extract<ArtifactFile, { kind: "file" }>,
+) {
+  const extension = file.path.includes(".")
+    ? file.path.slice(file.path.lastIndexOf(".")).toLowerCase()
+    : "";
+  if (preview.adapter === "browser") {
+    if (file.mediaType !== "text/html" && file.mediaType !== "image/svg+xml") {
+      throw new Error(
+        "Browser Preview entries must be HTML, SVG, or browser-built output with an HTML/SVG entry.",
+      );
+    }
+    return;
+  }
+  const renderer = preview.renderer;
+  const allowed: Record<
+    Extract<PreviewEntry, { adapter: "renderer" }>["renderer"],
+    string[]
+  > = {
+    react: [".js", ".jsx", ".mjs", ".ts", ".tsx"],
+    markdown: [".md", ".markdown"],
+    mermaid: [".mmd", ".mermaid"],
+    code: [],
+  };
+  if (renderer !== "code" && !allowed[renderer].includes(extension)) {
+    throw new Error(
+      `The ${renderer} renderer cannot use ${JSON.stringify(file.path)} as its entry.`,
+    );
+  }
+  if (
+    file.mediaType.startsWith("image/") ||
+    file.mediaType === "application/octet-stream"
+  ) {
+    throw new Error("Renderer Preview entries must contain text source.");
+  }
+}
+
+function finalizeToolResult(result: FinalizeResult) {
+  const metadata = { ...result };
+  return {
+    title: `Finalized ${result.title} v${result.version}`,
+    output: JSON.stringify(metadata),
+    metadata,
+  };
+}
+
 interface LocalArtifact {
   artifactDirectory: string;
   manifest: ArtifactManifest;
@@ -564,6 +887,580 @@ async function readPrepareState(
     if (isNodeError(error) && error.code === "ENOENT") return undefined;
     throw error;
   }
+}
+
+async function readDraftMetadata(path: string) {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      throw new Error(`Draft metadata is missing at ${path}.`);
+    }
+    throw new Error(`Draft metadata at ${path} is malformed.`);
+  }
+  const parsed = draftSchema.safeParse(value);
+  if (!parsed.success) throw new Error(`Draft metadata at ${path} is invalid.`);
+  return parsed.data;
+}
+
+async function scanRevisionFiles(root: string): Promise<ArtifactFile[]> {
+  const files: ArtifactFile[] = [];
+
+  async function visit(directory: string, relativeDirectory: string) {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const relativePath = relativeDirectory
+        ? `${relativeDirectory}/${entry.name}`
+        : entry.name;
+      const normalized = relativePathSchema.safeParse(relativePath);
+      if (!normalized.success) {
+        throw new Error(
+          `Draft contains an unsafe path ${JSON.stringify(relativePath)}.`,
+        );
+      }
+      const absolutePath = join(directory, entry.name);
+      const stats = await lstat(absolutePath);
+      const mode = stats.mode & 0o7777;
+      if (stats.isSymbolicLink()) {
+        throw new Error(
+          `Draft contains unsupported symlink ${JSON.stringify(relativePath)}.`,
+        );
+      }
+      if (stats.isDirectory()) {
+        files.push({
+          kind: "directory",
+          path: normalized.data,
+          byteSize: 0,
+          mode,
+        });
+        await visit(absolutePath, normalized.data);
+        continue;
+      }
+      if (!stats.isFile()) {
+        throw new Error(
+          `Draft contains unsupported filesystem entry ${JSON.stringify(relativePath)}.`,
+        );
+      }
+      const bytes = await readFile(absolutePath);
+      files.push({
+        kind: "file",
+        path: normalized.data,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+        byteSize: bytes.byteLength,
+        mediaType: mediaTypeForPath(normalized.data, bytes),
+        mode,
+      });
+    }
+  }
+
+  await visit(root, "");
+  const parsed = artifactFilesSchema.safeParse(files);
+  if (!parsed.success)
+    throw new Error("Draft files do not form a valid manifest.");
+  return parsed.data;
+}
+
+async function verifyFinalizedRevisions(artifact: LocalArtifact) {
+  const entries = await readdir(artifact.artifactDirectory, {
+    withFileTypes: true,
+  });
+  const expectedDirectories = new Set(
+    artifact.manifest.revisions.map((revision) => `v${revision.version}`),
+  );
+  for (const entry of entries) {
+    if (/^v\d+$/u.test(entry.name) && !expectedDirectories.has(entry.name)) {
+      throw new Error(`Found unexpected Revision directory ${entry.name}.`);
+    }
+  }
+  for (const revision of artifact.manifest.revisions) {
+    const path = join(artifact.artifactDirectory, `v${revision.version}`);
+    if (!(await pathExists(path))) {
+      throw new Error(
+        `Finalized Revision v${revision.version} is missing from disk.`,
+      );
+    }
+    await verifyRevisionFiles(path, revision.files);
+  }
+}
+
+async function verifyRevisionFiles(root: string, expected: ArtifactFile[]) {
+  const actual = await scanRevisionFiles(root);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error("Finalized Revision files no longer match artifact.json.");
+  }
+}
+
+async function recoverFinalization(artifact: LocalArtifact) {
+  const journalPath = join(
+    artifact.artifactDirectory,
+    FINALIZE_JOURNAL_FILE_NAME,
+  );
+  if (!(await pathExists(journalPath))) return undefined;
+  const journal = await readFinalizationJournal(journalPath);
+  if (journal.artifactId !== artifact.manifest.artifactId) {
+    throw new Error("Finalization journal belongs to another artifact.");
+  }
+  if (
+    resolve(journal.draftPath) !==
+      resolve(artifact.artifactDirectory, "draft") ||
+    resolve(journal.revisionPath) !==
+      resolve(artifact.artifactDirectory, `v${journal.targetVersion}`)
+  ) {
+    throw new Error("Finalization journal contains an unsafe path.");
+  }
+
+  const targetExists = await pathExists(journal.revisionPath);
+  const draftExists = await pathExists(journal.draftPath);
+  const currentRevision = artifact.manifest.revisions.find(
+    (revision) => revision.version === journal.targetVersion,
+  );
+  if (targetExists && draftExists) {
+    throw new Error(
+      "Finalization recovery found both Draft and target Revision.",
+    );
+  }
+  if (targetExists) {
+    await verifyRevisionFiles(journal.revisionPath, journal.revision.files);
+    if (currentRevision) {
+      if (
+        JSON.stringify(currentRevision) !== JSON.stringify(journal.revision) ||
+        JSON.stringify(artifact.manifest) !== JSON.stringify(journal.manifest)
+      ) {
+        throw new Error("Finalization recovery found a conflicting Revision.");
+      }
+    } else {
+      const expectedPrevious = journal.targetVersion - 1;
+      if (artifact.manifest.revisions.length !== expectedPrevious) {
+        throw new Error(
+          "Finalization recovery found a non-contiguous Revision ledger.",
+        );
+      }
+      if (
+        JSON.stringify(artifact.manifest.revisions) !==
+        JSON.stringify(journal.manifest.revisions.slice(0, expectedPrevious))
+      ) {
+        throw new Error(
+          "Finalization recovery found a changed Revision ledger.",
+        );
+      }
+      await writeJsonDurable(
+        join(artifact.artifactDirectory, "artifact.json"),
+        journal.manifest,
+      );
+    }
+    await unlink(journalPath);
+    await removeDraftMetadata(artifact.artifactDirectory);
+    return journal.revision;
+  }
+  if (!draftExists && !currentRevision) {
+    throw new Error(
+      "Finalization recovery found neither Draft nor target Revision.",
+    );
+  }
+  if (currentRevision) {
+    throw new Error(
+      "Finalization recovery found a manifest Revision without its files.",
+    );
+  }
+  // Before rename, the validated Draft remains available for an explicit retry.
+  await verifyRevisionFiles(journal.draftPath, journal.revision.files);
+  await unlink(journalPath);
+  return undefined;
+}
+
+async function removeDraftMetadata(artifactDirectory: string) {
+  await unlink(join(artifactDirectory, "draft.json")).catch(() => undefined);
+  await unlink(join(artifactDirectory, PREPARE_STATE_FILE_NAME)).catch(
+    () => undefined,
+  );
+}
+
+async function readFinalizationJournal(
+  path: string,
+): Promise<FinalizationJournal> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    throw new Error(`Finalization journal at ${path} is malformed.`);
+  }
+  if (!value || typeof value !== "object") {
+    throw new Error(`Finalization journal at ${path} is invalid.`);
+  }
+  const journal = value as Partial<FinalizationJournal>;
+  if (
+    journal.schemaVersion !== 1 ||
+    !["prepared", "renamed", "manifest-replaced"].includes(
+      String(journal.phase),
+    ) ||
+    typeof journal.artifactId !== "string" ||
+    typeof journal.targetVersion !== "number" ||
+    typeof journal.draftPath !== "string" ||
+    typeof journal.revisionPath !== "string" ||
+    !journal.revision ||
+    !journal.manifest
+  ) {
+    throw new Error(`Finalization journal at ${path} is invalid.`);
+  }
+  const manifest = artifactManifestSchema.safeParse(journal.manifest);
+  if (!manifest.success)
+    throw new Error(`Finalization journal at ${path} is invalid.`);
+  const revision = finalizedRevisionSchema.safeParse(journal.revision);
+  if (!revision.success)
+    throw new Error(`Finalization journal at ${path} is invalid.`);
+  const manifestRevision = manifest.data.revisions.find(
+    (candidate) => candidate.version === revision.data.version,
+  );
+  if (
+    journal.targetVersion !== revision.data.version ||
+    !manifestRevision ||
+    manifest.data.revisions.at(-1)?.version !== journal.targetVersion ||
+    JSON.stringify(manifestRevision) !== JSON.stringify(revision.data)
+  ) {
+    throw new Error(`Finalization journal at ${path} is invalid.`);
+  }
+  return {
+    schemaVersion: 1,
+    phase: journal.phase as FinalizationJournal["phase"],
+    artifactId: journal.artifactId,
+    targetVersion: journal.targetVersion,
+    draftPath: journal.draftPath,
+    revisionPath: journal.revisionPath,
+    revision: revision.data,
+    manifest: manifest.data,
+  };
+}
+
+async function writeJsonDurable(path: string, value: unknown) {
+  const temporary = join(
+    dirname(path),
+    `.${basename(path)}.${randomUUID()}.tmp`,
+  );
+  const handle = await open(temporary, "wx", 0o644);
+  try {
+    await handle.writeFile(`${JSON.stringify(value)}\n`, { encoding: "utf8" });
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(temporary, path);
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
+}
+
+class SimulatedCrashError extends Error {}
+
+function crashForTest(phase: string) {
+  if (process.env.OPENCODE_PANES_TEST_CRASH_PHASE === phase) {
+    throw new SimulatedCrashError(`Simulated finalization crash at ${phase}.`);
+  }
+}
+
+async function withArtifactLock<T>(
+  locks: Map<string, Promise<void>>,
+  artifactDirectory: string,
+  operation: () => Promise<T>,
+) {
+  const previous = locks.get(artifactDirectory) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => current);
+  locks.set(artifactDirectory, queued);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (locks.get(artifactDirectory) === queued)
+      locks.delete(artifactDirectory);
+  }
+}
+
+function mediaTypeForPath(path: string, bytes: Buffer) {
+  const extension = path.includes(".")
+    ? path.slice(path.lastIndexOf(".")).toLowerCase()
+    : "";
+  return (
+    {
+      ".html": "text/html",
+      ".htm": "text/html",
+      ".svg": "image/svg+xml",
+      ".css": "text/css",
+      ".js": "application/javascript",
+      ".mjs": "application/javascript",
+      ".cjs": "application/javascript",
+      ".ts": "application/typescript",
+      ".tsx": "application/typescript",
+      ".jsx": "application/javascript",
+      ".json": "application/json",
+      ".md": "text/markdown",
+      ".markdown": "text/markdown",
+      ".mmd": "text/plain",
+      ".mermaid": "text/plain",
+      ".txt": "text/plain",
+      ".py": "text/x-python",
+      ".rb": "text/x-ruby",
+      ".go": "text/x-go",
+      ".rs": "text/x-rust",
+      ".java": "text/x-java-source",
+      ".c": "text/x-c",
+      ".h": "text/x-c",
+      ".cpp": "text/x-c++src",
+      ".yaml": "text/yaml",
+      ".yml": "text/yaml",
+      ".xml": "application/xml",
+      ".sh": "application/x-sh",
+      ".sql": "application/sql",
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".gif": "image/gif",
+      ".webp": "image/webp",
+      ".ico": "image/x-icon",
+      ".woff": "font/woff",
+      ".woff2": "font/woff2",
+    }[extension] ??
+    (Buffer.from(bytes.toString("utf8"), "utf8").equals(bytes)
+      ? "text/plain"
+      : "application/octet-stream")
+  );
+}
+
+interface PreviewRoute {
+  artifactId: string;
+  artifactDirectory: string;
+  version: number;
+  root: string;
+  files: ArtifactFile[];
+  preview: PreviewEntry;
+  manifest?: ArtifactManifest | undefined;
+}
+
+class LocalPreviewServer {
+  private readonly routes = new Map<string, PreviewRoute>();
+  private readonly server = createServer((request, response) => {
+    void this.handle(request, response);
+  });
+  private listening?: Promise<void>;
+
+  constructor() {
+    this.server.unref();
+  }
+
+  async register(route: PreviewRoute) {
+    await this.listen();
+    const token = randomUUID();
+    this.routes.set(token, route);
+    return token;
+  }
+
+  updateRoot(token: string, root: string, manifest: ArtifactManifest) {
+    const route = this.routes.get(token);
+    if (route) {
+      route.root = root;
+      route.manifest = manifest;
+    }
+  }
+
+  remove(token: string) {
+    this.routes.delete(token);
+  }
+
+  url(token: string, entryPath: string) {
+    const address = this.server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Local preview server is not listening.");
+    return `http://127.0.0.1:${address.port}/preview/${encodeURIComponent(token)}/v${this.routes.get(token)?.version}/${encodePreviewPath(entryPath)}`;
+  }
+
+  async probe(token: string, entryPath: string) {
+    const response = await requestLoopback(this.url(token, entryPath));
+    if (response.statusCode !== 200) {
+      throw new Error(
+        `Local Preview validation failed with HTTP ${response.statusCode}.`,
+      );
+    }
+  }
+
+  private async listen() {
+    if (!this.listening) {
+      this.listening = new Promise<void>((resolve, reject) => {
+        const onError = (error: Error) => {
+          this.server.off("listening", onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          this.server.off("error", onError);
+          resolve();
+        };
+        this.server.once("error", onError);
+        this.server.once("listening", onListening);
+        this.server.listen(0, "127.0.0.1");
+      });
+    }
+    await this.listening;
+  }
+
+  private async handle(request: IncomingMessage, response: ServerResponse) {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      response.writeHead(405, { allow: "GET, HEAD" });
+      response.end();
+      return;
+    }
+    let url: URL;
+    try {
+      if (/(?:^|\/)(?:\.\.?|%2e|%2f|%5c)(?:\/|$)/iu.test(request.url ?? "")) {
+        throw new Error("Unsafe preview path.");
+      }
+      url = new URL(request.url ?? "/", "http://127.0.0.1");
+    } catch {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments[0] !== "preview" || segments.length < 4) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    let token: string;
+    try {
+      token = decodeURIComponent(segments[1] ?? "");
+    } catch {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    const route = this.routes.get(token);
+    if (!route || segments[2] !== `v${route.version}`) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    let relativePath: string;
+    try {
+      relativePath = decodeURIComponent(segments.slice(3).join("/"));
+    } catch {
+      response.writeHead(400);
+      response.end();
+      return;
+    }
+    const normalized = relativePathSchema.safeParse(relativePath);
+    if (!normalized.success || normalized.data !== relativePath) {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    try {
+      if (route.manifest) {
+        const artifact = await readArtifactDirectory(route.artifactDirectory);
+        if (
+          !artifact ||
+          JSON.stringify(artifact.manifest) !== JSON.stringify(route.manifest)
+        ) {
+          throw new Error("Artifact manifest changed.");
+        }
+        await verifyFinalizedRevisions(artifact);
+      }
+      await verifyRevisionFiles(route.root, route.files);
+    } catch {
+      response.writeHead(409, { "content-type": "text/plain; charset=utf-8" });
+      response.end("Finalized Revision files no longer match artifact.json.");
+      return;
+    }
+    const file = route.files.find(
+      (candidate) =>
+        candidate.kind === "file" && candidate.path === relativePath,
+    );
+    if (!file || file.kind !== "file") {
+      response.writeHead(404);
+      response.end();
+      return;
+    }
+    let body: Buffer;
+    let contentType = file.mediaType;
+    try {
+      if (
+        route.preview.adapter === "renderer" &&
+        route.preview.entryPath === relativePath
+      ) {
+        body = Buffer.from(
+          await rendererWrapper(route.preview.renderer, route.root, file.path),
+        );
+        contentType = "text/html";
+      } else {
+        body = await readFile(join(route.root, relativePath));
+      }
+    } catch {
+      response.writeHead(409, {
+        "content-type": "text/plain; charset=utf-8",
+      });
+      response.end("Finalized Revision files no longer match artifact.json.");
+      return;
+    }
+    const contentTypeHeader =
+      /^text\//u.test(contentType) ||
+      /^(?:application\/(?:javascript|json|typescript|xml)|image\/svg\+xml)$/u.test(
+        contentType,
+      )
+        ? `${contentType}; charset=utf-8`
+        : contentType;
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-security-policy":
+        "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'none'",
+      "content-type": contentTypeHeader,
+      "content-length": body.byteLength,
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    });
+    if (request.method === "GET") response.end(body);
+    else response.end();
+  }
+}
+
+async function rendererWrapper(
+  renderer: "react" | "markdown" | "mermaid" | "code",
+  root: string,
+  entryPath: string,
+) {
+  const source = (await readFile(join(root, entryPath))).toString("utf8");
+  const encodedSource = JSON.stringify(source).replace(/</gu, "\\u003c");
+  return `<!doctype html>
+<meta charset="utf-8">
+<meta name="panes-adapter" content="renderer:${renderer}">
+<title>Panes ${renderer} preview</title>
+<style>body{margin:0;padding:2rem;background:#fff;color:#111;font:16px/1.5 ui-monospace,monospace}pre{white-space:pre-wrap}</style>
+<main data-renderer="${renderer}" data-panes-renderer="${renderer}"><pre></pre></main>
+<script>const source=${encodedSource};document.querySelector("pre").textContent=source;</script>`;
+}
+
+function encodePreviewPath(path: string) {
+  return path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+function requestLoopback(url: string) {
+  return new Promise<{ statusCode?: number }>((resolve, reject) => {
+    const request = get(url, (response) => {
+      response.resume();
+      response.once("end", () => {
+        const statusCode = response.statusCode;
+        resolve(statusCode === undefined ? {} : { statusCode });
+      });
+    });
+    request.once("error", reject);
+  });
 }
 
 async function writeJson(path: string, value: unknown) {
