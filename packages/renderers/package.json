@@ -1,0 +1,14 @@
+{
+  "name": "@opencode-panes/renderers",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    "./react-build": {
+      "types": "./react-build.d.ts",
+      "import": "./react-build.js",
+      "default": "./react-build.js"
+    }
+  }
+}

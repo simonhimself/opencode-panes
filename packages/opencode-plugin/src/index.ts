@@ -21,8 +21,15 @@ import {
 import { homedir, platform } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { execFile, spawn } from "node:child_process";
+import { runInNewContext } from "node:vm";
 import { promisify } from "node:util";
 
+import { parseHTML } from "linkedom";
+import * as React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { createReactBuildOptions } from "@opencode-panes/renderers/react-build";
 import {
   MAX_ARTIFACT_SOURCE_BYTES,
   MAX_ARTIFACT_KIND_LENGTH,
@@ -59,6 +66,7 @@ const PROJECT_ID_FILE_NAME = ".panes-project.json";
 const PREPARE_STATE_FILE_NAME = ".panes-prepare.json";
 const FINALIZE_JOURNAL_FILE_NAME = ".panes-finalize.json";
 const execFileAsync = promisify(execFile);
+const ESBUILD_PACKAGE = "esbuild";
 
 const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description. After success, present viewerUrl exactly as returned, including its fragment; never shorten, sanitize, or rewrite that URL.`;
 
@@ -1442,14 +1450,13 @@ async function rendererWrapper(
   entryPath: string,
 ) {
   const source = (await readFile(join(root, entryPath))).toString("utf8");
-  const rendered =
-    renderer === "markdown"
-      ? renderMarkdown(source)
-      : renderer === "mermaid"
-        ? renderMermaid(source)
-        : renderer === "react"
-          ? renderReact(source)
-          : `<pre data-renderer="code"><code>${escapeHtml(source)}</code></pre>`;
+  const rendered = await (renderer === "markdown"
+    ? renderMarkdown(source)
+    : renderer === "mermaid"
+      ? renderMermaid(source)
+      : renderer === "react"
+        ? renderReact(source)
+        : `<pre data-renderer="code"><code>${escapeHtml(source)}</code></pre>`);
   return `<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="panes-adapter" content="renderer:${renderer}">
@@ -1458,164 +1465,201 @@ async function rendererWrapper(
 <body><main data-panes-renderer="${renderer}">${rendered}</main></body></html>`;
 }
 
-function renderMarkdown(source: string) {
-  const blocks: string[] = [];
-  let paragraph: string[] = [];
-  let list: string[] = [];
-  const flushParagraph = () => {
-    if (paragraph.length === 0) return;
-    blocks.push(`<p>${renderMarkdownInline(paragraph.join(" "))}</p>`);
-    paragraph = [];
-  };
-  const flushList = () => {
-    if (list.length === 0) return;
-    blocks.push(
-      `<ul>${list.map((item) => `<li>${renderMarkdownInline(item)}</li>`).join("")}</ul>`,
-    );
-    list = [];
-  };
-  for (const line of source.replaceAll("\r\n", "\n").split("\n")) {
-    const heading = line.match(/^(#{1,6})\s+(.+)$/u);
-    const item = line.match(/^\s*[-*+]\s+(.+)$/u);
-    if (heading) {
-      const level = heading[1];
-      const text = heading[2];
-      if (!level || !text) continue;
-      flushParagraph();
-      flushList();
-      blocks.push(
-        `<h${level.length}>${renderMarkdownInline(text)}</h${level.length}>`,
-      );
-    } else if (item) {
-      const text = item[1];
-      if (!text) continue;
-      flushParagraph();
-      list.push(text);
-    } else if (line.trim() === "") {
-      flushParagraph();
-      flushList();
-    } else {
-      flushList();
-      paragraph.push(line.trim());
+const MARKDOWN_COMPONENTS: Components = {
+  a({ children }) {
+    return React.createElement("span", null, children);
+  },
+  img({ alt, src }) {
+    if (
+      typeof src === "string" &&
+      /^data:image\/(?:gif|jpeg|png|webp);base64,/i.test(src)
+    ) {
+      return React.createElement("img", { alt: alt ?? "", src });
     }
-  }
-  flushParagraph();
-  flushList();
-  return `<article data-renderer="markdown">${blocks.join("")}</article>`;
+    return React.createElement("span", null, alt ?? "Image blocked");
+  },
+};
+
+function renderMarkdown(source: string) {
+  return renderToStaticMarkup(
+    React.createElement(
+      "article",
+      { "data-renderer": "markdown" },
+      React.createElement(
+        ReactMarkdown,
+        {
+          components: MARKDOWN_COMPONENTS,
+          remarkPlugins: [remarkGfm],
+          skipHtml: true,
+        },
+        source,
+      ),
+    ),
+  );
 }
 
-function renderMarkdownInline(value: string) {
-  const escaped = escapeHtml(value);
-  return escaped
-    .replace(/\*\*(.+?)\*\*/gu, "<strong>$1</strong>")
-    .replace(/__(.+?)__/gu, "<strong>$1</strong>")
-    .replace(/\*([^*]+)\*/gu, "<em>$1</em>")
-    .replace(/_([^_]+)_/gu, "<em>$1</em>");
-}
+let mermaidRenderQueue = Promise.resolve();
 
 function renderMermaid(source: string) {
-  const nodes = new Map<string, string>();
-  const edges: Array<[string, string]> = [];
-  for (const line of source.split(/\r?\n/u)) {
-    const match = line.match(
-      /^\s*([A-Za-z][\w-]*)(?:\[([^\]]+)\])?\s*-->\s*([A-Za-z][\w-]*)(?:\[([^\]]+)\])?\s*$/u,
-    );
-    if (!match) continue;
-    const [, from, fromLabel, to, toLabel] = match;
-    if (from && to) {
-      nodes.set(from, fromLabel ?? from);
-      nodes.set(to, toLabel ?? to);
-      edges.push([from, to]);
-    }
-  }
-  if (nodes.size === 0) nodes.set("diagram", source.trim() || "Diagram");
-  const nodeNames = [...nodes.keys()];
-  const positions = new Map(
-    nodeNames.map((name, index) => [name, { x: 80 + index * 180, y: 90 }]),
+  const render = mermaidRenderQueue.then(() => renderMermaidWithDom(source));
+  mermaidRenderQueue = render.then(
+    () => undefined,
+    () => undefined,
   );
-  const lines = edges
-    .map(([from, to]) => {
-      const start = positions.get(from);
-      const end = positions.get(to);
-      if (!start || !end) return "";
-      return `<line x1="${start.x + 70}" y1="${start.y}" x2="${end.x - 70}" y2="${end.y}" marker-end="url(#arrow)"/>`;
-    })
-    .join("");
-  const shapes = nodeNames
-    .map((name) => {
-      const position = positions.get(name);
-      if (!position) return "";
-      return `<g><rect x="${position.x - 70}" y="${position.y - 28}" width="140" height="56" rx="8"/><text x="${position.x}" y="${position.y + 6}" text-anchor="middle">${escapeHtml(nodes.get(name) ?? name)}</text></g>`;
-    })
-    .join("");
-  const width = Math.max(320, 160 + nodeNames.length * 180);
-  return `<svg data-renderer="mermaid" role="img" aria-label="Mermaid diagram" viewBox="0 0 ${width} 180" xmlns="http://www.w3.org/2000/svg"><defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L0,6 L6,3 z"/></marker></defs><g fill="#eef2ff" stroke="#4f46e5" stroke-width="2">${lines}${shapes}</g></svg>`;
+  return render;
 }
 
-function renderReact(source: string) {
-  const returned = source
-    .match(/\breturn\s+([\s\S]*?)(?:;\s*(?=\})|(?=\s*\}))/u)?.[1]
-    ?.trim();
-  const jsx = returned?.replace(/^\((.*)\)$/su, "$1");
-  const rendered = jsx ? renderJsxElement(jsx) : undefined;
-  return `<div id="root" data-react-mounted="true">${rendered ?? "<p>React component rendered without a visible root.</p>"}</div>`;
-}
-
-function renderJsxElement(source: string): string | undefined {
-  const match = source.match(/^<([A-Za-z][\w.-]*)([^>]*)>([\s\S]*)<\/\1>$/u);
-  const selfClosing = source.match(/^<([A-Za-z][\w.-]*)([^>]*)\/>$/u);
-  const element = match ?? selfClosing;
-  if (!element) return undefined;
-  const [, rawTag, rawAttributes, children] = element;
-  if (!rawTag || rawAttributes === undefined) return undefined;
-  const tag = /^[a-z]/u.test(rawTag) ? rawTag : "div";
-  const attributes = renderJsxAttributes(rawAttributes);
-  if (children === undefined) return `<${tag}${attributes}/>`;
-  const renderedChildren = renderJsxChildren(children);
-  return `<${tag}${attributes}>${renderedChildren}</${tag}>`;
-}
-
-function renderJsxChildren(source: string) {
-  let result = "";
-  let cursor = 0;
-  const tagPattern = /<([A-Za-z][\w.-]*)(?:\s[^>]*)?(?:\/?>)/gu;
-  for (const match of source.matchAll(tagPattern)) {
-    const index = match.index ?? 0;
-    result += escapeHtml(
-      source.slice(cursor, index).replace(/\{[^}]*\}/gu, ""),
+async function renderMermaidWithDom(source: string) {
+  const dom = parseHTML("<!doctype html><html><body></body></html>");
+  const globals = installMermaidDom(dom);
+  try {
+    const { default: createDOMPurify } = await import("dompurify");
+    const { default: mermaid } = await import("mermaid");
+    mermaid.initialize({
+      htmlLabels: false,
+      flowchart: { htmlLabels: false },
+      securityLevel: "strict",
+      startOnLoad: false,
+    });
+    const { svg } = await mermaid.render(
+      `panes-mermaid-${randomUUID()}`,
+      source,
     );
-    const tagSource = match[0];
-    if (tagSource.endsWith("/>")) {
-      result += renderJsxElement(tagSource) ?? "";
-      cursor = index + tagSource.length;
-    } else {
-      const tagName = match[1];
-      const close = source.indexOf(`</${tagName}>`, index + tagSource.length);
-      if (tagName && close >= 0) {
-        result +=
-          renderJsxElement(source.slice(index, close + tagName.length + 3)) ??
-          "";
-        cursor = close + tagName.length + 3;
+    return sanitizeMermaidSvg(svg, dom, createDOMPurify);
+  } finally {
+    globals.restore();
+  }
+}
+
+function installMermaidDom(dom: ReturnType<typeof parseHTML>) {
+  const window = dom.window;
+  const keys = [
+    "window",
+    "document",
+    "navigator",
+    "Element",
+    "HTMLElement",
+    "SVGElement",
+    "XMLSerializer",
+    "DOMParser",
+    "CSSStyleSheet",
+  ] as const;
+  const descriptors = new Map<string, PropertyDescriptor | undefined>();
+  for (const key of keys) {
+    descriptors.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+  }
+  for (const key of keys) {
+    const value =
+      key === "CSSStyleSheet"
+        ? (window.CSSStyleSheet ??
+          class CSSStyleSheet {
+            cssRules: unknown[] = [];
+            insertRule() {}
+            replaceSync() {}
+          })
+        : window[key];
+    Object.defineProperty(globalThis, key, {
+      configurable: true,
+      value,
+      writable: true,
+    });
+  }
+  const svgPrototype = window.SVGElement.prototype as SVGElement & {
+    getBBox?: () => { height: number; width: number; x: number; y: number };
+    getComputedTextLength?: () => number;
+  };
+  if (!svgPrototype.getBBox) {
+    svgPrototype.getBBox = () => ({
+      height: 20,
+      width: 100,
+      x: 0,
+      y: 0,
+    });
+  }
+  if (!svgPrototype.getComputedTextLength) {
+    svgPrototype.getComputedTextLength = function () {
+      return (this.textContent ?? "").length * 8;
+    };
+  }
+  return {
+    restore() {
+      for (const key of keys) {
+        const descriptor = descriptors.get(key);
+        if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+        else delete (globalThis as Record<string, unknown>)[key];
       }
-    }
-  }
-  result += escapeHtml(source.slice(cursor).replace(/\{[^}]*\}/gu, ""));
-  return result;
+    },
+  };
 }
 
-function renderJsxAttributes(source: string) {
-  const attributes: string[] = [];
-  for (const match of source.matchAll(
-    /([A-Za-z][\w-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'))?/gu,
-  )) {
-    const name = match[1];
-    const value = match[2] ?? match[3];
-    if (!name || name.startsWith("on") || value === undefined) continue;
-    attributes.push(
-      ` ${name === "className" ? "class" : name}="${escapeHtml(value)}"`,
-    );
+function sanitizeMermaidSvg(
+  source: string,
+  dom: ReturnType<typeof parseHTML>,
+  createPurifier: typeof import("dompurify").default,
+) {
+  const purifier = createPurifier(dom.window);
+  const clean = String(
+    purifier.sanitize(source, {
+      FORBID_ATTR: ["style"],
+      FORBID_TAGS: [
+        "script",
+        "style",
+        "foreignObject",
+        "iframe",
+        "object",
+        "embed",
+        "audio",
+        "video",
+      ],
+      RETURN_TRUSTED_TYPE: false,
+      USE_PROFILES: { svg: true, svgFilters: true },
+    }),
+  );
+  const document = new dom.window.DOMParser().parseFromString(
+    clean,
+    "image/svg+xml",
+  );
+  const root = document.documentElement;
+  if (root.localName !== "svg" || document.querySelector("parsererror")) {
+    throw new Error("Mermaid renderer did not produce one valid SVG root");
   }
-  return attributes.join("");
+  root.setAttribute("data-renderer", "mermaid");
+  return root.toString();
+}
+
+async function renderReact(source: string) {
+  const { build } = await import(ESBUILD_PACKAGE);
+  const result = await build(
+    createReactBuildOptions(source) as Parameters<typeof build>[0],
+  );
+  const compiled = result.outputFiles?.[0]?.text;
+  if (!compiled) throw new Error("React compiler did not emit JavaScript");
+
+  const sandbox: {
+    __PANES_COMPONENT__?: unknown;
+    __PANES_REACT__: typeof React;
+    __PANES_RENDERED__?: unknown;
+    __PANES_RENDER_TO_STATIC_MARKUP__: typeof renderToStaticMarkup;
+    globalThis?: unknown;
+  } = {
+    __PANES_REACT__: React,
+    __PANES_RENDER_TO_STATIC_MARKUP__: renderToStaticMarkup,
+  };
+  sandbox.globalThis = sandbox;
+  runInNewContext(compiled, sandbox, { timeout: 3_000 });
+  if (typeof sandbox.__PANES_COMPONENT__ !== "function") {
+    throw new Error("React compiler did not produce a component");
+  }
+  runInNewContext(
+    "globalThis.__PANES_RENDERED__ = __PANES_RENDER_TO_STATIC_MARKUP__(__PANES_REACT__.createElement(__PANES_COMPONENT__))",
+    sandbox,
+    { timeout: 3_000 },
+  );
+  if (typeof sandbox.__PANES_RENDERED__ !== "string") {
+    throw new Error("React runtime did not render a string");
+  }
+  const content = sandbox.__PANES_RENDERED__;
+  return `<div id="root" data-react-mounted="true">${content}</div>`;
 }
 
 function escapeHtml(value: string) {

@@ -167,6 +167,41 @@ describe("artifact_finalize tool", () => {
     ).toBe(source);
   });
 
+  it("executes GFM through the Markdown renderer on the Local preview surface", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "GFM Notes" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    const source =
+      "# Release\n\n| Area | Status |\n| --- | --- |\n| API | **ready** |\n\n- [x] shipped\n";
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "README.md"),
+      source,
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "README.md",
+        adapter: "renderer",
+        renderer: "markdown",
+      },
+      context,
+    );
+    const response = await getText(metadata(result).previewUrl as string);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toContain("<table>");
+    expect(response.body).toContain("<th>Area</th>");
+    expect(response.body).toContain("<strong>ready</strong>");
+    expect(response.body).toContain('type="checkbox"');
+    expect(response.body).toContain("shipped");
+  });
+
   it("renders Mermaid as an SVG diagram surface", async () => {
     const context = toolContext();
     const prepare = await executeTool(
@@ -193,9 +228,43 @@ describe("artifact_finalize tool", () => {
     const response = await getText(metadata(result).previewUrl as string);
 
     expect(response.status).toBe(200);
-    expect(response.body).toContain('<svg data-renderer="mermaid"');
-    expect(response.body).toContain(">Start</text>");
-    expect(response.body).toContain(">Finish</text>");
+    expect(response.body).toContain('data-renderer="mermaid"');
+    expect(response.body).toContain('class="flowchart"');
+    expect(response.body).toContain("Start");
+    expect(response.body).toContain("Finish");
+  });
+
+  it("executes non-trivial Mermaid syntax through the actual diagram renderer", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Decision Diagram" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "diagram.mmd"),
+      "flowchart LR\n  A[Start] --> B{Choice}\n  B -->|yes| C[Done]\n  B -->|no| D[Retry]",
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "diagram.mmd",
+        adapter: "renderer",
+        renderer: "mermaid",
+      },
+      context,
+    );
+    const response = await getText(metadata(result).previewUrl as string);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toContain('class="flowchart"');
+    expect(response.body).toContain('class="node default"');
+    expect(response.body).toContain("Choice");
+    expect(response.body).toContain("yes");
+    expect(response.body).toContain("no");
   });
 
   it("mounts a React entry as rendered DOM rather than a source listing", async () => {
@@ -230,6 +299,55 @@ describe("artifact_finalize tool", () => {
       '<div id="root" data-react-mounted="true"><button>Click me</button></div>',
     );
     expect(response.body).not.toContain("<pre>");
+  });
+
+  it("executes nested JSX, expressions, props, and state through the React compiler/runtime", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Interactive React" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    const source = `
+      import React, { useState } from "react";
+
+      function Badge({ label }) {
+        return <strong data-kind="badge">{label}</strong>;
+      }
+
+      export default function App() {
+        const [count] = useState(2);
+        return (
+          <section>
+            <h1>{\`Count: \${count}\`}</h1>
+            <Badge label="Ready" />
+          </section>
+        );
+      }
+    `;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "App.tsx"),
+      source,
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "App.tsx",
+        adapter: "renderer",
+        renderer: "react",
+      },
+      context,
+    );
+    const response = await getText(metadata(result).previewUrl as string);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toContain("<section>");
+    expect(response.body).toContain("<h1>Count: 2</h1>");
+    expect(response.body).toContain('<strong data-kind="badge">Ready</strong>');
+    expect(response.body).not.toContain("React component rendered without");
   });
 
   it("keeps code entries source-oriented", async () => {

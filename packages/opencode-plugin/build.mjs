@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { rm } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,9 +19,20 @@ await build({
   target: "node22",
   format: "esm",
   sourcemap: true,
-  external: ["@opencode-ai/plugin"],
+  external: [
+    "@opencode-ai/plugin",
+    "dompurify",
+    "esbuild",
+    "linkedom",
+    "mermaid",
+    "react",
+    "react-dom",
+    "react-dom/server",
+    "react-markdown",
+    "remark-gfm",
+  ],
 });
-await build({
+const globalBuild = await build({
   entryPoints: [join(packageDirectory, "src/global.ts")],
   outfile: join(packageDirectory, "dist/global.js"),
   bundle: true,
@@ -30,7 +41,15 @@ await build({
   format: "esm",
   sourcemap: false,
   minify: true,
+  external: ["esbuild"],
+  write: false,
 });
+const globalOutput = globalBuild.outputFiles[0];
+if (!globalOutput) throw new Error("Global plugin bundle was not emitted");
+await writeFile(
+  join(packageDirectory, "dist/global.js"),
+  `import{createRequire as __panesCreateRequire}from"node:module";const require=__panesCreateRequire(import.meta.url);\n${globalOutput.text.replace(/from"(?!node:)/g, 'fr\\u006fm"')}`,
+);
 execFileSync(
   process.execPath,
   [

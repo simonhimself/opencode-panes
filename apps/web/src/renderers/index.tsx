@@ -27,7 +27,7 @@ export function ArtifactRenderer({
     case "mermaid":
       return <MermaidArtifactRenderer onError={onError} source={source} />;
     case "markdown":
-      return <MarkdownArtifactRenderer source={source} />;
+      return <MarkdownArtifactRenderer enableGfm source={source} />;
     case "code":
       return <CodeArtifactRenderer source={source} />;
   }
