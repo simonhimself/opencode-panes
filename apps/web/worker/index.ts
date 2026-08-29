@@ -19,7 +19,10 @@ import {
 } from "@opencode-panes/contracts";
 import { cleanupTemporarySyncUploads, routeSyncRequest } from "./sync";
 import { verifyAccessRequest } from "./access";
-import { deleteInventoryArtifact } from "./deletion";
+import {
+  deleteInventoryArtifact,
+  deleteLegacyInventoryArtifact,
+} from "./deletion";
 import {
   inventoryResponse,
   loadInventory,
@@ -27,6 +30,7 @@ import {
   issueInventoryReconnectCode,
   rotateInventoryCreator,
 } from "./inventory";
+import { getLegacyArtifact, LEGACY_PRIVATE_TTL_MS } from "./legacy";
 
 // JSON can encode one UTF-8 source byte as a six-byte Unicode escape.
 export const MAX_JSON_BODY_BYTES = MAX_ARTIFACT_SOURCE_BYTES * 6 + 16 * 1024;
@@ -66,6 +70,8 @@ interface PublicShareRow extends RevisionRow {
   title: string;
   type: Artifact["type"];
   published_at: string;
+  public_expires_at: string | null;
+  revoked_at: string | null;
 }
 
 interface TimingSafeSubtleCrypto extends SubtleCrypto {
@@ -188,6 +194,16 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     return deleteInventoryArtifact(request, env, artifactId);
   }
 
+  const legacyInventoryDeletion = pathname.match(
+    /^\/api\/inventory\/legacy\/artifacts\/([^/]+)$/u,
+  );
+  if (legacyInventoryDeletion) {
+    if (request.method !== "DELETE") return methodNotAllowed(["DELETE"]);
+    const artifactId = parseArtifactId(legacyInventoryDeletion[1]);
+    if (artifactId instanceof Response) return artifactId;
+    return deleteLegacyInventoryArtifact(request, env, artifactId);
+  }
+
   if (pathname === "/api/artifacts") {
     if (request.method !== "POST") return methodNotAllowed(["POST"]);
     const admissionError = await requireCreateAdmission(
@@ -291,6 +307,17 @@ async function createArtifact(
          VALUES (?, ?, 1, ?, ?)`,
       )
       .bind(revisionId, artifactId, body.data.source, now),
+    db
+      .prepare(
+        `INSERT INTO legacy_artifacts
+          (artifact_id, migrated_at, private_expires_at)
+         VALUES (?, ?, ?)`,
+      )
+      .bind(
+        artifactId,
+        now,
+        new Date(Date.parse(now) + LEGACY_PRIVATE_TTL_MS).toISOString(),
+      ),
   ]);
 
   const artifact: Artifact = {
@@ -327,6 +354,8 @@ async function createRevision(
 ): Promise<Response> {
   const artifact = await authenticateOwner(request, db, artifactId);
   if (artifact instanceof Response) return artifact;
+  const legacyWriteError = await rejectLegacyWrite(db, artifactId);
+  if (legacyWriteError) return legacyWriteError;
 
   const body = await parseJsonBody(request, createRevisionRequestSchema);
   if (!body.ok) return body.response;
@@ -460,6 +489,8 @@ async function publishRevision(
 ): Promise<Response> {
   const artifact = await authenticateArtifact(request, db, artifactId, false);
   if (artifact instanceof Response) return artifact;
+  const legacyWriteError = await rejectLegacyWrite(db, artifactId);
+  if (legacyWriteError) return legacyWriteError;
 
   const body = await parsePublishBody(request);
   if (!body.ok) return body.response;
@@ -556,6 +587,8 @@ async function unpublishArtifact(
 ): Promise<Response> {
   const artifact = await authenticateArtifact(request, db, artifactId, false);
   if (artifact instanceof Response) return artifact;
+  const legacyWriteError = await rejectLegacyWrite(db, artifactId);
+  if (legacyWriteError) return legacyWriteError;
 
   await db
     .prepare(
@@ -582,18 +615,28 @@ async function getPublicShare(
          r.id,
          r.artifact_id,
          r.version,
-         r.source,
-         r.created_at,
-         s.created_at AS published_at
-       FROM shares s
-       JOIN artifacts a ON a.id = s.artifact_id
-       JOIN revisions r ON r.id = s.revision_id AND r.artifact_id = s.artifact_id
-       WHERE s.token_hash = ? AND s.revoked_at IS NULL`,
+          r.source,
+          r.created_at,
+          s.created_at AS published_at,
+          ls.public_expires_at,
+          s.revoked_at
+        FROM shares s
+        JOIN artifacts a ON a.id = s.artifact_id
+        JOIN revisions r ON r.id = s.revision_id AND r.artifact_id = s.artifact_id
+        LEFT JOIN legacy_shares ls ON ls.token_hash = s.token_hash
+        WHERE s.token_hash = ?`,
     )
     .bind(tokenHash)
     .first<PublicShareRow>();
 
   if (!row) return errorResponse(404, "NOT_FOUND", "Share not found");
+  if (row.revoked_at !== null)
+    return legacyGoneResponse("This legacy share has been revoked");
+  if (
+    row.public_expires_at !== null &&
+    row.public_expires_at <= new Date().toISOString()
+  )
+    return legacyGoneResponse("This legacy share has expired");
 
   return jsonResponse({
     artifact: {
@@ -620,6 +663,14 @@ async function authenticateArtifact(
   artifactId: string,
   ownerOnly: boolean,
 ): Promise<ArtifactRow | Response> {
+  const legacyArtifact = await getLegacyArtifact(db, artifactId);
+  if (
+    legacyArtifact &&
+    legacyArtifact.private_expires_at <= new Date().toISOString()
+  ) {
+    return legacyGoneResponse("This legacy artifact has expired");
+  }
+
   const authorization = request.headers.get("Authorization");
   const match = authorization?.match(/^Bearer ([^\s]+)$/);
   const token = match?.[1];
@@ -668,6 +719,18 @@ async function authenticateArtifact(
   }
 
   return artifact;
+}
+
+async function rejectLegacyWrite(
+  db: D1Database,
+  artifactId: string,
+): Promise<Response | undefined> {
+  const legacyArtifact = await getLegacyArtifact(db, artifactId);
+  if (!legacyArtifact) return undefined;
+  if (legacyArtifact.private_expires_at <= new Date().toISOString()) {
+    return legacyGoneResponse("This legacy artifact has expired");
+  }
+  return errorResponse(409, "CONFLICT", "Legacy artifacts are read-only");
 }
 
 async function parseJsonBody<T>(
@@ -937,7 +1000,7 @@ function preflightResponse(request: Request): Response {
     status: 204,
     headers: {
       "Access-Control-Allow-Headers": `Authorization, Content-Type, ${CREATE_KEY_HEADER}`,
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Methods": "DELETE, GET, POST, OPTIONS",
       "Access-Control-Allow-Origin": origin,
       "Access-Control-Max-Age": "600",
       Vary: "Origin",
@@ -1016,6 +1079,9 @@ function routeTemplate(pathname: string): string {
   if (/^\/api\/inventory\/artifacts\/[^/]+\/reconnect-code$/u.test(pathname)) {
     return "/api/inventory/artifacts/:artifactId/reconnect-code";
   }
+  if (/^\/api\/inventory\/legacy\/artifacts\/[^/]+$/u.test(pathname)) {
+    return "/api/inventory/legacy/artifacts/:artifactId";
+  }
   if (pathname === "/api/inventory") return "/api/inventory";
   return "unmatched";
 }
@@ -1092,6 +1158,14 @@ function errorResponse(
 ): Response {
   const error = issues ? { code, message, issues } : { code, message };
   return jsonResponse({ error }, status, extraHeaders);
+}
+
+function legacyGoneResponse(message: string): Response {
+  return errorResponse(410, "GONE", message, undefined, {
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+  });
 }
 
 function jsonResponse(

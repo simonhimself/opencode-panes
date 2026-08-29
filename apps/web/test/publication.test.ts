@@ -2,7 +2,6 @@ import {
   createArtifactResponseSchema,
   creatorWorkspaceResponseSchema,
   publicationSchema,
-  shareResponseSchema,
   syncCreateResponseSchema,
 } from "@opencode-panes/contracts";
 import { env } from "cloudflare:test";
@@ -197,28 +196,6 @@ async function syncRevision(
       )
     ).status,
   ).toBe(204);
-}
-
-async function legacyPublishedToken() {
-  const created = createArtifactResponseSchema.parse(
-    await (
-      await api(
-        "/api/artifacts",
-        jsonRequest({
-          title: "Legacy publication",
-          type: "html",
-          source: "<h1>legacy</h1>",
-          sessionId: `legacy-${crypto.randomUUID()}`,
-        }),
-      )
-    ).json(),
-  );
-  const response = await api(
-    `/api/artifacts/${created.artifact.id}/publish`,
-    jsonRequest({ revisionId: created.revision.id }, created.ownerToken),
-  );
-  const published = shareResponseSchema.parse(await response.json());
-  return new URL(published.publicUrl).pathname.split("/").at(-1)!;
 }
 
 describe("local-first publication lifecycle", () => {
@@ -508,8 +485,23 @@ describe("local-first publication lifecycle", () => {
     );
     expect((await api(`/api/publications/${token}`)).status).toBe(200);
 
-    const legacyToken = await legacyPublishedToken();
-    expect((await api(`/api/publications/${legacyToken}`)).status).toBe(404);
+    const legacyCreate = await api(
+      "/api/artifacts",
+      jsonRequest({
+        title: "Legacy publication",
+        type: "html",
+        source: "<h1>legacy</h1>",
+        sessionId: `legacy-${crypto.randomUUID()}`,
+      }),
+    );
+    const legacy = createArtifactResponseSchema.parse(
+      await legacyCreate.json(),
+    );
+    const legacyPublish = await api(
+      `/api/artifacts/${legacy.artifact.id}/publish`,
+      jsonRequest({ revisionId: legacy.revision.id }, legacy.ownerToken),
+    );
+    expect(legacyPublish.status).toBe(409);
     const unknownToken = "a".repeat(64);
     const unknownResponse = await api(`/api/publications/${unknownToken}`);
     expect(unknownResponse.status).toBe(404);

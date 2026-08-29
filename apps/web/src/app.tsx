@@ -1,5 +1,6 @@
 import type {
   Artifact,
+  InventoryLegacyArtifact,
   InventoryArtifact,
   Revision,
 } from "@opencode-panes/contracts";
@@ -33,6 +34,7 @@ import {
   includeRevision,
   issueInventoryReconnectCode,
   deleteInventoryArtifact,
+  deleteLegacyInventoryArtifact,
   extendInventoryPublication,
   republishInventoryPublication,
   rotateInventoryCreator,
@@ -151,7 +153,8 @@ function InventoryPage() {
     );
   }
   if (!inventory) return <LoadingState label="Loading cloud inventory" />;
-  if (inventory.projects.length === 0) {
+  const legacyArtifacts = inventory.legacyArtifacts ?? [];
+  if (inventory.projects.length === 0 && legacyArtifacts.length === 0) {
     return (
       <main className="inventory-shell" id="main-content">
         <InventoryHeader projectCount={0} />
@@ -172,6 +175,34 @@ function InventoryPage() {
   return (
     <main className="inventory-shell" id="main-content">
       <InventoryHeader projectCount={inventory.projects.length} />
+      {legacyArtifacts.length > 0 ? (
+        <section className="inventory-project" aria-labelledby="legacy-heading">
+          <header className="inventory-project-header">
+            <div>
+              <span className="eyebrow">LEGACY</span>
+              <h2 id="legacy-heading">Read-only cloud history</h2>
+            </div>
+            <span className="inventory-project-count">
+              {legacyArtifacts.length} artifact
+              {legacyArtifacts.length === 1 ? "" : "s"}
+            </span>
+          </header>
+          <div className="inventory-artifacts">
+            {legacyArtifacts.map((artifact) => (
+              <LegacyInventoryArtifactCard
+                artifact={artifact}
+                key={artifact.artifactId}
+                onRefresh={async () => {
+                  const loaded = await fetchInventory();
+                  setInventory(loaded);
+                  setError(undefined);
+                }}
+                onNotice={setCopyMessage}
+              />
+            ))}
+          </div>
+        </section>
+      ) : null}
       <div className="inventory-projects">
         {inventory.projects.map((project) => (
           <section
@@ -220,6 +251,95 @@ function InventoryPage() {
         {copyMessage}
       </div>
     </main>
+  );
+}
+
+function LegacyInventoryArtifactCard({
+  artifact,
+  onNotice,
+  onRefresh,
+}: {
+  artifact: InventoryLegacyArtifact;
+  onNotice: (message: string) => void;
+  onRefresh: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [confirmation, setConfirmation] = useState("");
+  const deletionConfirmation = `DELETE CLOUD COPY OF ${artifact.title}`;
+  const expired = artifact.status === "expired";
+  return (
+    <article className="inventory-card">
+      <header className="inventory-card-header">
+        <div>
+          <span className="eyebrow">LEGACY ARTIFACT</span>
+          <h3>{artifact.title}</h3>
+          <code>{artifact.artifactId}</code>
+        </div>
+        <span className={`inventory-state is-${artifact.status}`}>
+          {artifact.status}
+        </span>
+      </header>
+      <dl className="inventory-facts">
+        <div>
+          <dt>Revisions</dt>
+          <dd>{artifact.revisionCount}</dd>
+        </div>
+        <div>
+          <dt>Private access</dt>
+          <dd>{expired ? "expired" : "read-only"}</dd>
+        </div>
+        <div>
+          <dt>Expires</dt>
+          <dd>{formatInventoryTime(artifact.privateExpiresAt)}</dd>
+        </div>
+        <div>
+          <dt>Publication</dt>
+          <dd>
+            {artifact.publicationStatus === "none"
+              ? "none"
+              : `${artifact.publicationStatus}, expires ${formatInventoryTime(artifact.publicationExpiresAt)}`}
+          </dd>
+        </div>
+      </dl>
+      <p className="inventory-warning">
+        Legacy artifacts preserve their historical source and share records.
+        They cannot be edited, published, or extended.
+      </p>
+      <div className="inventory-delete-action">
+        <label htmlFor={`legacy-delete-${artifact.artifactId}`}>
+          Type <code>{deletionConfirmation}</code> to permanently remove this
+          Legacy artifact and its historical records.
+        </label>
+        <input
+          id={`legacy-delete-${artifact.artifactId}`}
+          onChange={(event) => setConfirmation(event.target.value)}
+          value={confirmation}
+        />
+        <button
+          className="inventory-danger"
+          disabled={busy || confirmation !== deletionConfirmation}
+          onClick={() => {
+            setBusy(true);
+            void deleteLegacyInventoryArtifact(
+              artifact.artifactId,
+              confirmation,
+            )
+              .then(
+                async () => {
+                  await onRefresh();
+                  onNotice(`${artifact.title}: Legacy artifact deleted`);
+                },
+                (error: unknown) =>
+                  onNotice(`${artifact.title}: ${apiErrorMessage(error)}`),
+              )
+              .finally(() => setBusy(false));
+          }}
+          type="button"
+        >
+          {busy ? "Deleting…" : "Delete Legacy artifact"}
+        </button>
+      </div>
+    </article>
   );
 }
 
@@ -635,7 +755,7 @@ function PrivateArtifactView({
   const [artifact, setArtifact] = useState<Artifact>();
   const [revisions, setRevisions] = useState<Revision[]>([]);
   const [selection, setSelection] = useState<RevisionSelection>();
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<unknown>();
   const [refreshError, setRefreshError] = useState<string>();
   const [notice, setNotice] = useState<Notice>();
   const currentRevisionVersion = useRef(0);
@@ -668,7 +788,7 @@ function PrivateArtifactView({
         ) {
           sessionStorage.removeItem(workspaceTokenStorageKey(artifactId));
         }
-        setError(apiErrorMessage(caught));
+        setError(caught);
       },
     );
     return () => controller.abort();
@@ -750,22 +870,33 @@ function PrivateArtifactView({
   }
 
   if (error) {
-    const invalidToken = error.startsWith("Access denied:");
+    const invalidToken =
+      error instanceof ApiError &&
+      (error.status === 401 || error.status === 403);
+    const expired = error instanceof ApiError && error.status === 410;
     return (
       <EntryState
         eyebrow={
-          invalidToken ? "Workspace access denied" : "API request failed"
+          invalidToken
+            ? "Workspace access denied"
+            : expired
+              ? "Legacy artifact expired"
+              : "API request failed"
         }
         title={
           invalidToken
             ? "The saved token is no longer valid."
-            : "The artifact could not be loaded."
+            : expired
+              ? "This legacy artifact has expired."
+              : "The artifact could not be loaded."
         }
       >
-        {error}{" "}
+        {apiErrorMessage(error)}{" "}
         {invalidToken
           ? "Open a fresh viewer URL from OpenCode."
-          : "Check the local server and reload this page."}
+          : expired
+            ? "Legacy artifacts are read-only and available only for a bounded period."
+            : "Check the local server and reload this page."}
       </EntryState>
     );
   }
@@ -862,13 +993,22 @@ function PublicArtifactView({ token }: { token: string }) {
   }, [token]);
 
   if (error) {
+    const expired = error.startsWith("This legacy share has expired");
     return (
       <EntryState
-        eyebrow="Public artifact unavailable"
-        title="This share cannot be opened."
+        eyebrow={
+          expired ? "Legacy share expired" : "Public artifact unavailable"
+        }
+        title={
+          expired
+            ? "This legacy share has expired."
+            : "This share cannot be opened."
+        }
       >
-        {error} The link may have been revoked or replaced by a newer published
-        version.
+        {error}{" "}
+        {expired
+          ? "Legacy shares are available only for a bounded period."
+          : "The link may have been revoked or replaced by a newer published version."}
       </EntryState>
     );
   }

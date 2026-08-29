@@ -25,6 +25,12 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 9. Panes stores an immutable revision and refreshes the creator view.
 10. The creator can copy, download, or publish a selected revision.
 
+Legacy compatibility is bounded. The legacy `artifact` route may create one v1
+cloud artifact for pre-Ticket-20 compatibility, but it immediately classifies
+that artifact as Legacy. Legacy reads remain available through their expiry;
+source revision, publication, and unpublish mutations are read-only failures.
+New iteration uses the local-first workflow above.
+
 ## MVP Scope
 
 ### Artifact Types

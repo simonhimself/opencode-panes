@@ -516,6 +516,22 @@ export async function deleteInventoryArtifact(
   );
 }
 
+export async function deleteLegacyInventoryArtifact(
+  artifactId: string,
+  confirmation: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> {
+  await requestJson<null>(
+    `/api/inventory/legacy/artifacts/${encodeURIComponent(artifactId)}`,
+    {
+      body: JSON.stringify({ confirmation }),
+      headers: { "Content-Type": "application/json" },
+      method: "DELETE",
+    },
+    fetcher,
+  );
+}
+
 export function publicFileUrl(
   token: string,
   path: string,

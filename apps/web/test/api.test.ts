@@ -1,12 +1,8 @@
 import {
-  MAX_ARTIFACT_REVISIONS,
   MAX_ARTIFACT_SOURCE_BYTES,
-  MAX_ARTIFACT_TOTAL_SOURCE_BYTES,
   WORKSPACE_TOKEN_FRAGMENT_KEY,
   createArtifactResponseSchema,
   errorEnvelopeSchema,
-  revisionResponseSchema,
-  shareResponseSchema,
 } from "@opencode-panes/contracts";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
@@ -17,18 +13,6 @@ const ORIGIN = "https://panes.example";
 interface RevisionList {
   artifactId: string;
   revisions: Array<{ id: string; version: number; source: string }>;
-}
-
-interface PublicShare {
-  artifact: { id: string; title: string; type: string };
-  revision: {
-    id: string;
-    artifactId: string;
-    version: number;
-    source: string;
-    createdAt: string;
-  };
-  publishedAt: string;
 }
 
 async function api(
@@ -66,25 +50,6 @@ async function createArtifact(source = "<h1>version one</h1>") {
   );
   expect(response.status).toBe(201);
   return createArtifactResponseSchema.parse(await response.json());
-}
-
-async function createRevision(
-  artifactId: string,
-  ownerToken: string,
-  source: string,
-) {
-  const response = await api(
-    `/api/artifacts/${artifactId}/revisions`,
-    jsonRequest({ source }, ownerToken),
-  );
-  expect(response.status).toBe(201);
-  return revisionResponseSchema.parse(await response.json());
-}
-
-function shareToken(publicUrl: string): string {
-  const token = new URL(publicUrl).pathname.split("/").at(-1);
-  if (!token) throw new Error("Public URL did not contain a share token");
-  return token;
 }
 
 function workspaceToken(viewerUrl: string): string {
@@ -163,78 +128,48 @@ describe("artifact API", () => {
     expect(amplifiedBodyResponse.status).toBe(201);
   });
 
-  it("enforces revision count and aggregate UTF-8 storage boundaries atomically", async () => {
-    const countBounded = await createArtifact("0");
-    let lastRevisionId = countBounded.revision.id;
-    for (let version = 2; version <= MAX_ARTIFACT_REVISIONS; version += 1) {
-      const revision = await createRevision(
-        countBounded.artifact.id,
-        countBounded.ownerToken,
-        String(version),
-      );
-      lastRevisionId = revision.revision.id;
-    }
-
-    const countConflict = await api(
-      `/api/artifacts/${countBounded.artifact.id}/revisions`,
-      jsonRequest({ source: "one too many" }, countBounded.ownerToken),
-    );
-    expect(countConflict.status).toBe(409);
-    expect(
-      errorEnvelopeSchema.parse(await countConflict.json()).error.code,
-    ).toBe("CONFLICT");
-
-    const countState = await env.DB.prepare(
-      `SELECT a.current_revision_id, COUNT(r.id) AS revision_count
-       FROM artifacts a
-       JOIN revisions r ON r.artifact_id = a.id
-       WHERE a.id = ?
-       GROUP BY a.id`,
+  it("atomically classifies first creation and bounds it as read-only", async () => {
+    const created = await createArtifact("exact first source");
+    const classification = await env.DB.prepare(
+      "SELECT migrated_at, private_expires_at FROM legacy_artifacts WHERE artifact_id = ?",
     )
-      .bind(countBounded.artifact.id)
-      .first<{ current_revision_id: string; revision_count: number }>();
-    expect(countState).toEqual({
-      current_revision_id: lastRevisionId,
-      revision_count: MAX_ARTIFACT_REVISIONS,
+      .bind(created.artifact.id)
+      .first<{ migrated_at: string; private_expires_at: string }>();
+    expect(classification).toEqual({
+      migrated_at: created.revision.createdAt,
+      private_expires_at: new Date(
+        Date.parse(created.revision.createdAt) + 30 * 24 * 60 * 60 * 1000,
+      ).toISOString(),
     });
 
-    const aggregateBounded = await createArtifact(
-      "a".repeat(MAX_ARTIFACT_SOURCE_BYTES),
+    const revision = await api(
+      `/api/artifacts/${created.artifact.id}/revisions`,
+      jsonRequest({ source: "must not be stored" }, created.ownerToken),
     );
-    const aggregateBoundary = await createRevision(
-      aggregateBounded.artifact.id,
-      aggregateBounded.ownerToken,
-      "é".repeat(MAX_ARTIFACT_SOURCE_BYTES / 2),
+    expect(revision.status).toBe(409);
+    expect(errorEnvelopeSchema.parse(await revision.json()).error.message).toBe(
+      "Legacy artifacts are read-only",
     );
-    const aggregateConflict = await api(
-      `/api/artifacts/${aggregateBounded.artifact.id}/revisions`,
-      jsonRequest({ source: "x" }, aggregateBounded.ownerToken),
-    );
-    expect(aggregateConflict.status).toBe(409);
-    expect(
-      errorEnvelopeSchema.parse(await aggregateConflict.json()).error.code,
-    ).toBe("CONFLICT");
 
-    const aggregateState = await env.DB.prepare(
-      `SELECT a.current_revision_id,
-              COUNT(r.id) AS revision_count,
-              SUM(length(CAST(r.source AS BLOB))) AS source_bytes
-       FROM artifacts a
-       JOIN revisions r ON r.artifact_id = a.id
-       WHERE a.id = ?
-       GROUP BY a.id`,
+    const stored = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM revisions WHERE artifact_id = ?",
     )
-      .bind(aggregateBounded.artifact.id)
-      .first<{
-        current_revision_id: string;
-        revision_count: number;
-        source_bytes: number;
-      }>();
-    expect(aggregateState).toEqual({
-      current_revision_id: aggregateBoundary.revision.id,
-      revision_count: 2,
-      source_bytes: MAX_ARTIFACT_TOTAL_SOURCE_BYTES,
-    });
+      .bind(created.artifact.id)
+      .first<{ count: number }>();
+    expect(stored?.count).toBe(1);
+
+    await env.DB.prepare(
+      "UPDATE legacy_artifacts SET private_expires_at = ? WHERE artifact_id = ?",
+    )
+      .bind("2020-01-01T00:00:00.000Z", created.artifact.id)
+      .run();
+    expect(
+      (
+        await api(`/api/artifacts/${created.artifact.id}`, {
+          headers: { Authorization: `Bearer ${created.ownerToken}` },
+        })
+      ).status,
+    ).toBe(410);
   });
 
   it("optionally requires the production artifact creation key", async () => {
@@ -291,10 +226,10 @@ describe("artifact API", () => {
       jsonRequest({ source: "owner update" }, created.ownerToken),
       protectedEnv,
     );
-    expect(ownerRevision.status).toBe(201);
+    expect(ownerRevision.status).toBe(409);
   });
 
-  it("requires owner authorization and increments immutable revisions", async () => {
+  it("requires owner authorization and preserves the immutable first revision", async () => {
     const created = await createArtifact();
     const artifactPath = `/api/artifacts/${created.artifact.id}`;
     const workspace = workspaceToken(created.viewerUrl);
@@ -325,12 +260,11 @@ describe("artifact API", () => {
     });
     expect(wrongToken.status).toBe(403);
 
-    const second = await createRevision(
-      created.artifact.id,
-      created.ownerToken,
-      "<h1>version two</h1>",
+    const rejectedRevision = await api(
+      `${artifactPath}/revisions`,
+      jsonRequest({ source: "<h1>version two</h1>" }, created.ownerToken),
     );
-    expect(second.revision.version).toBe(2);
+    expect(rejectedRevision.status).toBe(409);
 
     const currentResponse = await api(artifactPath, {
       headers: { Authorization: `Bearer ${created.ownerToken}` },
@@ -340,11 +274,11 @@ describe("artifact API", () => {
       artifact: { currentRevisionId: string };
       revision: { id: string; version: number; source: string };
     };
-    expect(current.artifact.currentRevisionId).toBe(second.revision.id);
+    expect(current.artifact.currentRevisionId).toBe(created.revision.id);
     expect(current.revision).toMatchObject({
-      id: second.revision.id,
-      version: 2,
-      source: "<h1>version two</h1>",
+      id: created.revision.id,
+      version: 1,
+      source: "<h1>version one</h1>",
     });
 
     const revisionsResponse = await api(`${artifactPath}/revisions`, {
@@ -352,8 +286,8 @@ describe("artifact API", () => {
     });
     expect(revisionsResponse.status).toBe(200);
     const revisions = (await revisionsResponse.json()) as RevisionList;
-    expect(revisions.revisions.map(({ version }) => version)).toEqual([2, 1]);
-    expect(revisions.revisions[1]?.source).toBe("<h1>version one</h1>");
+    expect(revisions.revisions.map(({ version }) => version)).toEqual([1]);
+    expect(revisions.revisions[0]?.source).toBe("<h1>version one</h1>");
 
     const stored = await env.DB.prepare(
       "SELECT owner_token_hash, workspace_token_hash FROM artifacts WHERE id = ?",
@@ -388,10 +322,7 @@ describe("artifact API", () => {
       `${artifactPath}/publish`,
       jsonRequest({ revisionId: created.revision.id }, workspace),
     );
-    expect(publishResponse.status).toBe(201);
-    const published = shareResponseSchema.parse(await publishResponse.json());
-    const publicToken = shareToken(published.publicUrl);
-    expect((await api(`/api/public/${publicToken}`)).status).toBe(200);
+    expect(publishResponse.status).toBe(409);
 
     const revisionResponse = await api(
       `${artifactPath}/revisions`,
@@ -411,111 +342,45 @@ describe("artifact API", () => {
       method: "POST",
       headers: workspaceHeaders,
     });
-    expect(unpublishResponse.status).toBe(204);
-    expect((await api(`/api/public/${publicToken}`)).status).toBe(404);
+    expect(unpublishResponse.status).toBe(409);
   });
 
-  it("pins a selected revision and isolates public data", async () => {
+  it("keeps the first revision private because Legacy publication is disabled", async () => {
     const created = await createArtifact("<h1>private version one</h1>");
-    const second = await createRevision(
-      created.artifact.id,
-      created.ownerToken,
-      "<h1>private version two</h1>",
-    );
-
     const publishResponse = await api(
       `/api/artifacts/${created.artifact.id}/publish`,
       jsonRequest({ revisionId: created.revision.id }, created.ownerToken),
     );
-    expect(publishResponse.status).toBe(201);
-    const published = shareResponseSchema.parse(await publishResponse.json());
-    expect(published.version).toBe(1);
-
-    const token = shareToken(published.publicUrl);
-    const publicResponse = await api(`/api/public/${token}`);
-    expect(publicResponse.status).toBe(200);
-    const publicShare = (await publicResponse.json()) as PublicShare;
-    expect(publicShare.revision).toMatchObject({
-      id: created.revision.id,
-      version: 1,
-      source: "<h1>private version one</h1>",
-    });
-    expect(Object.keys(publicShare.artifact).sort()).toEqual([
-      "id",
-      "title",
-      "type",
-    ]);
-
-    const third = await createRevision(
-      created.artifact.id,
-      created.ownerToken,
-      "<h1>private version three</h1>",
-    );
-    expect(third.revision.version).toBe(3);
-
-    const stillPinned = (await (
-      await api(`/api/public/${token}`)
-    ).json()) as PublicShare;
-    expect(stillPinned.revision.id).toBe(created.revision.id);
-
-    const serializedPublicData = JSON.stringify(stillPinned);
-    expect(serializedPublicData).not.toContain(created.ownerToken);
-    expect(serializedPublicData).not.toContain(
-      workspaceToken(created.viewerUrl),
-    );
-    expect(serializedPublicData).not.toContain("private-session-id");
-    expect(serializedPublicData).not.toContain(second.revision.source);
-    expect(serializedPublicData).not.toContain(third.revision.source);
-    expect(serializedPublicData).not.toContain(created.viewerUrl);
-
-    const storedShare = await env.DB.prepare(
-      "SELECT token_hash FROM shares WHERE artifact_id = ? AND revoked_at IS NULL",
+    expect(publishResponse.status).toBe(409);
+    const shares = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM shares WHERE artifact_id = ?",
     )
       .bind(created.artifact.id)
-      .first<{ token_hash: string }>();
-    expect(storedShare?.token_hash).toMatch(/^[0-9a-f]{64}$/);
-    expect(storedShare?.token_hash).not.toBe(token);
+      .first<{ count: number }>();
+    expect(shares?.count).toBe(0);
   });
 
-  it("keeps same-revision publication idempotent and replaces another active share", async () => {
+  it("rejects all Legacy publication attempts, including concurrent attempts", async () => {
     const created = await createArtifact();
-    const second = await createRevision(
-      created.artifact.id,
-      created.ownerToken,
-      "<h1>version two</h1>",
-    );
     const publishPath = `/api/artifacts/${created.artifact.id}/publish`;
 
     const firstResponse = await api(
       publishPath,
       jsonRequest({ revisionId: created.revision.id }, created.ownerToken),
     );
-    const first = shareResponseSchema.parse(await firstResponse.json());
-    const firstToken = shareToken(first.publicUrl);
+    expect(firstResponse.status).toBe(409);
 
-    // The existing token remains active. A 204 avoids generating or exposing a replacement.
     const idempotentResponse = await api(
       publishPath,
       jsonRequest({ revisionId: created.revision.id }, created.ownerToken),
     );
-    expect(idempotentResponse.status).toBe(204);
-    expect((await api(`/api/public/${firstToken}`)).status).toBe(200);
+    expect(idempotentResponse.status).toBe(409);
 
     const replacementResponse = await api(
       publishPath,
-      jsonRequest({ revisionId: second.revision.id }, created.ownerToken),
+      jsonRequest({ revisionId: created.revision.id }, created.ownerToken),
     );
-    expect(replacementResponse.status).toBe(201);
-    const replacement = shareResponseSchema.parse(
-      await replacementResponse.json(),
-    );
-    const replacementToken = shareToken(replacement.publicUrl);
-
-    expect((await api(`/api/public/${firstToken}`)).status).toBe(404);
-    const replacementPublic = (await (
-      await api(`/api/public/${replacementToken}`)
-    ).json()) as PublicShare;
-    expect(replacementPublic.revision.id).toBe(second.revision.id);
+    expect(replacementResponse.status).toBe(409);
   });
 
   it("allows only one concurrent same-revision publish to return a live URL", async () => {
@@ -533,44 +398,36 @@ describe("artifact API", () => {
       ),
     ]);
 
-    expect(responses.map(({ status }) => status).sort()).toEqual([201, 204]);
-    const createdResponse = responses.find(({ status }) => status === 201);
-    expect(createdResponse).toBeDefined();
-    const published = shareResponseSchema.parse(await createdResponse?.json());
-    expect(
-      (await api(`/api/public/${shareToken(published.publicUrl)}`)).status,
-    ).toBe(200);
+    expect(responses.map(({ status }) => status).sort()).toEqual([409, 409]);
 
     const activeShares = await env.DB.prepare(
       "SELECT COUNT(*) AS count FROM shares WHERE artifact_id = ? AND revoked_at IS NULL",
     )
       .bind(created.artifact.id)
       .first<{ count: number }>();
-    expect(activeShares?.count).toBe(1);
+    expect(activeShares?.count).toBe(0);
   });
 
-  it("revokes public access and makes unpublish idempotent", async () => {
+  it("rejects Legacy unpublish without mutating historical shares", async () => {
     const created = await createArtifact();
     const publishResponse = await api(
       `/api/artifacts/${created.artifact.id}/publish`,
       jsonRequest({ revisionId: created.revision.id }, created.ownerToken),
     );
-    const published = shareResponseSchema.parse(await publishResponse.json());
-    const token = shareToken(published.publicUrl);
+    expect(publishResponse.status).toBe(409);
     const unpublishPath = `/api/artifacts/${created.artifact.id}/unpublish`;
 
     const firstUnpublish = await api(unpublishPath, {
       method: "POST",
       headers: { Authorization: `Bearer ${created.ownerToken}` },
     });
-    expect(firstUnpublish.status).toBe(204);
-    expect((await api(`/api/public/${token}`)).status).toBe(404);
+    expect(firstUnpublish.status).toBe(409);
 
     const secondUnpublish = await api(unpublishPath, {
       method: "POST",
       headers: { Authorization: `Bearer ${created.ownerToken}` },
     });
-    expect(secondUnpublish.status).toBe(204);
+    expect(secondUnpublish.status).toBe(409);
   });
 
   it("allows only same-origin browser requests", async () => {

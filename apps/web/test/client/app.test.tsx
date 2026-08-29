@@ -152,6 +152,42 @@ describe("artifact workspace", () => {
     expect(container.textContent).not.toContain("read-only");
   });
 
+  it("renders Legacy inventory as read-only with deletion confirmation only", async () => {
+    const payload = {
+      projects: [],
+      legacyArtifacts: [
+        {
+          artifactId: "legacy-artifact",
+          title: "Archived artifact",
+          type: "html",
+          revisionCount: 3,
+          createdAt: "2026-08-01T10:00:00.000Z",
+          privateExpiresAt: "2026-08-31T10:00:00.000Z",
+          status: "active",
+          publicationStatus: "none",
+          publicationExpiresAt: null,
+        },
+      ],
+    };
+    const fetcher = vi.fn(async () => new Response(JSON.stringify(payload)));
+    vi.stubGlobal("fetch", fetcher);
+
+    await act(async () => {
+      root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+
+    expect(container.textContent).toContain("Read-only cloud history");
+    expect(container.textContent).toContain("Archived artifact");
+    expect(container.textContent).toContain(
+      "cannot be edited, published, or extended",
+    );
+    expect(container.querySelector("button")?.disabled).toBe(true);
+    expect(container.textContent).not.toContain("Rotate Creator link");
+    expect(container.textContent).not.toContain("Republish");
+    expect(container.textContent).not.toContain("Extend publication");
+  });
+
   it("requires the exact reconnect confirmation and keeps the issued code ephemeral", async () => {
     const writeText = vi.fn(async () => undefined);
     Object.defineProperty(navigator, "clipboard", {

@@ -556,8 +556,21 @@ export const inventoryProjectSchema = z.strictObject({
   artifacts: z.array(inventoryArtifactSchema),
 });
 
+export const inventoryLegacyArtifactSchema = z.strictObject({
+  artifactId: artifactIdSchema,
+  title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
+  type: artifactTypeSchema,
+  revisionCount: z.number().int().nonnegative().safe(),
+  createdAt: timestampSchema,
+  privateExpiresAt: timestampSchema,
+  status: z.enum(["active", "expired"]),
+  publicationStatus: z.enum(["none", "active", "expired", "revoked"]),
+  publicationExpiresAt: timestampSchema.nullable(),
+});
+
 export const inventoryResponseSchema = z.strictObject({
   projects: z.array(inventoryProjectSchema),
+  legacyArtifacts: z.array(inventoryLegacyArtifactSchema).optional(),
 });
 
 export const inventoryCreatorRotateResponseSchema = z.strictObject({
@@ -681,6 +694,9 @@ export type InventoryRevision = z.infer<typeof inventoryRevisionSchema>;
 export type InventoryPublication = z.infer<typeof inventoryPublicationSchema>;
 export type InventoryArtifact = z.infer<typeof inventoryArtifactSchema>;
 export type InventoryProject = z.infer<typeof inventoryProjectSchema>;
+export type InventoryLegacyArtifact = z.infer<
+  typeof inventoryLegacyArtifactSchema
+>;
 export type InventoryResponse = z.infer<typeof inventoryResponseSchema>;
 export type InventoryCreatorRotateResponse = z.infer<
   typeof inventoryCreatorRotateResponseSchema
@@ -800,6 +816,7 @@ export const API_ERROR_CODES = [
   "UNAUTHORIZED",
   "FORBIDDEN",
   "NOT_FOUND",
+  "GONE",
   "CONFLICT",
   "SOURCE_TOO_LARGE",
   "FILE_TOO_LARGE",

@@ -94,6 +94,33 @@ export async function deleteInventoryArtifact(
   }
 }
 
+export async function deleteLegacyInventoryArtifact(
+  request: Request,
+  env: Env,
+  artifactId: string,
+): Promise<Response> {
+  const body = await parseBody(request);
+  if (!body.ok) return errorResponse(400, "Request validation failed");
+
+  const artifact = await env.DB.prepare(
+    `SELECT a.title
+       FROM legacy_artifacts legacy
+       JOIN artifacts a ON a.id = legacy.artifact_id
+      WHERE legacy.artifact_id = ?`,
+  )
+    .bind(artifactId)
+    .first<{ title: string }>();
+  if (!artifact) return errorResponse(404, "Artifact not found");
+  if (body.value.confirmation !== cloudDeletionConfirmation(artifact.title)) {
+    return errorResponse(400, "The cloud deletion confirmation is not exact");
+  }
+
+  await env.DB.prepare("DELETE FROM artifacts WHERE id = ?")
+    .bind(artifactId)
+    .run();
+  return new Response(null, { status: 204 });
+}
+
 export function cloudDeletionConfirmation(title: string): string {
   return `DELETE CLOUD COPY OF ${title}`;
 }

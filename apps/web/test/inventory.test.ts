@@ -14,7 +14,7 @@ import {
   publicationSchema,
   syncReconnectResponseSchema,
 } from "@opencode-panes/contracts";
-import { reconnectCodeConfirmation } from "../worker/inventory";
+import { loadInventory, reconnectCodeConfirmation } from "../worker/inventory";
 import { readBoundedText } from "../worker/bounded-json";
 import { privateRevisionObjectKey } from "../worker/storage";
 
@@ -37,6 +37,7 @@ beforeEach(async () => {
   clearAccessJwksCache();
   vi.unstubAllGlobals();
   await env.DB.batch([
+    env.DB.prepare("DELETE FROM artifacts WHERE id LIKE 'inventory-legacy-%'"),
     env.DB.prepare("DELETE FROM artifact_deletion_objects"),
     env.DB.prepare("DELETE FROM artifact_deletion_tombstones"),
     env.DB.prepare("DELETE FROM publications"),
@@ -1218,6 +1219,55 @@ describe("authenticated cloud inventory", () => {
     );
     expect(response.status).toBe(401);
     expect(await response.text()).not.toContain(name);
+  });
+
+  it("returns Legacy artifacts in a separate minimal inventory group", async () => {
+    const now = "2026-08-29T12:00:00.000Z";
+    const artifactId = "inventory-legacy-artifact";
+    const revisionId = "inventory-legacy-revision";
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO artifacts
+          (id, owner_token_hash, workspace_token_hash, opencode_session_id,
+           title, type, current_revision_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        artifactId,
+        "a".repeat(64),
+        "b".repeat(64),
+        "inventory-legacy-session",
+        "Inventory Legacy",
+        "html",
+        revisionId,
+        now,
+        now,
+      ),
+      env.DB.prepare(
+        "INSERT INTO revisions (id, artifact_id, version, source, created_at) VALUES (?, ?, 1, ?, ?)",
+      ).bind(revisionId, artifactId, "<h1>legacy</h1>", now),
+      env.DB.prepare(
+        "INSERT INTO legacy_artifacts (artifact_id, migrated_at, private_expires_at) VALUES (?, ?, ?)",
+      ).bind(artifactId, now, "2026-09-28T12:00:00.000Z"),
+    ]);
+
+    const inventory = await loadInventory(
+      new Request(`${ORIGIN}/api/inventory`),
+      env,
+    );
+    expect(inventory.projects).toEqual([]);
+    expect(inventory.legacyArtifacts).toEqual([
+      {
+        artifactId,
+        title: "Inventory Legacy",
+        type: "html",
+        revisionCount: 1,
+        createdAt: now,
+        privateExpiresAt: "2026-09-28T12:00:00.000Z",
+        status: "active",
+        publicationStatus: "none",
+        publicationExpiresAt: null,
+      },
+    ]);
   });
 });
 

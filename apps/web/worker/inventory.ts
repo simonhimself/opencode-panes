@@ -9,6 +9,7 @@ import {
   inventoryResponseSchema,
   syncCreatorRotateRequestSchema,
   type InventoryResponse,
+  type InventoryLegacyArtifact,
 } from "@opencode-panes/contracts";
 import { decryptPublicationToken } from "./publication";
 import {
@@ -17,6 +18,7 @@ import {
 } from "./sync";
 import { mutatePublicationForInventory } from "./publication";
 import { readBoundedText } from "./bounded-json";
+import { listLegacyArtifacts } from "./legacy";
 
 const INVENTORY_BODY_LIMIT = 4096;
 const RECONNECT_CODE_ID_PREFIX = "owner-reconnect-";
@@ -236,7 +238,73 @@ export async function loadInventory(
     });
   }
 
-  return inventoryResponseSchema.parse({ projects: [...projects.values()] });
+  const legacyRows = await listLegacyArtifacts(env.DB);
+  const legacyArtifacts = await Promise.all(
+    legacyRows.map(async (legacy) => {
+      const row = await env.DB.prepare(
+        `SELECT a.title, a.type, a.created_at,
+                COUNT(r.id) AS revision_count
+           FROM artifacts a
+           LEFT JOIN revisions r ON r.artifact_id = a.id
+          WHERE a.id = ?
+          GROUP BY a.id, a.title, a.type, a.created_at`,
+      )
+        .bind(legacy.artifact_id)
+        .first<{
+          title: string;
+          type: InventoryLegacyArtifact["type"];
+          created_at: string;
+          revision_count: number;
+        }>();
+      if (!row) return undefined;
+      const publication = await env.DB.prepare(
+        `SELECT s.revoked_at, legacy_share.public_expires_at
+           FROM legacy_shares legacy_share
+           JOIN shares s ON s.token_hash = legacy_share.token_hash
+          WHERE legacy_share.artifact_id = ?
+          ORDER BY s.created_at DESC
+          LIMIT 1`,
+      )
+        .bind(legacy.artifact_id)
+        .first<{
+          revoked_at: string | null;
+          public_expires_at: string;
+        }>();
+      const publicationStatus = !publication
+        ? "none"
+        : publication.revoked_at !== null
+          ? "revoked"
+          : publication.public_expires_at <= now
+            ? "expired"
+            : "active";
+      return {
+        artifactId: legacy.artifact_id,
+        title: row.title,
+        type: row.type,
+        revisionCount: row.revision_count,
+        createdAt: row.created_at,
+        privateExpiresAt: legacy.private_expires_at,
+        status:
+          legacy.private_expires_at <= now
+            ? ("expired" as const)
+            : ("active" as const),
+        publicationStatus,
+        publicationExpiresAt: publication?.public_expires_at ?? null,
+      };
+    }),
+  );
+  const response = { projects: [...projects.values()] };
+  const presentLegacyArtifacts = legacyArtifacts.filter(
+    (artifact): artifact is NonNullable<typeof artifact> =>
+      artifact !== undefined,
+  );
+  if (presentLegacyArtifacts.length > 0) {
+    return inventoryResponseSchema.parse({
+      ...response,
+      legacyArtifacts: presentLegacyArtifacts,
+    });
+  }
+  return inventoryResponseSchema.parse(response);
 }
 
 async function recoverPublicUrl(
