@@ -5,6 +5,7 @@ import {
   type Artifact,
   type ArtifactType,
   type CreatorWorkspaceResponse,
+  type InventoryResponse,
   type PublicPublicationResponse,
   type Revision,
   type ShareResponse,
@@ -19,6 +20,7 @@ export type ViewerRoute =
   | { kind: "creator"; token: string }
   | { kind: "shared"; token: string }
   | { kind: "published"; token: string }
+  | { kind: "inventory" }
   | { kind: "home" }
   | { kind: "not-found" };
 
@@ -51,6 +53,7 @@ export interface PrivateWorkspaceData {
 
 export type CreatorWorkspaceData = CreatorWorkspaceResponse;
 export type PublicWorkspaceData = PublicPublicationResponse;
+export type InventoryData = InventoryResponse;
 export type PublicationDuration = 1 | 7 | 30;
 
 export interface RevisionSelection {
@@ -118,6 +121,8 @@ export class ApiError extends Error {
 
 export function parseViewerRoute(pathname: string): ViewerRoute {
   if (pathname === "/" || pathname === "") return { kind: "home" };
+  if (pathname === "/inventory" || pathname === "/inventory/")
+    return { kind: "inventory" };
 
   const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)\/?$/);
   if (artifactMatch) {
@@ -398,6 +403,17 @@ export function fetchPublicationStatus(
 ): Promise<PublicWorkspaceData> {
   return requestJson<PublicWorkspaceData>(
     `/api/publications/${encodeURIComponent(token)}`,
+    signal ? { signal } : {},
+    fetcher,
+  );
+}
+
+export function fetchInventory(
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<InventoryData> {
+  return requestJson<InventoryData>(
+    "/api/inventory",
     signal ? { signal } : {},
     fetcher,
   );

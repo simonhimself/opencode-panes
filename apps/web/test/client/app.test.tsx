@@ -61,6 +61,122 @@ describe("artifact workspace", () => {
       kind: "published",
       token: "local-first-token",
     });
+    expect(parseViewerRoute("/inventory")).toEqual({ kind: "inventory" });
+  });
+
+  it("renders a grouped read-only inventory and copies a recoverable URL", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              projects: [
+                {
+                  projectId: "project-demo",
+                  artifacts: [
+                    {
+                      artifactId: "artifact-demo",
+                      slug: "demo",
+                      title: "Demo artifact",
+                      kind: null,
+                      revisionCount: 2,
+                      storageBytes: 2048,
+                      lastSyncedAt: "2026-08-29T12:00:00.000Z",
+                      creatorLink: {
+                        status: "active",
+                        expiresAt: "2026-09-28T12:00:00.000Z",
+                      },
+                      publication: {
+                        status: "active",
+                        revisionVersion: 2,
+                        expiresAt: "2026-09-05T12:00:00.000Z",
+                        publicUrl:
+                          "https://panes.example/published/public-token",
+                      },
+                      warnings: [
+                        "The active public URL could not be recovered.",
+                      ],
+                    },
+                  ],
+                },
+              ],
+            }),
+          ),
+      ),
+    );
+
+    await act(async () => {
+      root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+
+    expect(container.textContent).toContain("project-demo");
+    expect(container.textContent).toContain("Demo artifact");
+    expect(container.textContent).toContain(
+      "The active public URL could not be recovered.",
+    );
+    const copy = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Copy public URL",
+    );
+    await act(async () => {
+      copy?.click();
+      await settle();
+    });
+    expect(writeText).toHaveBeenCalledWith(
+      "https://panes.example/published/public-token",
+    );
+    expect(container.textContent).toContain("public URL copied");
+    expect(container.textContent).not.toContain("owner_token_hash");
+  });
+
+  it.each([
+    [401, "Inventory access denied", "approved Access identity"],
+    [503, "Inventory unavailable", "could not be loaded"],
+  ] as const)(
+    "renders inventory failure state %s",
+    async (status, eyebrow, title) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                error: { code: "UNAUTHORIZED", message: "generic" },
+              }),
+              {
+                status,
+              },
+            ),
+        ),
+      );
+      await act(async () => {
+        root.render(<App route={{ kind: "inventory" }} />);
+        await settle();
+      });
+      expect(container.textContent).toContain(eyebrow);
+      expect(container.textContent).toContain(title);
+      expect(container.textContent).not.toContain("generic");
+    },
+  );
+
+  it("renders an empty inventory without lifecycle controls", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ projects: [] }))),
+    );
+    await act(async () => {
+      root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+    expect(container.textContent).toContain("Your cloud shelf is clear.");
+    expect(container.textContent).not.toContain("Publish");
+    expect(container.textContent).not.toContain("Delete");
   });
   it("preserves raw source as text in code mode", () => {
     const source = '<script>alert("raw")</script>\n# heading';

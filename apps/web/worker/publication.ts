@@ -57,6 +57,14 @@ interface PublicationRow {
   revoked_at: string | null;
 }
 
+export interface PublicationTokenCiphertext {
+  id: string;
+  artifactId: string;
+  tokenCiphertext: string | null;
+  tokenNonce: string | null;
+  encryptionKeyVersion: number | null;
+}
+
 interface RevisionRow {
   id: string;
   version: number;
@@ -256,7 +264,13 @@ async function mutatePublication(
       Date.parse(active.expires_at) > nowDate.getTime() &&
       active.revision_version === revision.version
     ) {
-      const token = await decryptToken(env, active);
+      const token = await decryptPublicationToken(env, {
+        id: active.id,
+        artifactId: active.artifact_id,
+        tokenCiphertext: active.token_ciphertext,
+        tokenNonce: active.token_nonce,
+        encryptionKeyVersion: active.encryption_key_version,
+      });
       return publicationResponse(request, active, token, 200);
     }
 
@@ -354,7 +368,13 @@ async function extendPublication(
     .first<PublicationRow>();
   if (!updated || updated.status !== "active")
     return conflict("Publication is no longer active; use Republish instead");
-  const token = await decryptToken(env, updated);
+  const token = await decryptPublicationToken(env, {
+    id: updated.id,
+    artifactId: updated.artifact_id,
+    tokenCiphertext: updated.token_ciphertext,
+    tokenNonce: updated.token_nonce,
+    encryptionKeyVersion: updated.encryption_key_version,
+  });
   return publicationResponse(request, updated, token, 200);
 }
 
@@ -864,14 +884,17 @@ async function encryptToken(
   };
 }
 
-async function decryptToken(env: Env, row: PublicationRow): Promise<string> {
+export async function decryptPublicationToken(
+  env: Env,
+  row: PublicationTokenCiphertext,
+): Promise<string> {
   if (
-    row.encryption_key_version !== PUBLICATION_KEY_VERSION ||
-    !row.token_ciphertext ||
-    !row.token_nonce
+    row.encryptionKeyVersion !== PUBLICATION_KEY_VERSION ||
+    !row.tokenCiphertext ||
+    !row.tokenNonce
   )
     throw new Error("Publication token ciphertext is unavailable");
-  const nonce = hexToBytes(row.token_nonce);
+  const nonce = hexToBytes(row.tokenNonce);
   if (!nonce || nonce.byteLength !== 12)
     throw new Error("Publication nonce is malformed");
   const key = await encryptionKey(env, "decrypt");
@@ -880,11 +903,11 @@ async function decryptToken(env: Env, row: PublicationRow): Promise<string> {
       {
         name: "AES-GCM",
         iv: nonce.buffer as ArrayBuffer,
-        additionalData: new TextEncoder().encode(aad(row.artifact_id, row.id))
+        additionalData: new TextEncoder().encode(aad(row.artifactId, row.id))
           .buffer as ArrayBuffer,
       },
       key,
-      decodeBase64(row.token_ciphertext).buffer as ArrayBuffer,
+      decodeBase64(row.tokenCiphertext).buffer as ArrayBuffer,
     );
     const token = new TextDecoder("utf-8", { fatal: true }).decode(plaintext);
     if (!ownerTokenSchema.safeParse(token).success)

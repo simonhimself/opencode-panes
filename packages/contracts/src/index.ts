@@ -517,6 +517,40 @@ export const publicPublicationResponseSchema = z.strictObject({
   revision: publicPublicationRevisionSchema,
 });
 
+export const inventoryCreatorLinkSchema = z.strictObject({
+  status: z.enum(["active", "expired", "revoked"]),
+  expiresAt: timestampSchema,
+});
+
+export const inventoryPublicationSchema = z.strictObject({
+  status: z.enum(["none", "active", "expired", "revoked"]),
+  revisionVersion: revisionNumberSchema.nullable(),
+  expiresAt: timestampSchema.nullable(),
+  publicUrl: urlSchema.optional(),
+});
+
+export const inventoryArtifactSchema = z.strictObject({
+  artifactId: identifierSchema,
+  slug: artifactSlugSchema,
+  title: z.string().min(1).max(MAX_ARTIFACT_TITLE_LENGTH),
+  kind: z.string().min(1).max(MAX_ARTIFACT_KIND_LENGTH).nullable(),
+  revisionCount: z.number().int().nonnegative().safe(),
+  storageBytes: z.number().int().nonnegative().safe(),
+  lastSyncedAt: timestampSchema.nullable(),
+  creatorLink: inventoryCreatorLinkSchema,
+  publication: inventoryPublicationSchema,
+  warnings: z.array(z.string().min(1).max(256)),
+});
+
+export const inventoryProjectSchema = z.strictObject({
+  projectId: identifierSchema,
+  artifacts: z.array(inventoryArtifactSchema),
+});
+
+export const inventoryResponseSchema = z.strictObject({
+  projects: z.array(inventoryProjectSchema),
+});
+
 export type ArtifactManifest = z.infer<typeof artifactManifestSchema>;
 export type CloudArtifactMapping = z.infer<typeof cloudArtifactMappingSchema>;
 export type CloudManifest = z.infer<typeof cloudManifestSchema>;
@@ -566,6 +600,11 @@ export type PublicArtifactPresentation = z.infer<
 export type PublicPublicationResponse = z.infer<
   typeof publicPublicationResponseSchema
 >;
+export type InventoryCreatorLink = z.infer<typeof inventoryCreatorLinkSchema>;
+export type InventoryPublication = z.infer<typeof inventoryPublicationSchema>;
+export type InventoryArtifact = z.infer<typeof inventoryArtifactSchema>;
+export type InventoryProject = z.infer<typeof inventoryProjectSchema>;
+export type InventoryResponse = z.infer<typeof inventoryResponseSchema>;
 
 export const deriveCloudManifest = (
   manifest: unknown,
@@ -670,6 +709,7 @@ export const API_ERROR_CODES = [
   "REVISION_TOO_LARGE",
   "HASH_MISMATCH",
   "INTERNAL_ERROR",
+  "SERVICE_UNAVAILABLE",
 ] as const;
 
 export const apiErrorCodeSchema = z.enum(API_ERROR_CODES);

@@ -18,6 +18,8 @@ import {
   type Revision,
 } from "@opencode-panes/contracts";
 import { cleanupTemporarySyncUploads, routeSyncRequest } from "./sync";
+import { verifyAccessRequest } from "./access";
+import { inventoryResponse, loadInventory } from "./inventory";
 
 // JSON can encode one UTF-8 source byte as a six-byte Unicode escape.
 export const MAX_JSON_BODY_BYTES = MAX_ARTIFACT_SOURCE_BYTES * 6 + 16 * 1024;
@@ -115,6 +117,21 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
 
   const syncResponse = await routeSyncRequest(request, env);
   if (syncResponse) return syncResponse;
+
+  if (pathname === "/api/inventory") {
+    if (request.method !== "GET") return methodNotAllowed(["GET"]);
+    const access = await verifyAccessRequest(request, env);
+    if (!access.ok) {
+      return errorResponse(
+        access.status,
+        access.status === 503 ? "SERVICE_UNAVAILABLE" : "UNAUTHORIZED",
+        access.status === 503
+          ? "Inventory authentication is unavailable"
+          : "Inventory authentication is required",
+      );
+    }
+    return inventoryResponse(await loadInventory(request, env));
+  }
 
   if (pathname === "/api/artifacts") {
     if (request.method !== "POST") return methodNotAllowed(["POST"]);
@@ -941,6 +958,7 @@ function routeTemplate(pathname: string): string {
   if (/^\/api\/artifacts\/[^/]+$/.test(pathname)) {
     return "/api/artifacts/:artifactId";
   }
+  if (pathname === "/api/inventory") return "/api/inventory";
   return "unmatched";
 }
 

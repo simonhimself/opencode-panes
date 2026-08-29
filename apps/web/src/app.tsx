@@ -21,6 +21,7 @@ import {
   fetchPrivateRevisions,
   fetchPrivateWorkspace,
   fetchCreatorWorkspace,
+  fetchInventory,
   fetchPublicArtifact,
   fetchPublicationStatus,
   followCurrentRevision,
@@ -76,6 +77,7 @@ export function App({ route, workspaceAccess }: AppProps) {
     return <PublicArtifactView token={route.token} />;
   if (route.kind === "published")
     return <PublishedArtifactView token={route.token} />;
+  if (route.kind === "inventory") return <InventoryPage />;
   if (route.kind === "not-found") {
     return (
       <EntryState
@@ -94,6 +96,208 @@ export function App({ route, workspaceAccess }: AppProps) {
       <code>/shared/:token</code>. New publications use{" "}
       <code>/published/:token</code>.
     </EntryState>
+  );
+}
+
+function InventoryPage() {
+  const [inventory, setInventory] =
+    useState<Awaited<ReturnType<typeof fetchInventory>>>();
+  const [error, setError] = useState<unknown>();
+  const [copyMessage, setCopyMessage] = useState<string>();
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchInventory(fetch, controller.signal).then(
+      (loaded) => {
+        setInventory(loaded);
+        setError(undefined);
+      },
+      (caught: unknown) => {
+        if (!controller.signal.aborted) setError(caught);
+      },
+    );
+    return () => controller.abort();
+  }, []);
+
+  if (error) {
+    const unauthorized =
+      error instanceof ApiError &&
+      (error.status === 401 || error.status === 403);
+    return (
+      <EntryState
+        eyebrow={
+          unauthorized ? "Inventory access denied" : "Inventory unavailable"
+        }
+        title={
+          unauthorized
+            ? "This cloud inventory requires your approved Access identity."
+            : "The cloud inventory could not be loaded."
+        }
+      >
+        {unauthorized
+          ? "Sign in through Cloudflare Access with the approved account, then reload this page."
+          : "Reload the page or try again later."}
+      </EntryState>
+    );
+  }
+  if (!inventory) return <LoadingState label="Loading cloud inventory" />;
+  if (inventory.projects.length === 0) {
+    return (
+      <main className="inventory-shell" id="main-content">
+        <InventoryHeader projectCount={0} />
+        <section
+          className="inventory-empty"
+          aria-labelledby="inventory-empty-title"
+        >
+          <span className="eyebrow">NO SYNCHRONIZED ARTIFACTS</span>
+          <h1 id="inventory-empty-title">Your cloud shelf is clear.</h1>
+          <p>
+            Sync a local Artifact from OpenCode to see its cloud history here.
+          </p>
+        </section>
+      </main>
+    );
+  }
+
+  return (
+    <main className="inventory-shell" id="main-content">
+      <InventoryHeader projectCount={inventory.projects.length} />
+      <div className="inventory-projects">
+        {inventory.projects.map((project) => (
+          <section
+            className="inventory-project"
+            key={project.projectId}
+            aria-labelledby={`project-${project.projectId}`}
+          >
+            <header className="inventory-project-header">
+              <div>
+                <span className="eyebrow">PROJECT</span>
+                <h2 id={`project-${project.projectId}`}>{project.projectId}</h2>
+              </div>
+              <span className="inventory-project-count">
+                {project.artifacts.length} artifact
+                {project.artifacts.length === 1 ? "" : "s"}
+              </span>
+            </header>
+            <div className="inventory-artifacts">
+              {project.artifacts.map((artifact) => (
+                <InventoryArtifactCard
+                  artifact={artifact}
+                  copyMessage={copyMessage}
+                  key={artifact.artifactId}
+                  onCopy={async () => {
+                    if (!artifact.publication.publicUrl) return;
+                    try {
+                      await copyText(artifact.publication.publicUrl);
+                      setCopyMessage(`${artifact.title} public URL copied`);
+                    } catch {
+                      setCopyMessage("Clipboard access is unavailable");
+                    }
+                  }}
+                />
+              ))}
+            </div>
+          </section>
+        ))}
+      </div>
+      <div className="inventory-feedback" aria-live="polite">
+        {copyMessage}
+      </div>
+    </main>
+  );
+}
+
+function InventoryHeader({ projectCount }: { projectCount: number }) {
+  return (
+    <header className="inventory-header">
+      <div className="inventory-heading">
+        <span className="brand-mark" aria-hidden="true">
+          OP
+        </span>
+        <div>
+          <span className="eyebrow">CLOUD INVENTORY</span>
+          <h1>Everything synchronized, in one quiet view.</h1>
+        </div>
+      </div>
+      <p className="inventory-summary">
+        {projectCount} project{projectCount === 1 ? "" : "s"} · read-only
+      </p>
+    </header>
+  );
+}
+
+function InventoryArtifactCard({
+  artifact,
+  copyMessage,
+  onCopy,
+}: {
+  artifact: Awaited<
+    ReturnType<typeof fetchInventory>
+  >["projects"][number]["artifacts"][number];
+  copyMessage?: string | undefined;
+  onCopy: () => Promise<void>;
+}) {
+  const publication = artifact.publication;
+  return (
+    <article className="inventory-card">
+      <header className="inventory-card-header">
+        <div>
+          <span className="eyebrow">ARTIFACT</span>
+          <h3>{artifact.title}</h3>
+          <code>{artifact.slug}</code>
+        </div>
+        <span className={`inventory-state is-${publication.status}`}>
+          {publication.status}
+        </span>
+      </header>
+      <dl className="inventory-facts">
+        <div>
+          <dt>Revisions</dt>
+          <dd>{artifact.revisionCount}</dd>
+        </div>
+        <div>
+          <dt>Committed storage</dt>
+          <dd>{formatBytes(artifact.storageBytes)}</dd>
+        </div>
+        <div>
+          <dt>Last Sync</dt>
+          <dd>{formatInventoryTime(artifact.lastSyncedAt)}</dd>
+        </div>
+        <div>
+          <dt>Creator link</dt>
+          <dd>
+            {artifact.creatorLink.status}, expires{" "}
+            {formatInventoryTime(artifact.creatorLink.expiresAt)}
+          </dd>
+        </div>
+        <div>
+          <dt>Publication</dt>
+          <dd>
+            {publication.status === "none"
+              ? "none"
+              : `v${publication.revisionVersion}, expires ${formatInventoryTime(publication.expiresAt)}`}
+          </dd>
+        </div>
+      </dl>
+      {publication.publicUrl ? (
+        <div className="inventory-public-link">
+          <a href={publication.publicUrl} rel="noreferrer" target="_blank">
+            {publication.publicUrl}
+          </a>
+          <button onClick={() => void onCopy()} type="button">
+            Copy public URL
+          </button>
+          {copyMessage?.startsWith(artifact.title) ? (
+            <span role="status">{copyMessage}</span>
+          ) : null}
+        </div>
+      ) : null}
+      {artifact.warnings.map((warning) => (
+        <p className="inventory-warning" key={warning} role="alert">
+          {warning}
+        </p>
+      ))}
+    </article>
   );
 }
 
@@ -844,4 +1048,20 @@ function formatTimestamp(value: string): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date);
+}
+
+function formatInventoryTime(value: string | null): string {
+  if (!value) return "not recorded";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "unknown";
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
 }

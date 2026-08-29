@@ -4,6 +4,19 @@
   "main": "./worker/index.ts",
   "compatibility_date": "2026-08-18",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    // This is an admission policy value, not credential material. The Access
+    // issuer and application audience are deployment inputs and are omitted
+    // here deliberately, so dry runs cannot publish fake production values.
+    "PANES_ACCESS_ALLOWED_EMAIL": "simonhimself@gmail.com",
+  },
+  // Deferred to Ticket 23's approved deployment:
+  // PANES_ACCESS_ISSUER = the exact HTTPS team domain, for example
+  // https://<team-name>.cloudflareaccess.com
+  // PANES_ACCESS_AUDIENCE = the Access application's AUD tag.
+  // Create one self-hosted Access application with paths /inventory and
+  // /api/inventory* only. Its sole Allow policy includes the exact email above.
+  // Do not protect creator, public, legacy, or capability routes.
   // Production admission control. Upload the value as an encrypted Worker secret.
   "secrets": {
     // Versioned AES-GCM key material. Set with `wrangler secret put`; never
