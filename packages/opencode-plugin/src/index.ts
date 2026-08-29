@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   createServer,
   get,
@@ -58,6 +59,7 @@ import {
   type ArtifactManifest,
   type ArtifactFile,
   type ArtifactType,
+  type Draft,
   type FinalizedRevision,
   type PreviewEntry,
 } from "@opencode-panes/contracts";
@@ -69,7 +71,9 @@ const STATE_DIRECTORY_NAME = "opencode-panes";
 const PROJECT_ID_FILE_NAME = ".panes-project.json";
 const PREPARE_STATE_FILE_NAME = ".panes-prepare.json";
 const FINALIZE_JOURNAL_FILE_NAME = ".panes-finalize.json";
+const IMPORT_JOURNAL_FILE_NAME = ".panes-import.json";
 const ARTIFACT_LOCK_FILE_NAME = ".panes-lock.json";
+const IMPORT_RECEIPT_TTL_MS = 5 * 60 * 1000;
 const PREVIEW_FRAME_PATH = "__panes__/frame";
 const execFileAsync = promisify(execFile);
 const PROCESS_OWNER_ID = randomUUID();
@@ -110,6 +114,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
   const options = resolveOptions(pluginOptions);
   const previewServer = new LocalPreviewServer();
   const locks = new Map<string, Promise<void>>();
+  const importReceipts = new Map<string, ImportReceipt>();
 
   return {
     tool: {
@@ -233,6 +238,87 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
           return prepareArtifact(args, context, locks, previewServer);
         },
       }),
+      artifact_import: tool({
+        description:
+          "Import one existing file or directory into a project-local Panes Draft through a temporary copy. The source is never changed by ordinary import. A verification receipt is returned for a separate, explicitly confirmed source deletion.",
+        args: {
+          sourcePath: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .optional()
+            .describe("Existing file or directory to copy."),
+          source: tool.schema
+            .string()
+            .optional()
+            .describe(
+              "One-file convenience source text. Use filename with this form.",
+            ),
+          filename: tool.schema
+            .string()
+            .min(1)
+            .max(1024)
+            .optional()
+            .describe("Destination path for one-file source convenience."),
+          artifactId: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^\S+$/)
+            .optional()
+            .describe("Existing local Artifact ID to receive the import."),
+          title: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(200)
+            .optional()
+            .describe("Title for a new imported Artifact."),
+          slug: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe("Safe directory slug for a new imported Artifact."),
+          kind: tool.schema
+            .string()
+            .trim()
+            .min(1)
+            .max(MAX_ARTIFACT_KIND_LENGTH)
+            .optional()
+            .describe("Optional descriptive kind for a new Artifact."),
+          destinationPath: tool.schema
+            .string()
+            .min(1)
+            .max(1024)
+            .optional()
+            .describe(
+              "Relative Draft path. Directory sources default to the Draft root.",
+            ),
+          collision: tool.schema
+            .enum(["error", "replace"])
+            .optional()
+            .describe("Required as replace when an import destination exists."),
+          verificationReceipt: tool.schema
+            .string()
+            .min(1)
+            .max(128)
+            .optional()
+            .describe("Receipt returned by a successful source import."),
+          deleteSource: tool.schema
+            .boolean()
+            .optional()
+            .describe("Request the separate source deletion action."),
+          confirmDeletion: tool.schema
+            .boolean()
+            .optional()
+            .describe("Explicitly confirm deletion of the verified source."),
+        },
+        async execute(args, context) {
+          return importArtifact(args, context, locks, importReceipts);
+        },
+      }),
       artifact_discover: tool({
         description:
           "Scan the current project artifact root for valid local Panes manifests. Ambiguous names return choices without changing files.",
@@ -331,7 +417,68 @@ type PrepareArguments = {
   idempotencyKey?: string | undefined;
 };
 
-type PrepareOperation = "created" | "prepared";
+type PrepareOperation = "created" | "prepared" | "imported";
+
+type ImportArguments = {
+  sourcePath?: string | undefined;
+  source?: string | undefined;
+  filename?: string | undefined;
+  artifactId?: string | undefined;
+  title?: string | undefined;
+  slug?: string | undefined;
+  kind?: string | undefined;
+  destinationPath?: string | undefined;
+  collision?: "error" | "replace" | undefined;
+  verificationReceipt?: string | undefined;
+  deleteSource?: boolean | undefined;
+  confirmDeletion?: boolean | undefined;
+};
+
+interface ImportReceipt {
+  token: string;
+  sourcePath: string;
+  sourceSnapshot: SourceSnapshot;
+  artifactId: string;
+  artifactDirectory: string;
+  operationId: string;
+  expiresAt: number;
+}
+
+interface ImportResult extends PrepareResult {
+  operation: "imported";
+  sourcePath?: string | undefined;
+  sourceKind?: "file" | "directory" | undefined;
+  verificationReceipt?: string | undefined;
+  receiptExpiresAt?: string | undefined;
+}
+
+interface SourceEntry {
+  path: string;
+  kind: "file" | "directory";
+  mode: number;
+  sha256?: string | undefined;
+  byteSize: number;
+}
+
+interface SourceSnapshot {
+  kind: "file" | "directory";
+  entries: SourceEntry[];
+  digest: string;
+}
+
+interface ImportJournal {
+  schemaVersion: 1;
+  phase: "staged" | "installed";
+  artifactId: string;
+  stagingPath: string;
+  draftPath: string;
+  draftMetadataPath: string;
+  prepareStatePath: string;
+  destinationPath?: string | undefined;
+  draft: Draft;
+  result: ImportResult;
+  files: ArtifactFile[];
+}
 
 type ReopenArguments = {
   artifactId?: string | undefined;
@@ -455,11 +602,892 @@ async function prepareArtifact(
   });
 }
 
+async function importArtifact(
+  args: ImportArguments,
+  context: ToolContext,
+  locks: Map<string, Promise<void>>,
+  receipts: Map<string, ImportReceipt>,
+) {
+  const request = validateImportArguments(args);
+  if (request.deleteSource) {
+    return deleteImportedSource(request, context, receipts, locks);
+  }
+
+  const project = await resolveLocalProject(context);
+  const sourcePath = request.sourcePath
+    ? resolve(context.directory, request.sourcePath)
+    : undefined;
+  const sourceSnapshot = sourcePath
+    ? await snapshotSource(sourcePath)
+    : undefined;
+  const title =
+    request.title ?? (sourcePath ? basename(sourcePath) : undefined);
+  if (!title) throw validationError("A title is required for source text");
+  if (title.length > 200)
+    throw validationError("Title must be between 1 and 200 characters");
+  const slug = request.slug ?? slugify(title);
+  const artifactDirectory = join(project.artifactRoot, slug);
+  assertImportDoesNotAliasArtifact(sourcePath, artifactDirectory);
+  const destinationPath =
+    request.destinationPath ??
+    (sourceSnapshot?.kind === "file" && sourcePath
+      ? relativePathSchema.parse(basename(sourcePath))
+      : undefined);
+
+  if (request.artifactId) {
+    const existing = await findArtifact(
+      project.artifactRoot,
+      request.artifactId,
+    );
+    if (!existing) {
+      throw new Error(
+        `No local artifact with ID ${request.artifactId} was found under ${project.artifactRoot}.`,
+      );
+    }
+    assertImportDoesNotAliasArtifact(sourcePath, existing.artifactDirectory);
+    return withArtifactLock(locks, existing.artifactDirectory, async () => {
+      await recoverFinalization(existing);
+      await recoverImport(existing);
+      const artifact = await readArtifactDirectory(existing.artifactDirectory);
+      if (!artifact)
+        throw new Error("The local artifact disappeared during import.");
+      return installImportedDraft({
+        artifact,
+        sourcePath,
+        sourceSnapshot,
+        sourceText: request.source,
+        destinationPath,
+        collision: request.collision,
+        receipts,
+      });
+    });
+  }
+
+  await mkdir(project.artifactRoot, { recursive: true });
+  if (await pathExists(artifactDirectory)) {
+    throw new Error(
+      `Artifact slug ${JSON.stringify(slug)} already exists. Choose a different slug or provide its artifactId explicitly.`,
+    );
+  }
+  const artifactId = `artifact-${randomUUID()}`;
+  const now = new Date().toISOString();
+  const manifest = artifactManifestSchema.parse({
+    schemaVersion: 1,
+    projectId: project.projectId,
+    artifactId,
+    slug,
+    title,
+    ...(request.kind ? { kind: request.kind } : {}),
+    revisions: [],
+  });
+  await mkdir(artifactDirectory);
+  try {
+    await writeJson(join(artifactDirectory, "artifact.json"), manifest);
+    return await withArtifactLock(locks, artifactDirectory, () =>
+      installImportedDraft({
+        artifact: { artifactDirectory, manifest },
+        sourcePath,
+        sourceSnapshot,
+        sourceText: request.source,
+        destinationPath,
+        collision: request.collision,
+        receipts,
+        createdAt: now,
+      }),
+    );
+  } catch (error) {
+    await rm(artifactDirectory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function validateImportArguments(args: ImportArguments) {
+  const artifactId =
+    args.artifactId === undefined
+      ? undefined
+      : artifactIdSchema.safeParse(args.artifactId);
+  if (artifactId && !artifactId.success)
+    throw validationError("Artifact ID is invalid");
+  const sourcePath = args.sourcePath?.trim();
+  if (args.sourcePath !== undefined && !sourcePath) {
+    throw validationError("Source path must not be empty");
+  }
+  if (args.source !== undefined && args.sourcePath !== undefined) {
+    throw validationError("Provide sourcePath or source text, not both");
+  }
+  if (args.source === undefined && args.sourcePath === undefined) {
+    if (args.verificationReceipt === undefined || args.deleteSource !== true) {
+      throw validationError(
+        "An existing sourcePath or source text is required",
+      );
+    }
+  }
+  if (args.source !== undefined && args.filename === undefined) {
+    throw validationError("filename is required with source text");
+  }
+  if (args.filename !== undefined && args.destinationPath !== undefined) {
+    throw validationError("Provide filename or destinationPath, not both");
+  }
+  if (args.sourcePath !== undefined && args.filename !== undefined) {
+    throw validationError("filename is only valid with source text");
+  }
+  const title = args.title?.trim();
+  if (args.title !== undefined && (!title || title.length > 200)) {
+    throw validationError("Title must be between 1 and 200 characters");
+  }
+  const slug =
+    args.slug === undefined
+      ? undefined
+      : artifactSlugSchema.safeParse(args.slug.trim());
+  if (slug && !slug.success)
+    throw validationError(
+      "Slug must use lowercase safe words separated by hyphens",
+    );
+  const kind = args.kind?.trim();
+  if (
+    args.kind !== undefined &&
+    (!kind || kind.length > MAX_ARTIFACT_KIND_LENGTH)
+  ) {
+    throw validationError(
+      `Kind must be at most ${MAX_ARTIFACT_KIND_LENGTH} characters`,
+    );
+  }
+  const destinationInput = args.filename ?? args.destinationPath;
+  const destination =
+    destinationInput === undefined
+      ? undefined
+      : relativePathSchema.safeParse(destinationInput);
+  if (destination && !destination.success) {
+    throw validationError(
+      "Import destination must be a safe relative POSIX path",
+    );
+  }
+  if (
+    args.collision !== undefined &&
+    args.collision !== "error" &&
+    args.collision !== "replace"
+  ) {
+    throw validationError("Import collision must be error or replace");
+  }
+  if (args.deleteSource === true) {
+    if (!sourcePath) {
+      throw validationError(
+        "sourcePath is required to delete an imported source",
+      );
+    }
+    if (!args.verificationReceipt) {
+      throw validationError(
+        "A verification receipt is required to delete a source",
+      );
+    }
+    if (args.confirmDeletion !== true) {
+      throw new Error(
+        "Import source deletion requires explicit confirmation. Retry with confirmDeletion true.",
+      );
+    }
+    if (
+      args.title !== undefined ||
+      args.slug !== undefined ||
+      args.kind !== undefined ||
+      args.destinationPath !== undefined ||
+      args.collision !== undefined
+    ) {
+      throw validationError(
+        "Source cleanup accepts only sourcePath, artifactId, verificationReceipt, and confirmDeletion",
+      );
+    }
+  } else if (
+    args.deleteSource !== undefined ||
+    args.confirmDeletion !== undefined ||
+    args.verificationReceipt !== undefined
+  ) {
+    throw validationError(
+      "verificationReceipt and deletion confirmation are only valid for source cleanup",
+    );
+  }
+  return {
+    artifactId: artifactId?.success ? artifactId.data : undefined,
+    sourcePath,
+    source: args.source,
+    title,
+    slug: slug?.success ? slug.data : undefined,
+    kind,
+    destinationPath: destination?.success ? destination.data : undefined,
+    collision: args.collision ?? "error",
+    verificationReceipt: args.verificationReceipt,
+    deleteSource: args.deleteSource === true,
+    confirmDeletion: args.confirmDeletion === true,
+  };
+}
+
+async function installImportedDraft(input: {
+  artifact: LocalArtifact;
+  sourcePath?: string | undefined;
+  sourceSnapshot?: SourceSnapshot | undefined;
+  sourceText?: string | undefined;
+  destinationPath?: string | undefined;
+  collision: "error" | "replace";
+  receipts: Map<string, ImportReceipt>;
+  createdAt?: string | undefined;
+}) {
+  const { artifact } = input;
+  const draftPath = join(artifact.artifactDirectory, "draft");
+  if (
+    (await pathExists(draftPath)) ||
+    (await pathExists(join(artifact.artifactDirectory, "draft.json"))) ||
+    (await pathExists(
+      join(artifact.artifactDirectory, PREPARE_STATE_FILE_NAME),
+    ))
+  ) {
+    throw new Error(
+      `Draft already exists for artifact ${artifact.manifest.artifactId}. Resume or discard it explicitly before importing.`,
+    );
+  }
+  await verifyFinalizedRevisions(artifact);
+
+  const stagingPath = join(
+    artifact.artifactDirectory,
+    `.panes-import-${randomUUID()}.tmp`,
+  );
+  let installed = false;
+  try {
+    const latestRevision = artifact.manifest.revisions.at(-1);
+    if (latestRevision) {
+      await cp(
+        join(artifact.artifactDirectory, `v${latestRevision.version}`),
+        stagingPath,
+        { recursive: true, errorOnExist: true, force: false },
+      );
+    } else {
+      await mkdir(stagingPath);
+    }
+
+    await importIntoStaging(
+      stagingPath,
+      input.sourcePath,
+      input.sourceSnapshot,
+      input.sourceText,
+      input.destinationPath,
+      input.collision,
+    );
+    const files = await scanRevisionFiles(stagingPath);
+    if (input.sourcePath && input.sourceSnapshot) {
+      const after = await snapshotSource(input.sourcePath);
+      if (!sameSourceSnapshot(input.sourceSnapshot, after)) {
+        throw new Error("Import source changed while it was being copied.");
+      }
+    }
+
+    const now = input.createdAt ?? new Date().toISOString();
+    const draft = draftSchemaParse({
+      artifactId: artifact.manifest.artifactId,
+      baseRevision: artifact.manifest.revisions.at(-1)?.version ?? null,
+      requestedOrigins: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    const result: ImportResult = {
+      operation: "imported",
+      projectId: artifact.manifest.projectId,
+      artifactId: artifact.manifest.artifactId,
+      slug: artifact.manifest.slug,
+      title: artifact.manifest.title,
+      draftPath,
+      manifestPath: join(artifact.artifactDirectory, "artifact.json"),
+      draftMetadataPath: join(artifact.artifactDirectory, "draft.json"),
+      baseRevision: draft.baseRevision,
+      requestedOrigins: [],
+      ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}),
+      ...(input.sourceSnapshot
+        ? { sourceKind: input.sourceSnapshot.kind }
+        : {}),
+    };
+    const draftMetadataPath = join(artifact.artifactDirectory, "draft.json");
+    const prepareStatePath = join(
+      artifact.artifactDirectory,
+      PREPARE_STATE_FILE_NAME,
+    );
+    const journalPath = join(
+      artifact.artifactDirectory,
+      IMPORT_JOURNAL_FILE_NAME,
+    );
+    const journal: ImportJournal = {
+      schemaVersion: 1,
+      phase: "staged",
+      artifactId: artifact.manifest.artifactId,
+      stagingPath,
+      draftPath,
+      draftMetadataPath,
+      prepareStatePath,
+      draft,
+      destinationPath: input.destinationPath,
+      result,
+      files,
+    };
+    await writeJsonDurable(journalPath, journal);
+    await rename(stagingPath, draftPath);
+    installed = true;
+    journal.phase = "installed";
+    await writeJsonDurable(journalPath, journal);
+    await writeJsonDurable(draftMetadataPath, draft);
+    await writeJsonDurable(prepareStatePath, {
+      requestHash: importRequestHash(input),
+      result: { ...result, operation: "prepared" },
+    } satisfies StoredPrepareState);
+    await unlink(journalPath);
+
+    if (input.sourcePath && input.sourceSnapshot) {
+      const token = `receipt-${randomUUID()}`;
+      const receipt: ImportReceipt = {
+        token,
+        sourcePath: input.sourcePath,
+        sourceSnapshot: input.sourceSnapshot,
+        artifactId: artifact.manifest.artifactId,
+        artifactDirectory: artifact.artifactDirectory,
+        operationId: randomUUID(),
+        expiresAt: Date.now() + IMPORT_RECEIPT_TTL_MS,
+      };
+      input.receipts.set(token, receipt);
+      result.verificationReceipt = token;
+      result.receiptExpiresAt = new Date(receipt.expiresAt).toISOString();
+    }
+    return importToolResult(result);
+  } catch (error) {
+    await unlink(
+      join(artifact.artifactDirectory, IMPORT_JOURNAL_FILE_NAME),
+    ).catch(() => undefined);
+    if (installed) await rm(draftPath, { recursive: true, force: true });
+    await unlink(join(artifact.artifactDirectory, "draft.json")).catch(
+      () => undefined,
+    );
+    await unlink(
+      join(artifact.artifactDirectory, PREPARE_STATE_FILE_NAME),
+    ).catch(() => undefined);
+    throw error;
+  } finally {
+    await rm(stagingPath, { recursive: true, force: true });
+  }
+}
+
+function importRequestHash(input: {
+  sourcePath?: string | undefined;
+  destinationPath?: string | undefined;
+}) {
+  return sha256(
+    JSON.stringify({
+      operation: "import",
+      sourcePath: input.sourcePath,
+      destinationPath: input.destinationPath,
+    }),
+  );
+}
+
+async function recoverImport(artifact: LocalArtifact) {
+  const journalPath = join(
+    artifact.artifactDirectory,
+    IMPORT_JOURNAL_FILE_NAME,
+  );
+  if (!(await pathExists(journalPath))) {
+    const entries = await readdir(artifact.artifactDirectory);
+    for (const entry of entries) {
+      if (entry.startsWith(".panes-import-") && entry.endsWith(".tmp")) {
+        await rm(join(artifact.artifactDirectory, entry), {
+          recursive: true,
+          force: true,
+        });
+      }
+    }
+    return;
+  }
+  const journal = await readImportJournal(journalPath);
+  if (journal.artifactId !== artifact.manifest.artifactId) {
+    throw new Error("Import journal belongs to another artifact.");
+  }
+  if (
+    dirname(resolve(journal.stagingPath)) !==
+      resolve(artifact.artifactDirectory) ||
+    !/^\.panes-import-[^/]+\.tmp$/u.test(basename(journal.stagingPath)) ||
+    resolve(journal.draftPath) !==
+      resolve(artifact.artifactDirectory, "draft") ||
+    resolve(journal.draftMetadataPath) !==
+      resolve(artifact.artifactDirectory, "draft.json") ||
+    resolve(journal.prepareStatePath) !==
+      resolve(artifact.artifactDirectory, PREPARE_STATE_FILE_NAME)
+  ) {
+    throw new Error("Import journal contains an unsafe path.");
+  }
+  const stagingExists = await pathExists(journal.stagingPath);
+  const draftExists = await pathExists(journal.draftPath);
+  if (stagingExists && draftExists) {
+    throw new Error(
+      "Import recovery found both staging and Draft directories.",
+    );
+  }
+  if (stagingExists) {
+    await rm(journal.stagingPath, { recursive: true, force: true });
+    await unlink(journal.draftMetadataPath).catch(() => undefined);
+    await unlink(journal.prepareStatePath).catch(() => undefined);
+    await unlink(journalPath);
+    return;
+  }
+  if (!draftExists) {
+    await unlink(journal.draftMetadataPath).catch(() => undefined);
+    await unlink(journal.prepareStatePath).catch(() => undefined);
+    await unlink(journalPath);
+    return;
+  }
+  await verifyRevisionFiles(journal.draftPath, journal.files);
+  await writeJsonDurable(journal.draftMetadataPath, journal.draft);
+  await writeJsonDurable(journal.prepareStatePath, {
+    requestHash: importRequestHash({
+      sourcePath: journal.result.sourcePath,
+      destinationPath: journal.destinationPath,
+    }),
+    result: { ...journal.result, operation: "prepared" },
+  } satisfies StoredPrepareState);
+  await unlink(journalPath);
+}
+
+async function readImportJournal(path: string): Promise<ImportJournal> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    throw new Error(`Import journal at ${path} is malformed.`);
+  }
+  if (!value || typeof value !== "object") {
+    throw new Error(`Import journal at ${path} is invalid.`);
+  }
+  const journal = value as Partial<ImportJournal>;
+  const draft = draftSchema.safeParse(journal.draft);
+  const files = artifactFilesSchema.safeParse(journal.files);
+  if (
+    journal.schemaVersion !== 1 ||
+    !["staged", "installed"].includes(String(journal.phase)) ||
+    typeof journal.artifactId !== "string" ||
+    typeof journal.stagingPath !== "string" ||
+    typeof journal.draftPath !== "string" ||
+    typeof journal.draftMetadataPath !== "string" ||
+    typeof journal.prepareStatePath !== "string" ||
+    !draft.success ||
+    !files.success ||
+    !journal.result ||
+    typeof journal.result !== "object"
+  ) {
+    throw new Error(`Import journal at ${path} is invalid.`);
+  }
+  return {
+    schemaVersion: 1,
+    phase: journal.phase as ImportJournal["phase"],
+    artifactId: journal.artifactId,
+    stagingPath: journal.stagingPath,
+    draftPath: journal.draftPath,
+    draftMetadataPath: journal.draftMetadataPath,
+    prepareStatePath: journal.prepareStatePath,
+    ...(journal.destinationPath
+      ? { destinationPath: journal.destinationPath }
+      : {}),
+    draft: draft.data,
+    result: journal.result as ImportResult,
+    files: files.data,
+  };
+}
+
+function importToolResult(result: ImportResult) {
+  const metadata = { ...result };
+  return {
+    title: `Imported ${result.title} Draft`,
+    output: JSON.stringify(metadata),
+    metadata,
+  };
+}
+
+async function importIntoStaging(
+  stagingPath: string,
+  sourcePath: string | undefined,
+  sourceSnapshot: SourceSnapshot | undefined,
+  sourceText: string | undefined,
+  destinationPath: string | undefined,
+  collision: "error" | "replace",
+) {
+  const entries = sourceSnapshot
+    ? importDestinationEntries(sourceSnapshot, destinationPath)
+    : [
+        {
+          path: destinationPath as string,
+          kind: "file" as const,
+          mode: 0o644,
+          byteSize: Buffer.byteLength(sourceText ?? "", "utf8"),
+        },
+      ];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+    if (
+      entries
+        .slice(index + 1)
+        .some((candidate) => importPathsConflict(candidate, entry))
+    ) {
+      throw new Error(
+        `Import source contains colliding paths near ${JSON.stringify(entry.path)}.`,
+      );
+    }
+  }
+  const existing = await scanRevisionFiles(stagingPath);
+  const conflicts = entries.filter((entry) =>
+    existing.some((candidate) => importPathsConflict(candidate, entry)),
+  );
+  if (conflicts.length > 0 && collision !== "replace") {
+    throw new Error(
+      `Import destination collision at ${JSON.stringify(conflicts[0]?.path)}. Retry with collision "replace" or choose another destination.`,
+    );
+  }
+  if (collision === "replace") {
+    const removals = existing
+      .filter((candidate) =>
+        entries.some((entry) => shouldReplaceImportPath(candidate, entry)),
+      )
+      .map((entry) => entry.path)
+      .sort((left, right) => right.length - left.length);
+    for (const path of new Set(removals)) {
+      await rm(join(stagingPath, path), { recursive: true, force: true });
+    }
+  }
+
+  if (sourceSnapshot && sourcePath) {
+    for (const entry of entries) {
+      const sourceEntry = sourceSnapshot.entries.find(
+        (candidate) =>
+          candidate.path ===
+          importSourceEntryPath(sourceSnapshot, entry.path, destinationPath),
+      );
+      if (!sourceEntry) {
+        if (entry.kind === "directory")
+          await mkdirSafe(join(stagingPath, entry.path));
+        continue;
+      }
+      const sourceEntryPath = sourceEntry.path
+        ? join(sourcePath, sourceEntry.path)
+        : sourcePath;
+      const target = join(stagingPath, entry.path);
+      if (entry.kind === "directory") {
+        await mkdirSafe(target);
+        await chmod(target, entry.mode);
+      } else {
+        await assertNoSymlinkPath(sourceEntryPath);
+        const bytes = await readSourceFile(sourceEntryPath);
+        if (
+          createHash("sha256").update(bytes).digest("hex") !==
+          sourceEntry.sha256
+        ) {
+          throw new Error("Import source changed while it was being copied.");
+        }
+        await writeStagedFile(target, bytes, entry.mode);
+      }
+    }
+  } else {
+    await writeStagedFile(
+      join(stagingPath, destinationPath as string),
+      Buffer.from(sourceText ?? "", "utf8"),
+      0o644,
+    );
+  }
+  return entries;
+}
+
+function importDestinationEntries(
+  snapshot: SourceSnapshot,
+  destinationPath: string | undefined,
+) {
+  return snapshot.entries.flatMap((entry) => {
+    if (!entry.path && snapshot.kind === "file") {
+      return [{ ...entry, path: destinationPath as string }];
+    }
+    if (!entry.path && !destinationPath) return [];
+    const path = destinationPath
+      ? entry.path
+        ? `${destinationPath}/${entry.path}`
+        : destinationPath
+      : entry.path;
+    return [{ ...entry, path }];
+  });
+}
+
+function importSourceEntryPath(
+  snapshot: SourceSnapshot,
+  destinationEntryPath: string,
+  destinationPath: string | undefined,
+) {
+  if (snapshot.kind === "file") return "";
+  if (!destinationPath) return destinationEntryPath;
+  if (destinationEntryPath === destinationPath) return "";
+  return destinationEntryPath.slice(destinationPath.length + 1);
+}
+
+type ImportPathEntry = Pick<ArtifactFile, "path" | "kind">;
+
+function importPathsConflict(
+  existing: ImportPathEntry,
+  incoming: ImportPathEntry,
+) {
+  const existingKey = importCollisionKey(existing.path);
+  const incomingKey = importCollisionKey(incoming.path);
+  return (
+    existingKey === incomingKey ||
+    (existing.kind === "file" && incomingKey.startsWith(`${existingKey}/`)) ||
+    (incoming.kind === "file" && existingKey.startsWith(`${incomingKey}/`))
+  );
+}
+
+function shouldReplaceImportPath(
+  existing: ImportPathEntry,
+  incoming: ImportPathEntry,
+) {
+  const existingKey = importCollisionKey(existing.path);
+  const incomingKey = importCollisionKey(incoming.path);
+  return (
+    existingKey === incomingKey ||
+    (incoming.kind === "directory" &&
+      existingKey.startsWith(`${incomingKey}/`)) ||
+    (existing.kind === "file" && incomingKey.startsWith(`${existingKey}/`))
+  );
+}
+
+function importCollisionKey(path: string) {
+  return path
+    .normalize("NFC")
+    .split("/")
+    .map((segment) => segment.replace(/[ .]+$/u, "").toLocaleLowerCase())
+    .join("/");
+}
+
+async function snapshotSource(sourcePath: string): Promise<SourceSnapshot> {
+  await assertNoSymlinkPath(sourcePath);
+  const root = await lstat(sourcePath);
+  if (root.isSymbolicLink()) {
+    throw new Error("Import sources must not be symlinks.");
+  }
+  if (!root.isFile() && !root.isDirectory()) {
+    throw new Error("Import source must be a regular file or directory.");
+  }
+  const entries: SourceEntry[] = [];
+  const visit = async (path: string, relativePath: string) => {
+    await assertNoSymlinkPath(path);
+    const stats = await lstat(path);
+    if (stats.isSymbolicLink()) {
+      throw new Error(
+        `Import source contains unsupported symlink ${JSON.stringify(relativePath || basename(path))}.`,
+      );
+    }
+    const normalized = relativePath
+      ? relativePathSchema.safeParse(relativePath)
+      : { success: true as const, data: "" };
+    if (!normalized.success) {
+      throw new Error(
+        `Import source contains an unsafe path ${JSON.stringify(relativePath)}.`,
+      );
+    }
+    const mode = stats.mode & 0o7777;
+    if (stats.isDirectory()) {
+      entries.push({
+        path: normalized.data,
+        kind: "directory",
+        mode,
+        byteSize: 0,
+      });
+      const children = await readdir(path);
+      children.sort((left, right) => left.localeCompare(right));
+      for (const child of children) {
+        const childPath = join(path, child);
+        const childRelative = normalized.data
+          ? `${normalized.data}/${child}`
+          : child;
+        await visit(childPath, childRelative);
+      }
+      return;
+    }
+    if (!stats.isFile()) {
+      throw new Error(
+        `Import source contains unsupported filesystem entry ${JSON.stringify(relativePath)}.`,
+      );
+    }
+    const bytes = await readSourceFile(path);
+    entries.push({
+      path: normalized.data,
+      kind: "file",
+      mode,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      byteSize: bytes.byteLength,
+    });
+  };
+  await visit(sourcePath, "");
+  return {
+    kind: root.isDirectory() ? "directory" : "file",
+    entries,
+    digest: sha256(JSON.stringify(entries)),
+  };
+}
+
+async function readSourceFile(path: string) {
+  const handle = await open(
+    path,
+    fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile())
+      throw new Error("Import source is no longer a regular file.");
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function assertNoSymlinkPath(path: string) {
+  let current = resolve(path);
+  for (;;) {
+    const stats = await lstat(current);
+    if (
+      stats.isSymbolicLink() &&
+      !(platform() === "darwin" && ["/var", "/tmp"].includes(current))
+    ) {
+      throw new Error(`Import source path contains a symlink: ${path}`);
+    }
+    const parent = dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
+async function mkdirSafe(path: string) {
+  const existing = await lstat(path).catch((error: unknown) => {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isDirectory()) {
+      throw new Error(`Import destination is not a directory: ${path}`);
+    }
+    return;
+  }
+  await mkdir(dirname(path), { recursive: true });
+  await mkdir(path);
+}
+
+async function writeStagedFile(path: string, bytes: Buffer, mode: number) {
+  await mkdir(dirname(path), { recursive: true });
+  const handle = await open(path, "wx", mode);
+  try {
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await chmod(path, mode);
+}
+
+function sameSourceSnapshot(left: SourceSnapshot, right: SourceSnapshot) {
+  return left.kind === right.kind && left.digest === right.digest;
+}
+
+function assertImportDoesNotAliasArtifact(
+  sourcePath: string | undefined,
+  artifactDirectory: string,
+) {
+  if (!sourcePath) return;
+  const source = resolve(sourcePath);
+  const artifact = resolve(artifactDirectory);
+  if (isPathWithin(source, artifact) || isPathWithin(artifact, source)) {
+    throw new Error(
+      "Import source and destination must not alias the same Artifact state.",
+    );
+  }
+}
+
+function isPathWithin(path: string, parent: string) {
+  const resolvedPath = resolve(path);
+  const resolvedParent = resolve(parent);
+  return (
+    resolvedPath === resolvedParent ||
+    resolvedPath.startsWith(
+      `${resolvedParent}${resolvedParent.endsWith("/") ? "" : "/"}`,
+    )
+  );
+}
+
+async function deleteImportedSource(
+  request: ReturnType<typeof validateImportArguments>,
+  context: ToolContext,
+  receipts: Map<string, ImportReceipt>,
+  locks: Map<string, Promise<void>>,
+) {
+  const token = request.verificationReceipt;
+  if (!token)
+    throw new Error("A verification receipt is required for source deletion.");
+  const receipt = receipts.get(token);
+  if (!receipt)
+    throw new Error("The verification receipt is unknown or already consumed.");
+  if (receipt.expiresAt <= Date.now()) {
+    receipts.delete(token);
+    throw new Error(
+      "The verification receipt has expired. Import again before deleting the source.",
+    );
+  }
+  if (!request.confirmDeletion) {
+    throw new Error(
+      "Import source deletion requires explicit confirmation. Retry with confirmDeletion true.",
+    );
+  }
+  const sourcePath = resolve(context.directory, request.sourcePath ?? "");
+  if (sourcePath !== receipt.sourcePath) {
+    throw new Error(
+      "The verification receipt does not match this source path.",
+    );
+  }
+  if (request.artifactId && request.artifactId !== receipt.artifactId) {
+    throw new Error("The verification receipt does not match this Artifact.");
+  }
+  return withArtifactLock(locks, receipt.artifactDirectory, async () => {
+    const artifact = await readArtifactDirectory(receipt.artifactDirectory);
+    if (!artifact || artifact.manifest.artifactId !== receipt.artifactId) {
+      throw new Error(
+        "The verification receipt no longer matches its destination Artifact.",
+      );
+    }
+    const current = await snapshotSource(sourcePath);
+    if (!sameSourceSnapshot(receipt.sourceSnapshot, current)) {
+      throw new Error(
+        "The imported source changed after verification; it was not deleted.",
+      );
+    }
+    await rm(sourcePath, {
+      recursive: receipt.sourceSnapshot.kind === "directory",
+    });
+    receipts.delete(token);
+    return {
+      title: "Deleted imported source",
+      output: JSON.stringify({
+        operation: "source-deleted",
+        artifactId: receipt.artifactId,
+        sourcePath,
+        importOperationId: receipt.operationId,
+      }),
+      metadata: {
+        operation: "source-deleted",
+        artifactId: receipt.artifactId,
+        sourcePath,
+        importOperationId: receipt.operationId,
+      },
+    };
+  });
+}
+
 async function prepareExistingArtifact(
   existing: LocalArtifact,
   request: ValidatedPrepareArguments,
 ) {
   await recoverFinalization(existing);
+  await recoverImport(existing);
   const recovered = await readArtifactDirectory(existing.artifactDirectory);
   if (!recovered)
     throw new Error("The local artifact disappeared during recovery.");
@@ -738,6 +1766,7 @@ async function finalizeArtifact(
 
   return withArtifactLock(locks, existing.artifactDirectory, async () => {
     const recoveredRevision = await recoverFinalization(existing);
+    await recoverImport(existing);
     const artifact = await readArtifactDirectory(existing.artifactDirectory);
     if (!artifact)
       throw new Error("The local artifact disappeared during finalization.");
@@ -1075,6 +2104,7 @@ async function reopenExistingArtifact(
   previewServer: LocalPreviewServer,
 ) {
   await recoverFinalization(existing);
+  await recoverImport(existing);
   const artifact = await readArtifactDirectory(existing.artifactDirectory);
   if (!artifact)
     throw new Error("The local artifact disappeared during recovery.");
