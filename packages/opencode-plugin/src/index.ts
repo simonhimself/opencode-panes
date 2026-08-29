@@ -32,6 +32,7 @@ import {
   getReactBrowserRuntime,
   type ReactBrowserRuntime,
 } from "@opencode-panes/renderers/react-browser-runtime";
+import { createArtifactEgressGuardScript } from "@opencode-panes/renderers/iframe-security";
 import {
   MAX_ARTIFACT_SOURCE_BYTES,
   MAX_ARTIFACT_KIND_LENGTH,
@@ -67,8 +68,8 @@ const STATE_DIRECTORY_NAME = "opencode-panes";
 const PROJECT_ID_FILE_NAME = ".panes-project.json";
 const PREPARE_STATE_FILE_NAME = ".panes-prepare.json";
 const FINALIZE_JOURNAL_FILE_NAME = ".panes-finalize.json";
+const PREVIEW_FRAME_PATH = "__panes__/frame";
 const execFileAsync = promisify(execFile);
-const REACT_WASM_ASSET_PATH = "__panes__/esbuild.wasm";
 
 const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description. After success, present viewerUrl exactly as returned, including its fragment; never shorten, sanitize, or rewrite that URL.`;
 
@@ -1309,12 +1310,25 @@ class LocalPreviewServer {
   }
 
   async probe(token: string, entryPath: string) {
-    const response = await requestLoopback(this.url(token, entryPath));
-    if (response.statusCode !== 200) {
+    const shell = await requestLoopback(this.url(token, entryPath));
+    if (shell.statusCode !== 200) {
       throw new Error(
-        `Local Preview validation failed with HTTP ${response.statusCode}.`,
+        `Local Preview validation failed with HTTP ${shell.statusCode}.`,
       );
     }
+    const frame = await requestLoopback(this.frameUrl(token));
+    if (frame.statusCode !== 200) {
+      throw new Error(
+        `Local Preview validation failed with HTTP ${frame.statusCode}.`,
+      );
+    }
+  }
+
+  private frameUrl(token: string) {
+    const address = this.server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Local preview server is not listening.");
+    return `http://127.0.0.1:${address.port}/preview/${encodeURIComponent(token)}/v${this.routes.get(token)?.version}/${encodePreviewPath(PREVIEW_FRAME_PATH)}`;
   }
 
   private async listen() {
@@ -1404,20 +1418,45 @@ class LocalPreviewServer {
       response.end("Finalized Revision files no longer match artifact.json.");
       return;
     }
-    if (
-      relativePath === REACT_WASM_ASSET_PATH &&
-      route.preview.adapter === "renderer" &&
-      route.preview.renderer === "react" &&
-      route.reactRuntime
-    ) {
-      response.writeHead(200, {
-        "cache-control": "no-store",
-        "content-length": route.reactRuntime.wasm.byteLength,
-        "content-type": "application/wasm",
-        "x-content-type-options": "nosniff",
-      });
-      if (request.method === "GET") response.end(route.reactRuntime.wasm);
-      else response.end();
+    if (relativePath === route.preview.entryPath) {
+      const body = renderPreviewShell(this.frameUrl(token), route.preview);
+      this.sendHtml(
+        response,
+        request.method,
+        body,
+        createShellCsp(this.origin()),
+      );
+      return;
+    }
+    if (relativePath === PREVIEW_FRAME_PATH) {
+      try {
+        const body =
+          route.preview.adapter === "browser"
+            ? createBrowserFrame(
+                (
+                  await readFile(join(route.root, route.preview.entryPath))
+                ).toString("utf8"),
+                this.baseUrl(token),
+              )
+            : await rendererWrapper(
+                route.preview.renderer,
+                route.root,
+                route.preview.entryPath,
+                route.reactRuntime,
+                this.baseUrl(token),
+              );
+        this.sendHtml(
+          response,
+          request.method,
+          body,
+          createFrameCsp(this.origin()),
+        );
+      } catch {
+        response.writeHead(409, {
+          "content-type": "text/plain; charset=utf-8",
+        });
+        response.end("Finalized Revision files no longer match artifact.json.");
+      }
       return;
     }
     const file = route.files.find(
@@ -1430,25 +1469,8 @@ class LocalPreviewServer {
       return;
     }
     let body: Buffer;
-    let contentType = file.mediaType;
     try {
-      if (
-        route.preview.adapter === "renderer" &&
-        route.preview.entryPath === relativePath
-      ) {
-        body = Buffer.from(
-          await rendererWrapper(
-            route.preview.renderer,
-            route.root,
-            file.path,
-            route.reactRuntime,
-            this.url(token, REACT_WASM_ASSET_PATH),
-          ),
-        );
-        contentType = "text/html";
-      } else {
-        body = await readFile(join(route.root, relativePath));
-      }
+      body = await readFile(join(route.root, relativePath));
     } catch {
       response.writeHead(409, {
         "content-type": "text/plain; charset=utf-8",
@@ -1457,16 +1479,16 @@ class LocalPreviewServer {
       return;
     }
     const contentTypeHeader =
-      /^text\//u.test(contentType) ||
+      /^text\//u.test(file.mediaType) ||
       /^(?:application\/(?:javascript|json|typescript|xml)|image\/svg\+xml)$/u.test(
-        contentType,
+        file.mediaType,
       )
-        ? `${contentType}; charset=utf-8`
-        : contentType;
+        ? `${file.mediaType}; charset=utf-8`
+        : file.mediaType;
     response.writeHead(200, {
+      "access-control-allow-origin": "*",
       "cache-control": "no-store",
-      "content-security-policy":
-        "default-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'none'",
+      "content-security-policy": createFrameCsp(this.origin()),
       "content-type": contentTypeHeader,
       "content-length": body.byteLength,
       "referrer-policy": "no-referrer",
@@ -1475,6 +1497,68 @@ class LocalPreviewServer {
     if (request.method === "GET") response.end(body);
     else response.end();
   }
+
+  private origin() {
+    const address = this.server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Local preview server is not listening.");
+    return `http://127.0.0.1:${address.port}`;
+  }
+
+  private baseUrl(token: string) {
+    const route = this.routes.get(token);
+    if (!route) throw new Error("Local preview route is unavailable.");
+    return `${this.origin()}/preview/${encodeURIComponent(token)}/v${route.version}/`;
+  }
+
+  private sendHtml(
+    response: ServerResponse,
+    method: string | undefined,
+    body: string,
+    contentSecurityPolicy: string,
+  ) {
+    const bytes = Buffer.from(body, "utf8");
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-length": bytes.byteLength,
+      "content-security-policy": contentSecurityPolicy,
+      "content-type": "text/html; charset=utf-8",
+      "referrer-policy": "no-referrer",
+      "x-content-type-options": "nosniff",
+    });
+    if (method === "GET") response.end(bytes);
+    else response.end();
+  }
+}
+
+function renderPreviewShell(frameUrl: string, preview: PreviewEntry) {
+  const label =
+    preview.adapter === "browser"
+      ? "Browser artifact preview"
+      : `${preview.renderer} artifact preview`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(label)}</title><style>html,body{height:100%;margin:0}iframe{display:block;border:0;width:100%;height:100%}</style></head><body><iframe sandbox="allow-scripts" referrerpolicy="no-referrer" src="${escapeHtmlAttribute(frameUrl)}" title="${escapeHtmlAttribute(label)}"></iframe></body></html>`;
+}
+
+function createBrowserFrame(source: string, baseUrl: string) {
+  return createArtifactFrameDocument(
+    source,
+    baseUrl,
+    "<title>Panes browser artifact</title>",
+  );
+}
+
+function createArtifactFrameDocument(body: string, baseUrl: string, head = "") {
+  const origin = new URL(baseUrl).origin;
+  const csp = createFrameCsp(origin);
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeHtmlAttribute(csp)}"><meta http-equiv="x-dns-prefetch-control" content="off"><base href="${escapeHtmlAttribute(baseUrl)}"><script>${escapeInlineScript(createArtifactEgressGuardScript())}</script>${head}</head><body>${body}</body></html>`;
+}
+
+function createShellCsp(origin: string) {
+  return `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; frame-src ${origin}; child-src ${origin}; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; referrer-policy no-referrer`;
+}
+
+function createFrameCsp(origin: string) {
+  return `sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' ${origin}; style-src 'unsafe-inline' ${origin}; img-src ${origin} data: blob:; font-src ${origin} data:; connect-src 'none'; frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; base-uri ${origin}; form-action 'none'; manifest-src 'none'; media-src ${origin}`;
 }
 
 async function rendererWrapper(
@@ -1482,7 +1566,7 @@ async function rendererWrapper(
   root: string,
   entryPath: string,
   reactRuntime: ReactBrowserRuntime | undefined,
-  wasmUrl: string,
+  baseUrl: string,
 ) {
   const source = (await readFile(join(root, entryPath))).toString("utf8");
   const rendered = await (renderer === "markdown"
@@ -1490,24 +1574,22 @@ async function rendererWrapper(
     : renderer === "mermaid"
       ? renderMermaid(source)
       : renderer === "react"
-        ? renderReactWrapper(source, reactRuntime, wasmUrl)
+        ? renderReactWrapper(source, reactRuntime)
         : `<pre data-renderer="code"><code>${escapeHtml(source)}</code></pre>`);
-  return `<!doctype html>
-<html><head><meta charset="utf-8">
-<meta name="panes-adapter" content="renderer:${renderer}">
-<title>Panes ${renderer} preview</title>
-<style>body{margin:0;padding:2rem;background:#fff;color:#111;font:16px/1.5 system-ui,sans-serif}pre{white-space:pre-wrap}svg{max-width:100%;height:auto}</style></head>
- <body><main data-panes-renderer="${renderer}">${rendered}</main></body></html>`;
+  return createArtifactFrameDocument(
+    `<main data-panes-renderer="${renderer}">${rendered}</main>`,
+    baseUrl,
+    `<meta name="panes-adapter" content="renderer:${renderer}"><title>Panes ${renderer} preview</title><style>body{margin:0;padding:2rem;background:#fff;color:#111;font:16px/1.5 system-ui,sans-serif}pre{white-space:pre-wrap}svg{max-width:100%;height:auto}</style>`,
+  );
 }
 
 function renderReactWrapper(
   source: string,
   runtime: ReactBrowserRuntime | undefined,
-  wasmUrl: string,
 ) {
   if (!runtime) throw new Error("React browser runtime is unavailable");
   const setup = escapeInlineScript(
-    `globalThis.__PANES_REACT_SOURCE__=${JSON.stringify(source)};globalThis.__PANES_WASM_BASE64__=${JSON.stringify(Buffer.from(runtime.wasm).toString("base64"))};globalThis.__PANES_WASM_URL__=${JSON.stringify(wasmUrl)};`,
+    `globalThis.__PANES_REACT_SOURCE__=${JSON.stringify(source)};globalThis.__PANES_WASM_BASE64__=${JSON.stringify(Buffer.from(runtime.wasm).toString("base64"))};`,
   );
   return `<div id="root"></div><script>${setup}</script><script>${escapeInlineScript(runtime.source)}</script>`;
 }
@@ -1681,6 +1763,10 @@ function escapeHtml(value: string) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function escapeHtmlAttribute(value: string) {
+  return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
 }
 
 function escapeInlineScript(source: string) {

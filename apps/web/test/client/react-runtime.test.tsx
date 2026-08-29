@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { createReactSrcDoc } from "../../src/renderers/react";
 import { createReactBuildOptions } from "../../src/renderers/react-build";
 
-describe("React browser runtime", () => {
+describe("web React renderer createReactSrcDoc runtime", () => {
   it("updates visible state after a click inside the sandboxed document", async () => {
     const originalTextEncoder = globalThis.TextEncoder;
     const originalUint8Array = globalThis.Uint8Array;

@@ -11,7 +11,9 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { TextEncoder as NodeTextEncoder } from "node:util";
 
+import { JSDOM } from "jsdom";
 import { artifactManifestSchema } from "@opencode-panes/contracts";
 import type {
   ToolContext,
@@ -36,6 +38,148 @@ afterEach(async () => {
 });
 
 describe("artifact_finalize tool", () => {
+  it("returns a script-free outer shell with a restrictive artifact frame", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Framed site" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "index.html"),
+      '<script>document.body.dataset.executed = "yes";</script><h1>Inside</h1>',
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+    );
+    const shell = await getText(metadata(result).previewUrl as string);
+
+    expect(shell.status).toBe(200);
+    expect(shell.body).not.toContain("<script");
+    expect(shell.body).not.toContain("document.body.dataset.executed");
+    expect(shell.body).toContain('sandbox="allow-scripts"');
+    expect(shell.body).not.toContain("allow-same-origin");
+    expect(shell.body).toMatch(
+      /<iframe[^>]+sandbox="allow-scripts"[^>]+src="[^"]+__panes__\/frame[^>]*>/,
+    );
+
+    const frame = await getText(
+      frameUrl(shell.body, metadata(result).previewUrl as string),
+    );
+    expect(frame.body).toContain("document.body.dataset.executed");
+    expect(frame.contentSecurityPolicy).toContain("connect-src 'none'");
+    expect(frame.contentSecurityPolicy).toContain("sandbox allow-scripts");
+    expect(frame.contentSecurityPolicy).not.toContain("allow-same-origin");
+  });
+
+  it("confines direct HTML execution to the finalized artifact frame", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Framed interaction" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "index.html"),
+      '<button id="action">Run</button><script>document.querySelector("#action").dataset.bound = "yes";</script>',
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+    );
+    const shell = await getText(metadata(result).previewUrl as string);
+    const previewUrl = metadata(result).previewUrl as string;
+    const frame = await getText(frameUrl(shell.body, previewUrl));
+
+    expect(shell.body).not.toContain('id="action"');
+    expect(frame.body).toContain('id="action"');
+    expect(frame.body).toContain('"XMLHttpRequest"');
+    const dom = new JSDOM(frame.body, {
+      runScripts: "dangerously",
+      url: frameUrl(shell.body, previewUrl),
+    });
+    try {
+      await waitForRender();
+      expect(
+        dom.window.document
+          .querySelector("#action")
+          ?.getAttribute("data-bound"),
+      ).toBe("yes");
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("executes stateful React through the finalized Local preview frame", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Framed React" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "App.tsx"),
+      `import React, { useState } from "react";
+export default function Counter() {
+  const [count, setCount] = useState(0);
+  return <button onClick={() => setCount(count + 1)}>Count: {count}</button>;
+}`,
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "App.tsx",
+        adapter: "renderer",
+        renderer: "react",
+      },
+      context,
+    );
+    const shell = await getText(metadata(result).previewUrl as string);
+    expect(shell.body).not.toContain("__PANES_REACT_SOURCE__");
+    expect(shell.body).not.toContain("<script");
+    const frameResponseUrl = frameUrl(
+      shell.body,
+      metadata(result).previewUrl as string,
+    );
+    const frameResponse = await getText(frameResponseUrl);
+    const originalTextEncoder = globalThis.TextEncoder;
+    const originalUint8Array = globalThis.Uint8Array;
+    let dom: JSDOM | undefined;
+    try {
+      globalThis.TextEncoder = NodeTextEncoder;
+      globalThis.Uint8Array = new NodeTextEncoder().encode("")
+        .constructor as typeof Uint8Array;
+      dom = new JSDOM(frameResponse.body, {
+        runScripts: "dangerously",
+        url: frameResponseUrl,
+      });
+      await waitForRender(1000);
+      const button = dom.window.document.querySelector("button");
+      expect(button?.textContent).toBe("Count: 0");
+
+      button?.dispatchEvent(
+        new dom.window.MouseEvent("click", { bubbles: true }),
+      );
+      await waitForRender();
+
+      expect(button?.textContent).toBe("Count: 1");
+    } finally {
+      dom?.window.close();
+      globalThis.TextEncoder = originalTextEncoder;
+      globalThis.Uint8Array = originalUint8Array;
+    }
+  });
+
   it("finalizes a browser draft and serves its raw nested files over loopback", async () => {
     const fetchMock = vi.fn<typeof fetch>();
     vi.stubGlobal("fetch", fetchMock);
@@ -78,7 +222,11 @@ describe("artifact_finalize tool", () => {
     expect(preview.status).toBe(200);
     expect(preview.contentType).toMatch(/^text\/html/);
     expect(preview.contentSecurityPolicy).toContain("connect-src 'none'");
-    expect(preview.body).toBe(
+    expect(preview.body).toContain('sandbox="allow-scripts"');
+    const frame = await getText(
+      frameUrl(preview.body, String(resultMetadata.previewUrl)),
+    );
+    expect(frame.body).toContain(
       '<script type="module" src="assets/app.js"></script>',
     );
     const asset = await getText(
@@ -86,6 +234,7 @@ describe("artifact_finalize tool", () => {
     );
     expect(asset.status).toBe(200);
     expect(asset.contentType).toMatch(/^application\/javascript/);
+    expect(asset.accessControlAllowOrigin).toBe("*");
     expect(asset.body).toBe("export const answer = 42;\n");
 
     const artifactDirectory = join(project, "artifacts", "site");
@@ -152,7 +301,7 @@ describe("artifact_finalize tool", () => {
       context,
     );
     const previewUrl = metadata(result).previewUrl as string;
-    const response = await getText(previewUrl);
+    const response = await getPreviewFrame(previewUrl);
 
     expect(response.status).toBe(200);
     expect(response.contentType).toMatch(/^text\/html/);
@@ -192,7 +341,8 @@ describe("artifact_finalize tool", () => {
       },
       context,
     );
-    const response = await getText(metadata(result).previewUrl as string);
+    const previewUrl = metadata(result).previewUrl as string;
+    const response = await getPreviewFrame(previewUrl);
 
     expect(response.status).toBe(200);
     expect(response.body).toContain("<table>");
@@ -225,7 +375,8 @@ describe("artifact_finalize tool", () => {
       },
       context,
     );
-    const response = await getText(metadata(result).previewUrl as string);
+    const previewUrl = metadata(result).previewUrl as string;
+    const response = await getPreviewFrame(previewUrl);
 
     expect(response.status).toBe(200);
     expect(response.body).toContain('data-renderer="mermaid"');
@@ -257,7 +408,9 @@ describe("artifact_finalize tool", () => {
       },
       context,
     );
-    const response = await getText(metadata(result).previewUrl as string);
+    const response = await getPreviewFrame(
+      metadata(result).previewUrl as string,
+    );
 
     expect(response.status).toBe(200);
     expect(response.body).toContain('class="flowchart"');
@@ -292,22 +445,18 @@ describe("artifact_finalize tool", () => {
       },
       context,
     );
-    const response = await getText(metadata(result).previewUrl as string);
+    const previewUrl = metadata(result).previewUrl as string;
+    const response = await getPreviewFrame(previewUrl);
 
     expect(response.status).toBe(200);
     expect(response.body).toContain('<div id="root"></div>');
     expect(response.body).toContain("__PANES_REACT_SOURCE__");
-    expect(response.body).toContain("__PANES_WASM_URL__");
+    expect(response.body).not.toContain("__PANES_WASM_URL__");
     expect(response.body).not.toContain("<pre>");
     const wasm = await getText(
-      (metadata(result).previewUrl as string).replace(
-        "App.tsx",
-        "__panes__/esbuild.wasm",
-      ),
+      new URL("__panes__/esbuild.wasm", previewUrl).toString(),
     );
-    expect(wasm.status).toBe(200);
-    expect(wasm.contentType).toBe("application/wasm");
-    expect(wasm.body.length).toBeGreaterThan(1_000_000);
+    expect(wasm.status).toBe(404);
   });
 
   it("executes nested JSX, expressions, props, and state through the React compiler/runtime", async () => {
@@ -350,7 +499,9 @@ describe("artifact_finalize tool", () => {
       },
       context,
     );
-    const response = await getText(metadata(result).previewUrl as string);
+    const response = await getPreviewFrame(
+      metadata(result).previewUrl as string,
+    );
 
     expect(response.status).toBe(200);
     expect(response.body).toContain("__PANES_REACT_SOURCE__");
@@ -385,7 +536,9 @@ describe("artifact_finalize tool", () => {
       },
       context,
     );
-    const response = await getText(metadata(result).previewUrl as string);
+    const response = await getPreviewFrame(
+      metadata(result).previewUrl as string,
+    );
 
     expect(response.status).toBe(200);
     expect(response.body).toContain("artifact source was evaluated in Node");
@@ -414,7 +567,9 @@ describe("artifact_finalize tool", () => {
       },
       context,
     );
-    const response = await getText(metadata(result).previewUrl as string);
+    const response = await getPreviewFrame(
+      metadata(result).previewUrl as string,
+    );
 
     expect(response.body).toContain(
       '<pre data-renderer="code"><code>print(&#39;hello&#39;)</code></pre>',
@@ -667,6 +822,7 @@ function getText(url: string) {
     status: number;
     contentType: string;
     contentSecurityPolicy: string;
+    accessControlAllowOrigin: string;
     body: string;
   }>((resolve, reject) => {
     const request = get(url, (response) => {
@@ -679,12 +835,31 @@ function getText(url: string) {
           contentSecurityPolicy: String(
             response.headers["content-security-policy"] ?? "",
           ),
+          accessControlAllowOrigin: String(
+            response.headers["access-control-allow-origin"] ?? "",
+          ),
           body: Buffer.concat(chunks).toString("utf8"),
         }),
       );
     });
     request.once("error", reject);
   });
+}
+
+function frameUrl(shell: string, previewUrl: string) {
+  const source = shell.match(/<iframe[^>]+src="([^"]+)"/u)?.[1];
+  if (!source)
+    throw new Error("preview shell did not contain an artifact frame");
+  return new URL(source, previewUrl).toString();
+}
+
+async function getPreviewFrame(previewUrl: string) {
+  const shell = await getText(previewUrl);
+  return getText(frameUrl(shell.body, previewUrl));
+}
+
+function waitForRender(delay = 0) {
+  return new Promise<void>((resolve) => setTimeout(resolve, delay));
 }
 
 function metadata(result: ToolResult) {

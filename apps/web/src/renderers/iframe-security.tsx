@@ -1,4 +1,5 @@
 import { useEffect, useEffectEvent, useRef } from "react";
+import { createArtifactEgressGuardScript } from "@opencode-panes/renderers/iframe-security";
 
 export const EXECUTABLE_IFRAME_SANDBOX = "allow-scripts";
 export const RENDERER_MESSAGE_CHANNEL = "opencode-panes-renderer";
@@ -96,73 +97,6 @@ export function createRendererMessageRateLimiter(
   };
 }
 
-export function createEgressGuardScript(): string {
-  return `(() => {
-    const securityError = (name) => new DOMException(name + " is disabled in artifact previews", "SecurityError");
-    const fail = (name) => function () { throw securityError(name); };
-    const lock = (target, name, value) => {
-      try {
-        Object.defineProperty(target, name, { configurable: false, writable: false, value });
-      } catch {
-        try { target[name] = value; } catch {}
-      }
-    };
-
-    lock(globalThis, "fetch", () => Promise.reject(securityError("fetch")));
-    for (const name of ["XMLHttpRequest", "WebSocket", "EventSource", "RTCPeerConnection", "webkitRTCPeerConnection"]) {
-      lock(globalThis, name, fail(name));
-    }
-    lock(globalThis, "open", fail("window.open"));
-    lock(navigator, "sendBeacon", () => false);
-    const navigatorPrototype = Object.getPrototypeOf(navigator);
-    if (navigatorPrototype) lock(navigatorPrototype, "sendBeacon", () => false);
-
-    const resourceHints = new Set(["dns-prefetch", "modulepreload", "preconnect", "prefetch", "preload", "prerender"]);
-    const isResourceHint = (value) => String(value).toLowerCase().split(/\\s+/).some((token) => resourceHints.has(token));
-    const removeResourceHint = (node) => {
-      if (node instanceof HTMLLinkElement && isResourceHint(node.getAttribute("rel") || "")) node.remove();
-      if (node instanceof Element) {
-        for (const link of node.querySelectorAll("link[rel]")) {
-          if (isResourceHint(link.getAttribute("rel") || "")) link.remove();
-        }
-      }
-    };
-
-    const nativeSetAttribute = Element.prototype.setAttribute;
-    lock(Element.prototype, "setAttribute", function (name, value) {
-      if (this instanceof HTMLLinkElement && String(name).toLowerCase() === "rel" && isResourceHint(value)) {
-        throw securityError("resource hints");
-      }
-      return nativeSetAttribute.call(this, name, value);
-    });
-    const relDescriptor = Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype, "rel");
-    if (relDescriptor?.get && relDescriptor.set) {
-      try {
-        Object.defineProperty(HTMLLinkElement.prototype, "rel", {
-          configurable: false,
-          enumerable: relDescriptor.enumerable,
-          get: relDescriptor.get,
-          set(value) {
-            if (isResourceHint(value)) throw securityError("resource hints");
-            relDescriptor.set.call(this, value);
-          },
-        });
-      } catch {}
-    }
-    new MutationObserver((records) => {
-      for (const record of records) {
-        if (record.type === "attributes") removeResourceHint(record.target);
-        for (const node of record.addedNodes) removeResourceHint(node);
-      }
-    }).observe(document.documentElement, {
-      attributeFilter: ["rel"],
-      attributes: true,
-      childList: true,
-      subtree: true,
-    });
-  })();`;
-}
-
 export function createErrorBridgeScript(nonce: string): string {
   const channel = JSON.stringify(RENDERER_MESSAGE_CHANNEL);
   const serializedNonce = JSON.stringify(nonce);
@@ -193,7 +127,7 @@ export function createIsolatedDocument(
 ): string {
   const csp = escapeHtmlAttribute(createArtifactCsp(options.allowScripts));
   const guard = options.allowScripts
-    ? `<script>${escapeInlineScript(createEgressGuardScript())}</script>`
+    ? `<script>${escapeInlineScript(createArtifactEgressGuardScript())}</script>`
     : "";
   return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="${csp}"><meta http-equiv="x-dns-prefetch-control" content="off"><meta charset="utf-8">${guard}${options.head ?? ""}</head><body>${body}</body></html>`;
 }
