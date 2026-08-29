@@ -15,6 +15,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import worker from "../worker/index";
+import { privateRevisionObjectKey } from "../worker/storage";
 
 const ORIGIN = "https://panes.example";
 const PROJECT_ID = "project-sync-test";
@@ -101,16 +102,18 @@ describe("first private Sync Worker HTTP seam", () => {
     expect(Date.parse(rotatedBody.creatorExpiresAt)).toBeGreaterThan(
       Date.parse(first.creatorExpiresAt),
     );
-    expect((await api(`/api/creator/${token}`)).status).toBe(410);
-    expect(
-      (
-        await api(`/api/creator/${token}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-        })
-      ).status,
-    ).toBe(410);
+    const revoked = await api(`/api/creator/${token}`);
+    expect(revoked.status).toBe(410);
+    expect(revoked.headers.get("Cache-Control")).toBe("no-store");
+    expect(revoked.headers.get("Referrer-Policy")).toBe("no-referrer");
+    const revokedMutation = await api(`/api/creator/${token}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    expect(revokedMutation.status).toBe(410);
+    expect(revokedMutation.headers.get("Cache-Control")).toBe("no-store");
+    expect(revokedMutation.headers.get("Referrer-Policy")).toBe("no-referrer");
     expect((await api(`/api/creator/${rotatedBody.creatorToken}`)).status).toBe(
       200,
     );
@@ -119,10 +122,14 @@ describe("first private Sync Worker HTTP seam", () => {
     )
       .bind("2020-01-01T00:00:00.000Z", first.cloudArtifactId)
       .run();
-    expect((await api(`/api/creator/${rotatedBody.creatorToken}`)).status).toBe(
-      410,
-    );
-    expect((await api("/api/creator/unknown-creator-token")).status).toBe(404);
+    const expired = await api(`/api/creator/${rotatedBody.creatorToken}`);
+    expect(expired.status).toBe(410);
+    expect(expired.headers.get("Cache-Control")).toBe("no-store");
+    expect(expired.headers.get("Referrer-Policy")).toBe("no-referrer");
+    const unknown = await api("/api/creator/unknown-creator-token");
+    expect(unknown.status).toBe(404);
+    expect(unknown.headers.get("Cache-Control")).toBe("no-store");
+    expect(unknown.headers.get("Referrer-Policy")).toBe("no-referrer");
   });
 
   it("tracks temporary uploads, skips matching retries, and serializes sessions", async () => {
@@ -190,6 +197,79 @@ describe("first private Sync Worker HTTP seam", () => {
     expect(blocked.status).toBe(409);
   });
 
+  it("rejects a commit held by another session without partial file metadata", async () => {
+    const create = await api(
+      "/api/sync/artifacts",
+      jsonRequest({
+        projectId: "project-commit-lease",
+        artifactId: "artifact-commit-lease",
+        slug: "commit-lease",
+        title: "Commit lease",
+        idempotencyKey: "commit-lease-1",
+        ownerCredential: "owner-commit-lease",
+        creatorToken: "creator-commit-lease",
+      }),
+    );
+    const artifact = syncCreateResponseSchema.parse(await create.json());
+    const bytes = new TextEncoder().encode("commit bytes");
+    const fileHash = await sha256(bytes);
+    await uploadFileWithSession(
+      `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/files/index.html`,
+      bytes,
+      "text/html",
+      "owner-commit-lease",
+      "session-one",
+    );
+    await env.DB.prepare(
+      `UPDATE sync_artifacts
+          SET sync_lease_owner = ?, sync_lease_expires_at = ?
+        WHERE cloud_artifact_id = ?`,
+    )
+      .bind("session-one", "2099-01-01T00:00:00.000Z", artifact.cloudArtifactId)
+      .run();
+
+    const commit = await api(
+      `/api/sync/artifacts/${artifact.cloudArtifactId}/revisions/1/commit`,
+      jsonRequest(
+        {
+          manifest: {
+            schemaVersion: 1,
+            projectId: artifact.cloudProjectId,
+            artifactId: artifact.cloudArtifactId,
+            slug: "commit-lease",
+            title: "Commit lease",
+            revisions: [
+              {
+                id: "sync_revision_artifact-commit-lease_1",
+                version: 1,
+                preview: { adapter: "browser", entryPath: "index.html" },
+                approvedOrigins: [],
+                files: [
+                  {
+                    kind: "file",
+                    path: "index.html",
+                    sha256: fileHash,
+                    byteSize: bytes.byteLength,
+                    mediaType: "text/html",
+                  },
+                ],
+                createdAt: "2026-08-29T12:00:00.000Z",
+              },
+            ],
+          },
+        },
+        "owner-commit-lease",
+        { "X-Panes-Sync-Session": "session-two" },
+      ),
+    );
+    expect(commit.status).toBe(409);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM revision_files WHERE revision_id = ?")
+        .bind("sync_revision_artifact-commit-lease_1")
+        .first(),
+    ).toBeNull();
+  });
+
   it("runs bounded scheduled cleanup without deleting committed references", async () => {
     const create = await api(
       "/api/sync/artifacts",
@@ -234,6 +314,34 @@ describe("first private Sync Worker HTTP seam", () => {
     );
     if (!keepRow) throw new Error("expected tracked keep upload");
     if (!orphanRow) throw new Error("expected tracked orphan upload");
+    const orphanPromotedKey = privateRevisionObjectKey(
+      artifact.cloudProjectId,
+      artifact.cloudArtifactId,
+      `sync_revision_${artifact.cloudArtifactId}_1`,
+      "index.html",
+    );
+    const keepPromotedKey = privateRevisionObjectKey(
+      artifact.cloudProjectId,
+      artifact.cloudArtifactId,
+      `sync_revision_${artifact.cloudArtifactId}_1`,
+      "keep.html",
+    );
+    await env.PRIVATE_ARTIFACTS.put(orphanPromotedKey, bytes, {
+      customMetadata: {
+        sha256: await sha256(bytes),
+        byteSize: String(bytes.byteLength),
+      },
+    });
+    await env.PRIVATE_ARTIFACTS.put(
+      keepPromotedKey,
+      new TextEncoder().encode("keep"),
+      {
+        customMetadata: {
+          sha256: await sha256(new TextEncoder().encode("keep")),
+          byteSize: "4",
+        },
+      },
+    );
     await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO local_revisions
@@ -259,11 +367,14 @@ describe("first private Sync Worker HTTP seam", () => {
         await sha256(new TextEncoder().encode("keep")),
         4,
         "text/html",
-        keepRow.object_key,
+        keepPromotedKey,
       ),
       env.DB.prepare(
         "UPDATE sync_uploads SET created_at = ? WHERE artifact_id = ?",
       ).bind("2020-01-01T00:00:00.000Z", artifact.cloudArtifactId),
+      env.DB.prepare(
+        "UPDATE sync_artifacts SET sync_lease_owner = NULL, sync_lease_expires_at = NULL WHERE cloud_artifact_id = ?",
+      ).bind(artifact.cloudArtifactId),
     ]);
     const executionContext = createExecutionContext();
     await worker.scheduled(
@@ -281,13 +392,9 @@ describe("first private Sync Worker HTTP seam", () => {
       .first<{ object_key: string }>();
     expect(row).toBeNull();
     expect(await env.PRIVATE_ARTIFACTS.head(orphanRow.object_key)).toBeNull();
-    const kept = await env.DB.prepare(
-      "SELECT object_key FROM sync_uploads WHERE artifact_id = ? AND path = ?",
-    )
-      .bind(artifact.cloudArtifactId, "keep.html")
-      .first<{ object_key: string }>();
-    expect(kept?.object_key).toBe(keepRow.object_key);
-    expect(await env.PRIVATE_ARTIFACTS.head(keepRow.object_key)).not.toBeNull();
+    expect(await env.PRIVATE_ARTIFACTS.head(orphanPromotedKey)).toBeNull();
+    expect(await env.PRIVATE_ARTIFACTS.head(keepRow.object_key)).toBeNull();
+    expect(await env.PRIVATE_ARTIFACTS.head(keepPromotedKey)).not.toBeNull();
   });
 
   it("commits complete history one Revision at a time and retrieves each committed Revision", async () => {

@@ -4709,21 +4709,22 @@ async function releaseLocalSyncLease(
   let cloudArtifactId = state?.cloudArtifactId;
   let ownerCredential = state?.ownerCredential;
   let leaseSession = state?.sessionId ?? syncSession;
+  let checkpoint: SyncCheckpoint | undefined;
+  try {
+    checkpoint = await readSyncCheckpoint(
+      syncCheckpointPath(
+        options.apiBaseUrl.origin,
+        existing.manifest.projectId,
+        existing.manifest.artifactId,
+      ),
+    );
+  } catch {
+    return;
+  }
   if (!state) {
-    try {
-      const checkpoint = await readSyncCheckpoint(
-        syncCheckpointPath(
-          options.apiBaseUrl.origin,
-          existing.manifest.projectId,
-          existing.manifest.artifactId,
-        ),
-      );
-      cloudArtifactId = checkpoint?.cloudArtifactId;
-      ownerCredential = checkpoint?.ownerCredential;
-      leaseSession = checkpoint?.sessionId ?? syncSession;
-    } catch {
-      return;
-    }
+    cloudArtifactId = checkpoint?.cloudArtifactId;
+    ownerCredential = checkpoint?.ownerCredential;
+    leaseSession = checkpoint?.sessionId ?? syncSession;
   }
   if (!cloudArtifactId || cloudArtifactId === "pending" || !ownerCredential)
     return;
@@ -4744,6 +4745,21 @@ async function releaseLocalSyncLease(
       options.requestTimeoutMs,
     );
     if (!response.ok) return;
+    if (state) {
+      const { sessionId: _sessionId, ...stateWithoutSession } = state;
+      await writeSyncState(stateWithoutSession);
+    }
+    if (checkpoint) {
+      const { sessionId: _sessionId, ...checkpointWithoutSession } = checkpoint;
+      await writeSyncCheckpoint(
+        syncCheckpointPath(
+          options.apiBaseUrl.origin,
+          existing.manifest.projectId,
+          existing.manifest.artifactId,
+        ),
+        checkpointWithoutSession,
+      );
+    }
   } catch {
     // Lease expiry is the recovery path when a process cannot release cleanly.
   }

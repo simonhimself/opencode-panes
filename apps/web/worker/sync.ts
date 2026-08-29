@@ -27,6 +27,9 @@ const CREATOR_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SYNC_LEASE_TTL_MS = 60 * 1000;
 export const TEMP_UPLOAD_GRACE_MS = 24 * 60 * 60 * 1000;
 const CLEANUP_BATCH_SIZE = 100;
+const CREATOR_CAPABILITY_HEADERS = {
+  "Referrer-Policy": "no-referrer",
+} as const;
 const JSON_HEADERS = {
   "Cache-Control": "no-store",
   "Content-Type": "application/json; charset=utf-8",
@@ -50,6 +53,7 @@ interface SyncArtifactRow {
 }
 
 interface SyncUploadRow {
+  cloud_project_id: string;
   artifact_id: string;
   revision_version: number;
   session_id: string;
@@ -92,7 +96,13 @@ export async function routeSyncRequest(
   if (creatorMatch) {
     const token = decodePathSegment(creatorMatch[1]);
     if (!token || !ownerTokenSchema.safeParse(token).success)
-      return errorResponse(404, "NOT_FOUND", "Creator link not found");
+      return errorResponse(
+        404,
+        "NOT_FOUND",
+        "Creator link not found",
+        undefined,
+        CREATOR_CAPABILITY_HEADERS,
+      );
     return readCreatorCapability(request, env, token);
   }
 
@@ -360,7 +370,7 @@ function syncCreateResponse(
     inventoryUrl: new URL("/inventory", request.url).toString(),
     creatorExpiresAt: row.creator_expires_at,
   });
-  return jsonResponse(response, status, { "Referrer-Policy": "no-referrer" });
+  return jsonResponse(response, status, CREATOR_CAPABILITY_HEADERS);
 }
 
 async function uploadSyncFile(
@@ -697,7 +707,16 @@ async function commitSyncRevision(
     env.DB.prepare(
       `INSERT INTO revision_files
         (revision_id, path, sha256, byte_size, media_type, object_key)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+       SELECT ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM local_revisions
+           WHERE id = ? AND artifact_id = ? AND committed_at IS NOT NULL
+        )
+          AND EXISTS (
+            SELECT 1 FROM sync_artifacts
+             WHERE cloud_artifact_id = ? AND sync_lease_owner = ?
+               AND sync_lease_expires_at > ?
+          )`,
     ).bind(
       revisionId,
       file.path,
@@ -705,6 +724,11 @@ async function commitSyncRevision(
       file.byteSize,
       file.mediaType,
       file.objectKey,
+      revisionId,
+      artifactId,
+      artifactId,
+      sessionId(request),
+      new Date().toISOString(),
     ),
   );
   const commitResults = await env.DB.batch([
@@ -933,9 +957,22 @@ async function readCreatorCapability(
   )
     .bind(await hashToken(token))
     .first<CreatorCapabilityRow>();
-  if (!row) return errorResponse(404, "NOT_FOUND", "Creator link not found");
+  if (!row)
+    return errorResponse(
+      404,
+      "NOT_FOUND",
+      "Creator link not found",
+      undefined,
+      CREATOR_CAPABILITY_HEADERS,
+    );
   if (row.revoked_at || Date.parse(row.expires_at) <= Date.now()) {
-    return errorResponse(410, "NOT_FOUND", "Creator link is no longer active");
+    return errorResponse(
+      410,
+      "NOT_FOUND",
+      "Creator link is no longer active",
+      undefined,
+      CREATOR_CAPABILITY_HEADERS,
+    );
   }
   if (request.method !== "GET") return methodNotAllowed(["GET"]);
   return jsonResponse(
@@ -948,7 +985,7 @@ async function readCreatorCapability(
       creatorExpiresAt: row.expires_at,
     },
     200,
-    { "Referrer-Policy": "no-referrer" },
+    CREATOR_CAPABILITY_HEADERS,
   );
 }
 
@@ -1006,7 +1043,7 @@ async function rotateCreatorLink(
       creatorExpiresAt: expiresAt,
     }),
     200,
-    { "Referrer-Policy": "no-referrer" },
+    CREATOR_CAPABILITY_HEADERS,
   );
 }
 
@@ -1251,14 +1288,16 @@ export async function cleanupTemporarySyncUploads(
   now = new Date(),
 ): Promise<number> {
   const cutoff = new Date(now.getTime() - TEMP_UPLOAD_GRACE_MS).toISOString();
+  const cleanupOwner = `cleanup-${crypto.randomUUID()}`;
+  const cleanupLeases = new Set<string>();
+  // Prevent a concurrent commit from publishing a final object between the
+  // reference check and the R2 delete.
   const tracked = await env.DB.prepare(
     `SELECT u.artifact_id, u.revision_version, u.path, u.object_key,
-            u.created_at
+            u.created_at, a.cloud_project_id
        FROM sync_uploads u
+       JOIN sync_artifacts a ON a.cloud_artifact_id = u.artifact_id
       WHERE u.created_at < ?
-        AND NOT EXISTS (
-          SELECT 1 FROM revision_files f WHERE f.object_key = u.object_key
-        )
       ORDER BY u.created_at ASC
       LIMIT ?`,
   )
@@ -1271,9 +1310,37 @@ export async function cleanupTemporarySyncUploads(
         | "path"
         | "object_key"
         | "created_at"
+        | "cloud_project_id"
       >
     >();
-  const keys = new Set(tracked.results.map((row) => row.object_key));
+  const keys = new Set<string>();
+  const deletableTracked = [];
+  for (const row of tracked.results) {
+    if (!(await acquireCleanupLease(env.DB, row.artifact_id, cleanupOwner))) {
+      continue;
+    }
+    cleanupLeases.add(row.artifact_id);
+    const promotedObjectKey = privateRevisionObjectKey(
+      row.cloud_project_id,
+      row.artifact_id,
+      syncRevisionId(row.artifact_id, row.revision_version),
+      row.path,
+    );
+    const references = await env.DB.prepare(
+      `SELECT object_key FROM revision_files
+        WHERE object_key IN (?, ?)`,
+    )
+      .bind(row.object_key, promotedObjectKey)
+      .all<{ object_key: string }>();
+    const referenced = new Set(
+      references.results.map((item) => item.object_key),
+    );
+    if (!referenced.has(row.object_key)) keys.add(row.object_key);
+    if (!referenced.has(promotedObjectKey)) keys.add(promotedObjectKey);
+    if (!referenced.has(row.object_key) || !referenced.has(promotedObjectKey)) {
+      deletableTracked.push({ row, promotedObjectKey });
+    }
+  }
 
   const listed = await env.PRIVATE_ARTIFACTS.list({
     prefix: "private/tmp/",
@@ -1282,7 +1349,15 @@ export async function cleanupTemporarySyncUploads(
   });
   for (const object of listed.objects) {
     const createdAt = object.customMetadata?.createdAt;
-    if (createdAt && createdAt < cutoff) {
+    const artifactId = object.customMetadata?.artifactId;
+    if (
+      createdAt &&
+      createdAt < cutoff &&
+      artifactId &&
+      artifactIdSchema.safeParse(artifactId).success &&
+      (await acquireCleanupLease(env.DB, artifactId, cleanupOwner))
+    ) {
+      cleanupLeases.add(artifactId);
       const referenced = await env.DB.prepare(
         "SELECT 1 AS found FROM revision_files WHERE object_key = ? LIMIT 1",
       )
@@ -1292,25 +1367,81 @@ export async function cleanupTemporarySyncUploads(
     }
   }
   const boundedKeys = [...keys].slice(0, CLEANUP_BATCH_SIZE);
-  if (boundedKeys.length === 0) return 0;
+  if (boundedKeys.length === 0) {
+    await releaseCleanupLeases(env.DB, cleanupLeases, cleanupOwner);
+    return 0;
+  }
   await env.PRIVATE_ARTIFACTS.delete(boundedKeys);
-  const deleteStatements = tracked.results
-    .filter((row) => boundedKeys.includes(row.object_key))
-    .map((row) =>
+  const deleteStatements = deletableTracked
+    .filter(({ row }) => boundedKeys.includes(row.object_key))
+    .map(({ row, promotedObjectKey }) =>
       env.DB.prepare(
         `DELETE FROM sync_uploads
           WHERE artifact_id = ? AND revision_version = ? AND path = ?
-            AND object_key = ? AND created_at < ?`,
+            AND object_key = ? AND created_at < ?
+            AND EXISTS (
+              SELECT 1 FROM sync_artifacts
+               WHERE cloud_artifact_id = ? AND sync_lease_owner = ?
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM revision_files
+               WHERE object_key IN (?, ?)
+            )`,
       ).bind(
         row.artifact_id,
         row.revision_version,
         row.path,
         row.object_key,
         cutoff,
+        row.artifact_id,
+        cleanupOwner,
+        row.object_key,
+        promotedObjectKey,
       ),
     );
   if (deleteStatements.length > 0) await env.DB.batch(deleteStatements);
+  await releaseCleanupLeases(env.DB, cleanupLeases, cleanupOwner);
   return boundedKeys.length;
+}
+
+async function acquireCleanupLease(
+  db: D1Database,
+  artifactId: string,
+  owner: string,
+) {
+  const now = new Date().toISOString();
+  const expires = new Date(Date.now() + SYNC_LEASE_TTL_MS).toISOString();
+  const result = await db
+    .prepare(
+      `UPDATE sync_artifacts
+          SET sync_lease_owner = ?, sync_lease_expires_at = ?
+        WHERE cloud_artifact_id = ?
+          AND (sync_lease_owner IS NULL
+            OR sync_lease_expires_at <= ?
+            OR sync_lease_owner = ?)`,
+    )
+    .bind(owner, expires, artifactId, now, owner)
+    .run();
+  return result.meta.changes === 1;
+}
+
+async function releaseCleanupLeases(
+  db: D1Database,
+  artifactIds: Set<string>,
+  owner: string,
+) {
+  if (artifactIds.size === 0) return;
+  await db.batch(
+    [...artifactIds].map((artifactId) =>
+      db
+        .prepare(
+          `UPDATE sync_artifacts
+              SET sync_lease_owner = NULL, sync_lease_expires_at = NULL
+            WHERE cloud_artifact_id = ? AND sync_lease_owner = ?`,
+        )
+        .bind(artifactId, owner),
+    ),
+  );
 }
 
 function syncManifestKey(

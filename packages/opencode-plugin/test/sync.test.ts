@@ -423,6 +423,31 @@ describe("artifact_sync tool", () => {
       requests.filter(({ path }) => path === "/api/sync/artifacts"),
     ).toHaveLength(0);
   });
+
+  it("uses a fresh session after a successful release", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Rotate sessions", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    const firstSession = requests.find(
+      ({ headers }) => typeof headers["x-panes-sync-session"] === "string",
+    )?.headers["x-panes-sync-session"];
+    expect(firstSession).toEqual(expect.any(String));
+
+    await prepareAndFinalize(context, prepared.artifactId, {
+      "index.html": Buffer.from("<h1>two</h1>"),
+    });
+    requests = [];
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    const secondSession = requests.find(
+      ({ headers }) => typeof headers["x-panes-sync-session"] === "string",
+    )?.headers["x-panes-sync-session"];
+
+    expect(secondSession).toEqual(expect.any(String));
+    expect(secondSession).not.toBe(firstSession);
+  });
 });
 
 async function prepareAndFinalize(
