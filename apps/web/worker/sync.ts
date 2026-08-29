@@ -620,85 +620,90 @@ async function loadReconnectRevisions(
       )
         return undefined;
       if (
+        manifest.revisions.length !== revisionRow.version ||
         manifest.revisions.some(
           (candidate, index) => candidate.version !== index + 1,
         )
       )
         return undefined;
-      const revision = manifest.revisions.find(
-        (candidate) => candidate.version === revisionRow.version,
-      );
-      if (!revision) return undefined;
-      const storedPreview = previewEntrySchema.safeParse(
-        JSON.parse(revisionRow.preview_entry),
-      );
-      const storedOrigins = approvedOriginsSchema.safeParse(
-        JSON.parse(revisionRow.approved_origins),
-      );
-      if (!storedPreview.success || !storedOrigins.success) return undefined;
-      if (revision.files.some((file) => mandatoryExclusion(file.path)))
-        return undefined;
-      if (
-        JSON.stringify(revision.preview) !==
-          JSON.stringify(storedPreview.data) ||
-        JSON.stringify(revision.approvedOrigins) !==
-          JSON.stringify(storedOrigins.data) ||
-        revision.createdAt !== revisionRow.created_at
-      )
-        return undefined;
-      const fileRows = await env.DB.prepare(
-        `SELECT path, sha256, byte_size, media_type, object_key
-           FROM revision_files
-          WHERE revision_id = ?
-          ORDER BY path ASC`,
-      )
-        .bind(revisionRow.id)
-        .all<ReconnectFileRow>();
-      const cloudFiles = revision.files.filter((file) => file.kind === "file");
-      if (fileRows.results.length !== cloudFiles.length) return undefined;
-      const cloudFilesByPath = new Map(
-        cloudFiles.map((file) => [file.path, file]),
-      );
-      for (const fileRow of fileRows.results) {
-        const cloudFile = cloudFilesByPath.get(fileRow.path);
+      for (const [candidateIndex, candidate] of manifest.revisions.entries()) {
+        const ledgerRow = result.results[candidateIndex];
         if (
-          !cloudFile ||
-          cloudFile.sha256 !== fileRow.sha256 ||
-          cloudFile.byteSize !== fileRow.byte_size ||
-          cloudFile.mediaType !== fileRow.media_type ||
-          fileRow.object_key !==
-            privateRevisionObjectKey(
-              row.cloud_project_id,
-              row.cloud_artifact_id,
-              revisionRow.id,
-              fileRow.path,
-            )
-        )
-          return undefined;
-        const object = await env.PRIVATE_ARTIFACTS.head(fileRow.object_key);
-        if (
-          !object ||
-          object.customMetadata?.sha256 !== fileRow.sha256 ||
-          object.customMetadata?.byteSize !== String(fileRow.byte_size) ||
-          object.httpMetadata?.contentType !== fileRow.media_type
+          !ledgerRow ||
+          !(await reconnectRevisionMatches(env, row, ledgerRow, candidate))
         )
           return undefined;
       }
-      const filePaths = new Set(cloudFiles.map((file) => file.path));
-      if (
-        revision.files.some(
-          (file) =>
-            file.kind === "directory" &&
-            ![...filePaths].some((path) => path.startsWith(`${file.path}/`)),
-        )
-      )
-        return undefined;
+      const revision = manifest.revisions[revisionRow.version - 1];
+      if (!revision) return undefined;
       revisions.push(revision);
     } catch {
       return undefined;
     }
   }
   return revisions;
+}
+
+async function reconnectRevisionMatches(
+  env: Env,
+  row: ReconnectRow,
+  revisionRow: ReconnectRevisionRow,
+  revision: CloudManifest["revisions"][number],
+): Promise<boolean> {
+  if (revision.files.some((file) => mandatoryExclusion(file.path)))
+    return false;
+  const storedPreview = previewEntrySchema.safeParse(
+    JSON.parse(revisionRow.preview_entry),
+  );
+  const storedOrigins = approvedOriginsSchema.safeParse(
+    JSON.parse(revisionRow.approved_origins),
+  );
+  if (!storedPreview.success || !storedOrigins.success) return false;
+  if (
+    JSON.stringify(revision.preview) !== JSON.stringify(storedPreview.data) ||
+    JSON.stringify(revision.approvedOrigins) !==
+      JSON.stringify(storedOrigins.data) ||
+    revision.createdAt !== revisionRow.created_at
+  )
+    return false;
+  const fileRows = await env.DB.prepare(
+    `SELECT path, sha256, byte_size, media_type, object_key
+       FROM revision_files
+      WHERE revision_id = ?
+      ORDER BY path ASC`,
+  )
+    .bind(revisionRow.id)
+    .all<ReconnectFileRow>();
+  const cloudFiles = revision.files.filter((file) => file.kind === "file");
+  if (fileRows.results.length !== cloudFiles.length) return false;
+  const cloudFilesByPath = new Map(cloudFiles.map((file) => [file.path, file]));
+  for (const fileRow of fileRows.results) {
+    const cloudFile = cloudFilesByPath.get(fileRow.path);
+    if (
+      !cloudFile ||
+      cloudFile.sha256 !== fileRow.sha256 ||
+      cloudFile.byteSize !== fileRow.byte_size ||
+      cloudFile.mediaType !== fileRow.media_type ||
+      fileRow.object_key !==
+        privateRevisionObjectKey(
+          row.cloud_project_id,
+          row.cloud_artifact_id,
+          revisionRow.id,
+          fileRow.path,
+        )
+    )
+      return false;
+    const object = await env.PRIVATE_ARTIFACTS.head(fileRow.object_key);
+    if (
+      !object ||
+      object.size !== fileRow.byte_size ||
+      object.customMetadata?.sha256 !== fileRow.sha256 ||
+      object.customMetadata?.byteSize !== String(fileRow.byte_size) ||
+      object.httpMetadata?.contentType !== fileRow.media_type
+    )
+      return false;
+  }
+  return true;
 }
 
 async function loadReconnectCreatorLink(

@@ -19,6 +19,8 @@ import { readBoundedText } from "../worker/bounded-json";
 import { privateRevisionObjectKey } from "../worker/storage";
 
 const ORIGIN = "https://panes.example";
+const RECONNECT_MANIFEST_V1_KEY =
+  "private/manifests/636c6f75642d70726f6a6563742d6f6e65/636c6f75642d61727469666163742d6f6e65/v1.json";
 const RECONNECT_MANIFEST_V2_KEY =
   "private/manifests/636c6f75642d70726f6a6563742d6f6e65/636c6f75642d61727469666163742d6f6e65/v2.json";
 const KEY_MATERIAL =
@@ -197,6 +199,91 @@ describe("authenticated cloud inventory", () => {
       originalManifest,
     );
 
+    const v1ManifestObject = await env.PRIVATE_ARTIFACTS.get(
+      RECONNECT_MANIFEST_V1_KEY,
+    );
+    if (!v1ManifestObject)
+      throw new Error("reconnect v1 manifest fixture missing");
+    const originalV1Manifest = await v1ManifestObject.text();
+    const futureV1Manifest = JSON.parse(originalV1Manifest) as {
+      revisions: unknown[];
+    };
+    const v2Manifest = JSON.parse(originalManifest) as {
+      revisions: unknown[];
+    };
+    futureV1Manifest.revisions.push(v2Manifest.revisions[1]);
+    await env.PRIVATE_ARTIFACTS.put(
+      RECONNECT_MANIFEST_V1_KEY,
+      JSON.stringify(futureV1Manifest),
+    );
+    const futureInV1 = await api(
+      "/api/sync/artifacts/cloud-artifact-one/reconnect",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          localProjectId: "local-project-one",
+          localArtifactId: "local-artifact-one",
+          cloudProjectId: "cloud-project-one",
+          cloudArtifactId: "cloud-artifact-one",
+          reconnectCode: third.reconnectCode,
+          newOwnerCredential: "future-v1-owner",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(futureInV1.status).toBe(409);
+    await env.PRIVATE_ARTIFACTS.put(
+      RECONNECT_MANIFEST_V1_KEY,
+      originalV1Manifest,
+    );
+
+    await env.PRIVATE_ARTIFACTS.put(
+      privateRevisionObjectKey(
+        "cloud-project-one",
+        "cloud-artifact-one",
+        "revision-one-v2",
+        "index.html",
+      ),
+      "too-large",
+      {
+        httpMetadata: { contentType: "text/html" },
+        customMetadata: { sha256: "e".repeat(64), byteSize: "3" },
+      },
+    );
+    const wrongObjectSize = await api(
+      "/api/sync/artifacts/cloud-artifact-one/reconnect",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          localProjectId: "local-project-one",
+          localArtifactId: "local-artifact-one",
+          cloudProjectId: "cloud-project-one",
+          cloudArtifactId: "cloud-artifact-one",
+          reconnectCode: third.reconnectCode,
+          newOwnerCredential: "wrong-size-owner",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(wrongObjectSize.status).toBe(409);
+    await env.PRIVATE_ARTIFACTS.put(
+      privateRevisionObjectKey(
+        "cloud-project-one",
+        "cloud-artifact-one",
+        "revision-one-v2",
+        "index.html",
+      ),
+      "two",
+      {
+        httpMetadata: { contentType: "text/html" },
+        customMetadata: { sha256: "e".repeat(64), byteSize: "3" },
+      },
+    );
+
     await env.DB.prepare(
       "UPDATE revision_files SET sha256 = ? WHERE revision_id = ? AND path = ?",
     )
@@ -265,6 +352,11 @@ describe("authenticated cloud inventory", () => {
     expect(redeemed.status).toBe(200);
     const response = syncReconnectResponseSchema.parse(await redeemed.json());
     expect(response.creatorLink.status).toBe("active");
+    expect(response.syncedRevisionManifests[0]?.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "directory", path: "empty-dir" }),
+      ]),
+    );
     expect(response.publication).toEqual({
       status: "active",
       revisionVersion: 2,
@@ -1418,13 +1510,18 @@ async function encryptedToken(
 async function seedReconnectManifests() {
   const manifests = [
     {
-      key: "private/manifests/636c6f75642d70726f6a6563742d6f6e65/636c6f75642d61727469666163742d6f6e65/v1.json",
+      key: RECONNECT_MANIFEST_V1_KEY,
       revision: {
         id: "revision-one-v1",
         version: 1,
         preview: { adapter: "browser", entryPath: "index.html" },
         approvedOrigins: [],
         files: [
+          {
+            kind: "directory",
+            path: "empty-dir",
+            byteSize: 0,
+          },
           {
             kind: "file",
             path: "index.html",

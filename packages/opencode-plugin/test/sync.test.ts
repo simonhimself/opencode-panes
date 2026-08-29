@@ -117,10 +117,15 @@ describe("sync and publish intent tools", () => {
 
   it("reconnects from the canonical local manifest after protected state loss", async () => {
     const context = toolContext();
-    const prepared = await prepareAndFinalize(context, "Reconnect me", {
-      "index.html": Buffer.from("<h1>one</h1>"),
-      "local-secret.txt": Buffer.from("must remain local"),
-    });
+    const prepared = await prepareAndFinalize(
+      context,
+      "Reconnect me",
+      {
+        "index.html": Buffer.from("<h1>one</h1>"),
+        "local-secret.txt": Buffer.from("must remain local"),
+      },
+      ["empty-dir"],
+    );
     await writeFile(
       join(project, "artifacts", "reconnect-me", ".panesignore"),
       "local-secret.txt\n",
@@ -183,7 +188,7 @@ describe("sync and publish intent tools", () => {
     expect(state.syncedRevisionManifests?.[0]?.version).toBe(1);
     expect(
       state.syncedRevisionManifests?.[0]?.files.map(({ path }) => path),
-    ).toEqual(["index.html"]);
+    ).toEqual(["empty-dir", "index.html"]);
 
     requests = [];
     const nextSync = await executeSync(
@@ -209,6 +214,7 @@ describe("sync and publish intent tools", () => {
       1, 2,
     ]);
     expect(secondManifest.revisions[0]?.files.map(({ path }) => path)).toEqual([
+      "empty-dir",
       "index.html",
     ]);
 
@@ -732,6 +738,7 @@ async function prepareAndFinalize(
   context: ToolContext,
   artifactOrTitle: string,
   files: Record<string, Buffer>,
+  directories: string[] = [],
 ) {
   const plugin = await OpenCodePanesPlugin({} as never, {});
   const prepare = plugin.tool?.artifact_prepare as ToolDefinition;
@@ -746,6 +753,11 @@ async function prepareAndFinalize(
       recursive: true,
     });
     await writeFile(join(preparedMetadata.draftPath as string, path), bytes);
+  }
+  for (const path of directories) {
+    await mkdir(join(preparedMetadata.draftPath as string, path), {
+      recursive: true,
+    });
   }
   const finalized = await finalize.execute(
     {
