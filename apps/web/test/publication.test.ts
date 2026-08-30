@@ -508,6 +508,80 @@ describe("local-first publication lifecycle", () => {
     expect(await unknownResponse.text()).not.toContain(unknownToken);
   });
 
+  it("keeps adopted provenance private after a committed publication", async () => {
+    const artifact = await syncedArtifact();
+    const provenance = {
+      grantId: "adoption-grant-public-privacy",
+      cloudArtifactId: artifact.cloudArtifactId,
+      localProjectId: "adopted-local-project",
+      localArtifactId: "adopted-local-artifact",
+      localSlug: "adopted-local-slug",
+      legacyArtifactId: "legacy-private-artifact",
+      legacyRevisionId: "legacy-private-revision",
+      legacyRevisionVersion: 1,
+      legacyTitle: "Adopted publication",
+      legacyType: "html" as const,
+      createdAt: "2026-08-29T12:00:00.000Z",
+    };
+    await env.DB.prepare(
+      `INSERT INTO legacy_adoption_provenance
+        (grant_id, cloud_artifact_id, local_project_id, local_artifact_id,
+         local_slug, legacy_artifact_id, legacy_revision_id,
+         legacy_revision_version, legacy_title, legacy_type, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        provenance.grantId,
+        provenance.cloudArtifactId,
+        provenance.localProjectId,
+        provenance.localArtifactId,
+        provenance.localSlug,
+        provenance.legacyArtifactId,
+        provenance.legacyRevisionId,
+        provenance.legacyRevisionVersion,
+        provenance.legacyTitle,
+        provenance.legacyType,
+        provenance.createdAt,
+      )
+      .run();
+
+    const publication = publicationSchema.parse(
+      await (
+        await api(
+          `/api/creator/${artifact.creatorToken}/publish`,
+          jsonRequest({ revisionVersion: 1, durationDays: 7 }),
+        )
+      ).json(),
+    );
+    const publicToken = await storedPublicationToken(
+      artifact.cloudArtifactId,
+      publication.id,
+    );
+    const creator = creatorWorkspaceResponseSchema.parse(
+      await (await api(`/api/creator/${artifact.creatorToken}`)).json(),
+    );
+    expect(creator.legacyProvenance).toMatchObject({
+      grantId: provenance.grantId,
+      localProjectId: provenance.localProjectId,
+      localArtifactId: provenance.localArtifactId,
+      localSlug: provenance.localSlug,
+    });
+
+    const publicResponse = await api(`/api/publications/${publicToken}`);
+    expect(publicResponse.status).toBe(200);
+    const publicBody = await publicResponse.text();
+    for (const value of [
+      provenance.grantId,
+      provenance.legacyArtifactId,
+      provenance.legacyRevisionId,
+      provenance.localProjectId,
+      provenance.localArtifactId,
+      provenance.localSlug,
+    ]) {
+      expect(publicBody).not.toContain(value);
+    }
+  });
+
   it("keeps creator metadata operations independent from ciphertext contents", async () => {
     const artifact = await syncedArtifact();
     const first = publicationSchema.parse(

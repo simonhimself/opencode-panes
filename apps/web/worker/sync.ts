@@ -878,7 +878,7 @@ async function adoptionProvenanceMatchesRequest(
 ): Promise<boolean> {
   const row = await db
     .prepare(
-      `SELECT id, legacy_artifact_id, legacy_revision_id,
+      `SELECT id, legacy_artifact_id, legacy_revision_id, expires_at,
               legacy_revision_version, legacy_title, legacy_type,
               consumed_at, revoked_at, local_project_id, local_artifact_id,
               local_slug
@@ -890,6 +890,7 @@ async function adoptionProvenanceMatchesRequest(
       id: string;
       legacy_artifact_id: string;
       legacy_revision_id: string;
+      expires_at: string;
       legacy_revision_version: number;
       legacy_title: string;
       legacy_type: LegacyAdoptionProvenance["legacyType"];
@@ -904,6 +905,7 @@ async function adoptionProvenanceMatchesRequest(
       row &&
       row.consumed_at &&
       !row.revoked_at &&
+      row.expires_at > new Date().toISOString() &&
       provenance.localProjectId === localProjectId &&
       provenance.localArtifactId === localArtifactId &&
       provenance.localSlug === localSlug &&

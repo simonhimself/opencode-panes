@@ -189,13 +189,43 @@ describe("authenticated cloud inventory", () => {
       accessEnv(material),
     );
     expect(redeem.status).toBe(200);
+    const adoptedBody = await redeem.text();
     const adopted = legacyAdoptionRedeemResponseSchema.parse(
-      await redeem.json(),
+      JSON.parse(adoptedBody),
     );
     expect(adopted.source).toBe(source);
     expect(adopted.provenance.legacyRevisionId).toBe(
       "legacy-adoption-revision-2",
     );
+    const grantBeforeRetry = await env.DB.prepare(
+      "SELECT consumed_at, expires_at, local_project_id, local_artifact_id, local_slug FROM legacy_adoption_grants WHERE id = ?",
+    )
+      .bind(adopted.provenance.grantId)
+      .first();
+    const retry = await api(
+      "/api/adopt/legacy/legacy-adoption-one",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          apiOrigin: ORIGIN,
+          code: issued.code,
+          localProjectId: "local-project-adopted",
+          localArtifactId: "local-artifact-adopted",
+          slug: "adopted-artifact",
+        }),
+      },
+      accessEnv(material),
+    );
+    expect(retry.status).toBe(200);
+    expect(await retry.text()).toBe(adoptedBody);
+    expect(
+      await env.DB.prepare(
+        "SELECT consumed_at, expires_at, local_project_id, local_artifact_id, local_slug FROM legacy_adoption_grants WHERE id = ?",
+      )
+        .bind(adopted.provenance.grantId)
+        .first(),
+    ).toEqual(grantBeforeRetry);
 
     const syncEnv = {
       ...accessEnv(material),
@@ -439,6 +469,129 @@ describe("authenticated cloud inventory", () => {
       accessEnv(material),
     );
     expect(changedSlug.status).toBe(403);
+    expect(await changedSlug.text()).toContain("Adoption request is invalid");
+  });
+
+  it("rejects expired or revoked consumed grants and converges exact concurrent redemption", async () => {
+    const expired = await seedAdoptionGrant("consumed-expired", {
+      consumed: true,
+      expiresAt: "2020-01-01T00:00:00.000Z",
+    });
+    const expiredResponse = await api(
+      `/api/adopt/legacy/${expired.artifactId}`,
+      redeemRequest(expired.code, expired.binding),
+    );
+    expect(expiredResponse.status).toBe(403);
+    const lifecycleMaterial = await accessMaterial("adoption-lifecycle");
+    stubJwks(lifecycleMaterial);
+    const expiredSync = await worker.fetch(
+      new Request(`${ORIGIN}/api/sync/artifacts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Panes-Create-Key": "sync-key",
+        },
+        body: JSON.stringify({
+          projectId: expired.binding.localProjectId,
+          artifactId: expired.binding.localArtifactId,
+          slug: expired.binding.slug,
+          title: "Adoption fixture",
+          kind: "html",
+          idempotencyKey: "expired-adoption-sync",
+          ownerCredential: "expired-owner",
+          creatorToken: "expired-creator",
+          legacyProvenance: {
+            grantId: expired.grantId,
+            localProjectId: expired.binding.localProjectId,
+            localArtifactId: expired.binding.localArtifactId,
+            localSlug: expired.binding.slug,
+            legacyArtifactId: expired.artifactId,
+            legacyRevisionId: `${expired.artifactId}-revision`,
+            legacyRevisionVersion: 1,
+            legacyTitle: "Adoption fixture",
+            legacyType: "html",
+          },
+        }),
+      }),
+      {
+        ...accessEnv(lifecycleMaterial),
+        PANES_CREATE_API_KEY: "sync-key",
+      },
+    );
+    expect(expiredSync.status).toBe(409);
+
+    const cleanupIssue = await api(
+      `/api/inventory/legacy/artifacts/${expired.artifactId}/adoption-code`,
+      {
+        method: "POST",
+        headers: {
+          "Cf-Access-Jwt-Assertion": await accessToken(lifecycleMaterial, {
+            email: "simonhimself@gmail.com",
+          }),
+          "Content-Type": "application/json",
+        },
+      },
+      accessEnv(lifecycleMaterial),
+    );
+    expect(cleanupIssue.status).toBe(200);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM legacy_adoption_grants WHERE id = ?")
+        .bind(expired.grantId)
+        .first(),
+    ).toBeNull();
+
+    const revoked = await seedAdoptionGrant("consumed-revoked", {
+      consumed: true,
+      revokedAt: "2026-08-29T12:01:00.000Z",
+    });
+    const revokedResponse = await api(
+      `/api/adopt/legacy/${revoked.artifactId}`,
+      redeemRequest(revoked.code, revoked.binding),
+    );
+    expect(revokedResponse.status).toBe(403);
+
+    const concurrent = await seedAdoptionGrant("concurrent", {});
+    const [first, second] = await Promise.all([
+      api(
+        `/api/adopt/legacy/${concurrent.artifactId}`,
+        redeemRequest(concurrent.code, concurrent.binding),
+      ),
+      api(
+        `/api/adopt/legacy/${concurrent.artifactId}`,
+        redeemRequest(concurrent.code, concurrent.binding),
+      ),
+    ]);
+    const firstBody = await first.text();
+    const secondBody = await second.text();
+    expect(first.status, firstBody).toBe(200);
+    expect(second.status, secondBody).toBe(200);
+    expect(firstBody).toBe(secondBody);
+    expect(
+      await env.DB.prepare(
+        "SELECT consumed_at, expires_at, local_project_id, local_artifact_id, local_slug FROM legacy_adoption_grants WHERE id = ?",
+      )
+        .bind(concurrent.grantId)
+        .first(),
+    ).toMatchObject({
+      expires_at: concurrent.expiresAt,
+      local_project_id: concurrent.binding.localProjectId,
+      local_artifact_id: concurrent.binding.localArtifactId,
+      local_slug: concurrent.binding.slug,
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM legacy_adoption_grants WHERE legacy_artifact_id = ?",
+      )
+        .bind(concurrent.artifactId)
+        .first(),
+    ).toEqual({ count: 1 });
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM revisions WHERE artifact_id = ?",
+      )
+        .bind(concurrent.artifactId)
+        .first(),
+    ).toEqual({ count: 1 });
   });
 
   it("issues one-time hashed reconnect codes with a bounded TTL and replaces only the Owner credential", async () => {
@@ -2244,6 +2397,83 @@ async function sha256Text(value: string): Promise<string> {
   return Array.from(new Uint8Array(digest), (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("");
+}
+
+async function seedAdoptionGrant(
+  suffix: string,
+  options: {
+    consumed?: boolean;
+    expiresAt?: string;
+    revokedAt?: string | null;
+  },
+) {
+  const artifactId = `legacy-adoption-${suffix}`;
+  const revisionId = `${artifactId}-revision`;
+  const grantId = `adoption-grant-${suffix}`;
+  const code = `panes-adopt-legacy-${(await sha256Text(suffix)).slice(0, 32)}`;
+  const createdAt = "2026-08-29T12:00:00.000Z";
+  const expiresAt = options.expiresAt ?? "2099-08-29T12:00:00.000Z";
+  const consumed = options.consumed ?? false;
+  const binding = {
+    localProjectId: `local-project-${suffix}`,
+    localArtifactId: `local-artifact-${suffix}`,
+    slug: `local-${suffix}`,
+  };
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO artifacts (id, owner_token_hash, workspace_token_hash, opencode_session_id, title, type, current_revision_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ).bind(
+      artifactId,
+      "a".repeat(64),
+      "b".repeat(64),
+      `session-${suffix}`,
+      "Adoption fixture",
+      "html",
+      revisionId,
+      createdAt,
+      createdAt,
+    ),
+    env.DB.prepare(
+      "INSERT INTO revisions (id, artifact_id, version, source, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).bind(revisionId, artifactId, 1, "<p>fixture</p>", createdAt),
+    env.DB.prepare(
+      "INSERT INTO legacy_artifacts (artifact_id, migrated_at, private_expires_at) VALUES (?, ?, ?)",
+    ).bind(artifactId, createdAt, "2099-08-29T12:00:00.000Z"),
+    env.DB.prepare(
+      `INSERT INTO legacy_adoption_grants
+        (id, legacy_artifact_id, legacy_revision_id, legacy_revision_version,
+         legacy_title, legacy_type, code_hash, created_at, expires_at,
+         consumed_at, revoked_at, local_project_id, local_artifact_id, local_slug)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(
+      grantId,
+      artifactId,
+      revisionId,
+      1,
+      "Adoption fixture",
+      "html",
+      await sha256Text(code),
+      createdAt,
+      expiresAt,
+      consumed ? createdAt : null,
+      options.revokedAt ?? null,
+      consumed ? binding.localProjectId : null,
+      consumed ? binding.localArtifactId : null,
+      consumed ? binding.slug : null,
+    ),
+  ]);
+  return { artifactId, binding, code, expiresAt, grantId };
+}
+
+function redeemRequest(
+  code: string,
+  binding: { localProjectId: string; localArtifactId: string; slug: string },
+): RequestInit {
+  return {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiOrigin: ORIGIN, code, ...binding }),
+  };
 }
 
 async function api(path: string, init?: RequestInit, workerEnv: Env = env) {

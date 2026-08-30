@@ -43,6 +43,10 @@ export async function issueLegacyAdoptionCode(
   const grantId = `adoption_grant_${crypto.randomUUID()}`;
   const result = await env.DB.batch([
     env.DB.prepare(
+      `DELETE FROM legacy_adoption_grants
+        WHERE expires_at <= ?`,
+    ).bind(createdAt),
+    env.DB.prepare(
       `UPDATE legacy_adoption_grants
           SET revoked_at = ?
         WHERE legacy_artifact_id = ?
@@ -68,7 +72,7 @@ export async function issueLegacyAdoptionCode(
       MAX_ARTIFACT_SOURCE_BYTES,
     ),
   ]);
-  if (result[1]?.meta.changes !== 1)
+  if (result[2]?.meta.changes !== 1)
     return adoptionError(404, "Artifact not found");
 
   const source = await readAdoptionGrant(env.DB, artifactId, codeHash);
@@ -106,20 +110,19 @@ export async function redeemLegacyAdoption(
 
   const codeHash = await hashToken(parsed.data.code);
   const now = new Date().toISOString();
-  const grant = await readAdoptionGrant(env.DB, artifactId, codeHash);
-  if (
-    !grant ||
-    grant.revoked_at !== null ||
-    grant.expires_at <= now ||
-    (grant.consumed_at !== null &&
-      (grant.local_project_id !== parsed.data.localProjectId ||
-        grant.local_artifact_id !== parsed.data.localArtifactId ||
-        grant.local_slug !== parsed.data.slug))
-  ) {
+  const grant = await readAdoptionGrant(env.DB, artifactId, codeHash, true);
+  if (!grant) {
     return adoptionError(403, "Adoption request is invalid");
   }
 
-  if (grant.consumed_at === null) {
+  if (grant.consumed_at !== null) {
+    if (!sameBinding(grant, parsed.data)) {
+      return adoptionError(403, "Adoption request is invalid");
+    }
+    return adoptionResponse(request, parsed.data, grant);
+  }
+
+  {
     const result = await env.DB.prepare(
       `UPDATE legacy_adoption_grants
           SET consumed_at = ?, local_project_id = ?, local_artifact_id = ?,
@@ -137,9 +140,9 @@ export async function redeemLegacyAdoption(
       )
       .run();
     if (result.meta.changes !== 1) {
-      const retry = await readAdoptionGrant(env.DB, artifactId, codeHash);
+      const retry = await readAdoptionGrant(env.DB, artifactId, codeHash, true);
       if (!retry || !sameBinding(retry, parsed.data))
-        return adoptionError(409, "Adoption request is invalid");
+        return adoptionError(403, "Adoption request is invalid");
       return adoptionResponse(request, parsed.data, retry);
     }
   }
@@ -151,6 +154,7 @@ async function readAdoptionGrant(
   db: D1Database,
   artifactId: string,
   codeHash: string,
+  includeConsumed = false,
 ): Promise<AdoptionGrantRow | null> {
   return db
     .prepare(
@@ -166,11 +170,18 @@ async function readAdoptionGrant(
          JOIN artifacts a ON a.id = g.legacy_artifact_id
          JOIN revisions r ON r.id = g.legacy_revision_id
         WHERE g.legacy_artifact_id = ? AND g.code_hash = ?
-          AND g.consumed_at IS NULL AND g.revoked_at IS NULL
+          AND g.revoked_at IS NULL
+          ${includeConsumed ? "" : "AND g.consumed_at IS NULL"}
           AND legacy.private_expires_at > ?
+          AND g.expires_at > ?
           AND a.current_revision_id = g.legacy_revision_id`,
     )
-    .bind(artifactId, codeHash, new Date().toISOString())
+    .bind(
+      artifactId,
+      codeHash,
+      new Date().toISOString(),
+      new Date().toISOString(),
+    )
     .first<AdoptionGrantRow>();
 }
 

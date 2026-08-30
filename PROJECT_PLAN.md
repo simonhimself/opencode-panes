@@ -26,7 +26,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 10. The creator can copy, download, or publish a selected revision.
 
 Legacy adoption is an explicit inventory-to-plugin handoff. The creator issues a
-short-lived, single-use adoption code for the current Legacy Revision, then the
+short-lived adoption code for the current Legacy Revision, then the
 plugin redeems it into a project-local finalized v1 without changing source
 bytes. The original Legacy history stays separate and read-only. The first
 local-first Sync creates a new cloud identity and records the Legacy provenance.

@@ -192,6 +192,146 @@ describe("artifact workspace", () => {
     expect(container.textContent).not.toContain("Extend publication");
   });
 
+  it("issues Legacy adoption codes through the Access-protected inventory action", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const payload = {
+      projects: [],
+      legacyArtifacts: [
+        {
+          artifactId: "legacy-adoption-client",
+          title: "Client adoption fixture",
+          type: "html",
+          revisionCount: 2,
+          storageBytes: 128,
+          createdAt: "2026-08-01T10:00:00.000Z",
+          updatedAt: "2026-08-03T10:00:00.000Z",
+          privateExpiresAt: "2026-09-01T10:00:00.000Z",
+          status: "active",
+          publicationStatus: "none",
+          publicationExpiresAt: null,
+        },
+      ],
+    };
+    let postCount = 0;
+    let releaseFirstIssue!: () => void;
+    const firstIssueReleased = new Promise<void>(
+      (resolve) => (releaseFirstIssue = resolve),
+    );
+    const fetcher = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method !== "POST")
+          return new Response(JSON.stringify(payload));
+        postCount += 1;
+        if (postCount === 1) {
+          await firstIssueReleased;
+          return new Response(
+            JSON.stringify({
+              operation: "adoption-code-issued",
+              artifactId: "legacy-adoption-client",
+              code: "panes-adopt-legacy-11111111111111111111111111111111",
+              expiresAt: "2026-08-31T10:00:00.000Z",
+              source: {
+                title: "Client adoption fixture",
+                type: "html",
+                revisionVersion: 2,
+              },
+            }),
+          );
+        }
+        if (postCount === 2) {
+          return new Response(
+            JSON.stringify({
+              operation: "adoption-code-issued",
+              artifactId: "legacy-adoption-client",
+              code: "panes-adopt-legacy-22222222222222222222222222222222",
+              expiresAt: "2026-08-31T11:00:00.000Z",
+              source: {
+                title: "Client adoption fixture",
+                type: "html",
+                revisionVersion: 2,
+              },
+            }),
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            error: { code: "SERVICE_UNAVAILABLE", message: "Issue failed" },
+          }),
+          { status: 503 },
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    await act(async () => {
+      root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+    const issue = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Export / adopt locally",
+    );
+    expect(issue).not.toBeUndefined();
+    await act(async () => {
+      issue?.click();
+      await settle();
+    });
+    expect(issue?.textContent).toBe("Issuing…");
+    releaseFirstIssue();
+    await act(async () => {
+      await settle();
+    });
+    expect(container.textContent).toContain("Copy this one-time code now");
+    expect(container.textContent).toContain("v2");
+    expect(container.textContent).toContain("Expires Aug 31, 2026");
+    expect(container.textContent).toContain(
+      "panes-adopt-legacy-11111111111111111111111111111111",
+    );
+    expect(container.textContent).not.toContain("ownerCredential");
+    expect(container.textContent).not.toContain("source bytes");
+    expect(container.textContent).not.toContain("Owner credential");
+    const copy = [...container.querySelectorAll("button")].find(
+      (button) => button.textContent === "Copy code",
+    );
+    await act(async () => {
+      copy?.click();
+      await settle();
+    });
+    expect(writeText).toHaveBeenCalledWith(
+      "panes-adopt-legacy-11111111111111111111111111111111",
+    );
+
+    await act(async () => {
+      issue?.click();
+      await settle();
+    });
+    expect(container.textContent).not.toContain(
+      "panes-adopt-legacy-11111111111111111111111111111111",
+    );
+    expect(container.textContent).toContain(
+      "panes-adopt-legacy-22222222222222222222222222222222",
+    );
+    await act(async () => {
+      issue?.click();
+      await settle();
+    });
+    expect(container.textContent).toContain("Issue failed");
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/inventory/legacy/artifacts/legacy-adoption-client/adoption-code",
+      expect.objectContaining({
+        method: "POST",
+        body: "{}",
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    expect(postCount).toBe(3);
+    expect(String(fetcher.mock.calls[1]?.[0])).not.toContain("source");
+  });
+
   it("requires the exact reconnect confirmation and keeps the issued code ephemeral", async () => {
     const writeText = vi.fn(async () => undefined);
     Object.defineProperty(navigator, "clipboard", {

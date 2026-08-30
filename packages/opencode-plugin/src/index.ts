@@ -90,6 +90,7 @@ const FINALIZE_JOURNAL_FILE_NAME = ".panes-finalize.json";
 const IMPORT_JOURNAL_FILE_NAME = ".panes-import.json";
 const ARTIFACT_LOCK_FILE_NAME = ".panes-lock.json";
 const IMPORT_RECEIPT_TTL_MS = 5 * 60 * 1000;
+const ADOPTION_RESULT_TTL_MS = 5 * 60 * 1000;
 const PREVIEW_FRAME_PATH = "__panes__/frame";
 const execFileAsync = promisify(execFile);
 const PROCESS_OWNER_ID = randomUUID();
@@ -154,6 +155,10 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
   const previewServer = new LocalPreviewServer();
   const locks = new Map<string, Promise<void>>();
   const adoptionLocks = new Map<string, Promise<void>>();
+  const adoptionResults = new Map<
+    string,
+    { checkpoint: AdoptionCheckpoint; expiresAt: number }
+  >();
   const originApprovals = new Map<string, OriginApproval>();
   const importReceipts = new Map<string, ImportReceipt>();
 
@@ -362,7 +367,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
       }),
       artifact_adopt_legacy: tool({
         description:
-          "Adopt one authenticated Legacy artifact into the current project as a local finalized v1. The code is single-use, source bytes are copied unchanged, and no Owner credential is stored.",
+          "Adopt one authenticated Legacy artifact into the current project as a local finalized v1. The code binds one local destination and permits safe same-binding retries, source bytes are copied unchanged, and no Owner credential is stored.",
         args: {
           artifactId: tool.schema
             .string()
@@ -392,6 +397,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             context,
             locks,
             adoptionLocks,
+            adoptionResults,
             previewServer,
             options,
           );
@@ -799,6 +805,10 @@ async function adoptLegacyArtifact(
   context: ToolContext,
   locks: Map<string, Promise<void>>,
   adoptionLocks: Map<string, Promise<void>>,
+  adoptionResults: Map<
+    string,
+    { checkpoint: AdoptionCheckpoint; expiresAt: number }
+  >,
   previewServer: LocalPreviewServer,
   options: ResolvedOptions,
 ) {
@@ -836,6 +846,14 @@ async function adoptLegacyArtifact(
         codeDigest,
       );
       let checkpoint = await readAdoptionCheckpoint(checkpointPath);
+      if (!checkpoint) {
+        const cached = adoptionResults.get(operationKey);
+        if (cached && cached.expiresAt > Date.now()) {
+          checkpoint = cached.checkpoint;
+        } else if (cached) {
+          adoptionResults.delete(operationKey);
+        }
+      }
       if (checkpoint) {
         if (
           checkpoint.apiOrigin !== options.apiBaseUrl.origin ||
@@ -895,7 +913,11 @@ async function adoptLegacyArtifact(
             if (artifact.manifest.revisions.length > 0) {
               await verifyFinalizedRevisions(artifact);
               checkpoint = { ...checkpoint, phase: "completed" };
-              await writeProtectedJson(checkpointPath, checkpoint);
+              adoptionResults.set(operationKey, {
+                checkpoint,
+                expiresAt: Date.now() + ADOPTION_RESULT_TTL_MS,
+              });
+              await unlinkAdoptionCheckpoint(checkpointPath);
               return reopenExistingArtifact(
                 artifact,
                 undefined,
@@ -941,6 +963,7 @@ async function adoptLegacyArtifact(
               legacyAdoptionRedeemResponseSchema,
               [adoptionCode.data],
             );
+            injectFailure(options, "adopt-after-redemption-response");
             if (
               payload.apiOrigin !== options.apiBaseUrl.origin ||
               payload.localProjectId !== checkpoint.projectId ||
@@ -1045,7 +1068,11 @@ async function adoptLegacyArtifact(
             options,
           );
           checkpoint = { ...checkpoint, phase: "completed" };
-          await writeProtectedJson(checkpointPath, checkpoint);
+          adoptionResults.set(operationKey, {
+            checkpoint,
+            expiresAt: Date.now() + ADOPTION_RESULT_TTL_MS,
+          });
+          await unlinkAdoptionCheckpoint(checkpointPath);
           return finalized;
         });
       } catch (error) {
@@ -5790,6 +5817,14 @@ async function readAdoptionCheckpoint(
   if (!isAdoptionCheckpoint(value))
     throw new Error(`Adoption checkpoint at ${path} is invalid.`);
   return value;
+}
+
+async function unlinkAdoptionCheckpoint(path: string): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+  }
 }
 
 function isAdoptionCheckpoint(value: unknown): value is AdoptionCheckpoint {

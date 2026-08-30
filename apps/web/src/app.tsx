@@ -382,6 +382,8 @@ function LegacyInventoryArtifactCard({
         </button>
         {adoption ? (
           <p>
+            Copy this one-time code now. It is not stored in the browser.
+            <br />
             Current {adoption.type} v{adoption.revisionVersion}. Expires{" "}
             {formatInventoryTime(adoption.expiresAt)}.
             <br />
