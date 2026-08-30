@@ -1,6 +1,7 @@
 import {
   creatorWorkspaceResponseSchema,
   publicationSchema,
+  publicPublicationResponseSchema,
   syncCreateResponseSchema,
 } from "@opencode-panes/contracts";
 import { env } from "cloudflare:test";
@@ -260,6 +261,183 @@ describe("local-first publication lifecycle", () => {
     expect(JSON.stringify(stored)).not.toContain(
       await storedPublicationToken(artifact.cloudArtifactId, publication.id),
     );
+  });
+
+  it("shares the selected Revision with a seven-day default and returns its Public URL", async () => {
+    const artifact = await syncedArtifact();
+    const share = await api(
+      `/api/creator/${artifact.creatorToken}/share`,
+      jsonRequest({ revisionVersion: 1 }),
+    );
+    expect(share.status).toBe(201);
+    const publication = publicationSchema.parse(await share.json());
+    expect(publication).toMatchObject({
+      artifactId: artifact.cloudArtifactId,
+      revisionVersion: 1,
+      durationDays: 7,
+      status: "active",
+    });
+    expect(publication.publicUrl).toMatch(
+      /^https:\/\/panes\.example\/published\/[0-9a-f]{64}$/u,
+    );
+    const publicToken = publication.publicUrl?.split("/").at(-1);
+    expect(publicToken).toBeDefined();
+    const publicResponse = await api(`/api/publications/${publicToken}`);
+    expect(publicResponse.status).toBe(200);
+    expect(await publicResponse.text()).not.toContain(publicToken ?? "");
+  });
+
+  it("updates an active Share in place while preserving its URL, token, and expiry", async () => {
+    const artifact = await syncedArtifact();
+    await syncRevision(artifact, 2, "<h1>second</h1>");
+    const first = publicationSchema.parse(
+      await (
+        await api(
+          `/api/creator/${artifact.creatorToken}/share`,
+          jsonRequest({ revisionVersion: 1 }),
+        )
+      ).json(),
+    );
+    const firstStored = await env.DB.prepare(
+      "SELECT created_at, token_hash, token_ciphertext, token_nonce FROM publications WHERE id = ?",
+    )
+      .bind(first.id)
+      .first<{
+        created_at: string;
+        token_hash: string;
+        token_ciphertext: string;
+        token_nonce: string;
+      }>();
+    const refreshed = await api(`/api/creator/${artifact.creatorToken}/share`, {
+      method: "GET",
+    });
+    expect(refreshed.status).toBe(200);
+    expect(publicationSchema.parse(await refreshed.json())).toMatchObject({
+      id: first.id,
+      publicUrl: first.publicUrl,
+      revisionVersion: 1,
+      expiresAt: first.expiresAt,
+    });
+    const updated = await api(
+      `/api/creator/${artifact.creatorToken}/share`,
+      jsonRequest({ revisionVersion: 2, durationDays: 30 }),
+    );
+    expect(updated.status).toBe(200);
+    const second = publicationSchema.parse(await updated.json());
+    expect(second).toMatchObject({
+      id: first.id,
+      revisionVersion: 2,
+      durationDays: first.durationDays,
+      expiresAt: first.expiresAt,
+      publicUrl: first.publicUrl,
+    });
+    const secondStored = await env.DB.prepare(
+      "SELECT created_at, token_hash, token_ciphertext, token_nonce FROM publications WHERE id = ?",
+    )
+      .bind(second.id)
+      .first<typeof firstStored>();
+    expect(secondStored).toEqual(firstStored);
+    const activeRows = await env.DB.prepare(
+      "SELECT id, revision_version FROM publications WHERE artifact_id = ? AND status = 'active'",
+    )
+      .bind(artifact.cloudArtifactId)
+      .all<{ id: string; revision_version: number }>();
+    expect(activeRows.results).toEqual([{ id: first.id, revision_version: 2 }]);
+
+    const publicToken = second.publicUrl?.split("/").at(-1);
+    const publicResponse = await api(`/api/publications/${publicToken}`);
+    expect(publicResponse.status).toBe(200);
+    const publicWorkspace = publicPublicationResponseSchema.parse(
+      await publicResponse.json(),
+    );
+    expect(publicWorkspace.revision.version).toBe(2);
+  });
+
+  it("creates a new Share token after expiry or revocation", async () => {
+    const artifact = await syncedArtifact();
+    const first = publicationSchema.parse(
+      await (
+        await api(
+          `/api/creator/${artifact.creatorToken}/share`,
+          jsonRequest({ revisionVersion: 1 }),
+        )
+      ).json(),
+    );
+    await env.DB.prepare("UPDATE publications SET expires_at = ? WHERE id = ?")
+      .bind("2020-01-01T00:00:00.000Z", first.id)
+      .run();
+    const afterExpiry = publicationSchema.parse(
+      await (
+        await api(
+          `/api/creator/${artifact.creatorToken}/share`,
+          jsonRequest({ revisionVersion: 1 }),
+        )
+      ).json(),
+    );
+    expect(afterExpiry.id).not.toBe(first.id);
+    expect(afterExpiry.publicUrl).not.toBe(first.publicUrl);
+
+    await api(`/api/creator/${artifact.creatorToken}/unpublish`, {
+      method: "POST",
+    });
+    const afterRevoke = publicationSchema.parse(
+      await (
+        await api(
+          `/api/creator/${artifact.creatorToken}/share`,
+          jsonRequest({ revisionVersion: 1 }),
+        )
+      ).json(),
+    );
+    expect(afterRevoke.id).not.toBe(afterExpiry.id);
+    expect(afterRevoke.publicUrl).not.toBe(afterExpiry.publicUrl);
+  });
+
+  it("does not report a successful Share when its Public URL cannot be recovered", async () => {
+    const artifact = await syncedArtifact();
+    const first = publicationSchema.parse(
+      await (
+        await api(
+          `/api/creator/${artifact.creatorToken}/share`,
+          jsonRequest({ revisionVersion: 1 }),
+        )
+      ).json(),
+    );
+    await env.DB.prepare(
+      "UPDATE publications SET token_ciphertext = ? WHERE id = ?",
+    )
+      .bind("tampered", first.id)
+      .run();
+    const response = await api(
+      `/api/creator/${artifact.creatorToken}/share`,
+      jsonRequest({ revisionVersion: 1 }),
+    );
+    expect(response.status).toBe(503);
+    expect(await response.text()).not.toContain(first.publicUrl ?? "");
+  });
+
+  it("rejects non-POST unpublish requests without revoking the active Share", async () => {
+    const artifact = await syncedArtifact();
+    const shared = publicationSchema.parse(
+      await (
+        await api(
+          `/api/creator/${artifact.creatorToken}/share`,
+          jsonRequest({ revisionVersion: 1 }),
+        )
+      ).json(),
+    );
+
+    const response = await api(
+      `/api/creator/${artifact.creatorToken}/unpublish`,
+      { method: "GET" },
+    );
+    expect(response.status).toBe(405);
+    expect(response.headers.get("Allow")).toBe("POST");
+
+    const active = await api(`/api/creator/${artifact.creatorToken}/share`, {
+      method: "GET",
+    });
+    expect(active.status).toBe(200);
+    expect(publicationSchema.parse(await active.json()).id).toBe(shared.id);
   });
 
   it("reuses same-active state without extending, and supports explicit actions", async () => {
@@ -795,6 +973,9 @@ describe("local-first publication lifecycle", () => {
     expect(await nested.text()).toContain("dataset.ready");
     expect(nested.headers.get("Content-Security-Policy")).toContain(
       "sandbox allow-scripts",
+    );
+    expect(nested.headers.get("Content-Security-Policy")).toContain(
+      "connect-src https:",
     );
     expect(nested.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect(

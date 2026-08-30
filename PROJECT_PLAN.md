@@ -58,9 +58,9 @@ Without Git, the root is `<session-directory>/artifacts/`. A normalized
 merges slug collisions and never uses the directory name as cloud identity.
 
 `artifact.json` is the local non-secret Revision ledger. It includes all local
-files, including files excluded from Sync, and contains no credentials, bearer
-tokens, reconnect codes, or admission secrets. Panes does not stage, commit,
-branch, revert, or rewrite Git state.
+files, including files excluded from Sync, and persists approved origins. It
+contains no credentials, bearer tokens, reconnect codes, or admission secrets.
+Panes does not stage, commit, branch, revert, or rewrite Git state.
 
 ## Draft, Revision, and import contract
 
@@ -100,13 +100,11 @@ policy. The local server binds only to IPv4 loopback and returns temporary
 process-local URLs. Preview path traversal, aliases, escaping symlinks, and
 changed finalized files are rejected.
 
-External access is denied by default. A Draft may request exact normalized
-`http` or `https` origins. Finalize first validates the preview and returns an
-approval-required result when origins need approval. A second call must carry
-the bound nonce and the unchanged exact origin set. Approved origins are
-immutable per Revision and become derived CSP directives. Redirects to
-unapproved origins remain blocked. `ws:`, `wss:`, and all other schemes are
-unsupported; WebSockets are not available.
+HTTPS stylesheets, fonts, images, media, scripts, and API calls work by default
+without origin approval. The advanced compatibility path accepts exact
+normalized plain-HTTP origins and requires Finalize approval. Approved origins
+are immutable per Revision and become derived CSP directives. `ws:`, `wss:`,
+and all other schemes are unsupported; WebSockets are not available.
 
 ## Synchronization and storage
 
@@ -137,8 +135,9 @@ Panes derives a separate filtered cloud manifest containing only synchronized
 Revisions, Preview entries, approved origins, and exact selected files. Ignored
 filenames, paths, hashes, and sizes never appear in it. The cloud manifest
 cannot be ignored, and neither it nor the canonical local manifest is uploaded
-as Revision content. Public and Creator delivery is mediated by the Worker
-from private R2. The R2 bucket is never public.
+as Revision content. Public and Creator
+delivery is mediated by the Worker from private R2. The R2 bucket is never
+public.
 
 Initial remote limits are 25 MiB per file and 100 MiB per Revision, measured in
 raw bytes after ignore evaluation. They do not constrain local Drafts or local
@@ -160,24 +159,28 @@ Panes keeps capabilities separate:
   rotation revokes it and starts a new 30-day period.
 - A Publication grants public access to exactly one synced Revision for 1, 7,
   or 30 days. Seven days is the default, permanent Publication is unavailable,
-  and there is at most one active Publication per Artifact. Expired and revoked
-  Publication records remain server-side. Creator exposes the full history;
-  inventory reports the current or latest state. Private synced files remain
-  until explicit cloud deletion.
-- A Public link is the bearer URL for that Publication. It cannot expose later
-  or other private Revisions. Active Public tokens use a one-way lookup hash
-  plus recoverable encrypted ciphertext under a versioned Worker-managed key.
-  Only the Access-protected inventory reconstructs an active Public URL. Public
-  token plaintext appears only in that authorized active-link result;
-  encryption keys never leave Worker secret storage. Neither enters manifests,
-  logs, or analytics. Revocation clears recoverable ciphertext immediately;
-  expiry clears it when an inventory, Creator, or Public request observes the
-  expired record.
+  and there is at most one active Publication per Artifact. Sharing a newer
+  synced Revision through an active Publication preserves its Public URL and
+  expiry. Expired and revoked Publication records remain server-side. Creator
+  exposes the full history; inventory reports the current or latest state.
+  Private synced files remain until explicit cloud deletion.
+- A Public link is the bearer URL for that Publication. It cannot expose another
+  private Revision unless the active Publication is explicitly updated to
+  select it. Active Public tokens use a one-way lookup hash plus recoverable
+  encrypted ciphertext under a versioned Worker-managed key. A
+  Creator-authorized sharing response and the Access-protected inventory can
+  reconstruct an active Public URL. Public token plaintext appears only in
+  those authorized active-link results; encryption keys never leave Worker
+  secret storage. Neither enters manifests, logs, or analytics. Revocation
+  clears recoverable ciphertext immediately; expiry clears it when an
+  inventory, Creator, or Public request observes the expired record.
 - Cloud inventory is an Access-protected administrative surface for synced
-  Artifacts. It groups by project and shows revision count, storage size, last
-  Sync, Creator expiry, Publication status and expiry, and Legacy state. It has
-  no knowledge of local-only Artifacts. Its Access session policy is separate
-  from capability expiry; synced cloud data remains until explicit deletion.
+  Artifacts. It shows current Artifacts before collapsed Legacy history and
+  places recovery and destructive controls behind Manage. It groups current
+  work by project and shows revision count, storage size, last Sync, Creator
+  expiry, and Publication state. It has no knowledge of local-only Artifacts.
+  Its Access session policy is separate from capability expiry; synced cloud
+  data remains until explicit deletion.
 
 Cloud deletion requires exact human confirmation in inventory. It revokes all
 active Creator and Public capabilities, removes D1 metadata and private R2

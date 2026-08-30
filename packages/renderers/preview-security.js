@@ -33,14 +33,15 @@ export function normalizePreviewOrigins(origins) {
 
 export function createArtifactNetworkPolicy(origins) {
   const normalizedOrigins = normalizePreviewOrigins(origins);
+  const allowedOrigins = ["https:", ...normalizedOrigins];
   return {
     origins: normalizedOrigins,
-    connectSrc: normalizedOrigins,
-    imageSrc: normalizedOrigins,
-    mediaSrc: normalizedOrigins,
-    fontSrc: normalizedOrigins,
-    styleSrc: normalizedOrigins,
-    scriptSrc: normalizedOrigins,
+    connectSrc: allowedOrigins,
+    imageSrc: allowedOrigins,
+    mediaSrc: allowedOrigins,
+    fontSrc: allowedOrigins,
+    styleSrc: allowedOrigins,
+    scriptSrc: allowedOrigins,
   };
 }
 
@@ -53,7 +54,8 @@ export function isAllowedArtifactNetworkRequest(value, origins) {
   }
   if (!HTTP_SCHEMES.has(url.protocol)) return false;
   try {
-    return createArtifactNetworkPolicy(origins).origins.includes(url.origin);
+    const policy = createArtifactNetworkPolicy(origins);
+    return policy.connectSrc.includes(url.origin) || url.protocol === "https:";
   } catch {
     return false;
   }

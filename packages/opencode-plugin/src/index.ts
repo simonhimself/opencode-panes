@@ -192,7 +192,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
             .array(tool.schema.string())
             .optional()
             .describe(
-              "HTTP(S) origins requested by the Draft, defaulting to none.",
+              "Advanced compatibility only. Exact plain-HTTP origins requested by the Draft; normal HTTPS dependencies need no origin list.",
             ),
           draftAction: tool.schema
             .enum(["resume", "discard"])
@@ -417,11 +417,15 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
           requestedOrigins: tool.schema
             .array(tool.schema.string())
             .optional()
-            .describe("Normalized origins declared by the Draft."),
+            .describe(
+              "Advanced compatibility only. Exact plain-HTTP origins declared by the Draft; HTTPS dependencies need no approval.",
+            ),
           approvedOrigins: tool.schema
             .array(tool.schema.string())
             .optional()
-            .describe("Exact origins approved for a nonce-confirmed Finalize."),
+            .describe(
+              "Advanced compatibility only. Exact plain-HTTP origins approved for a nonce-confirmed Finalize.",
+            ),
           approvalNonce: tool.schema
             .string()
             .trim()
@@ -494,7 +498,7 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
       }),
       artifact_publish: tool({
         description:
-          "Begin publishing a local Panes Artifact by completing private Sync and opening its Creator workspace. The human selects the exact synced Revision and 1, 7, or 30 day duration in that workspace. This intent never selects or sends a Revision, duration, or Publication request.",
+          "Begin sharing a local Panes Artifact by completing private Sync and opening its Creator workspace. The human selects the exact synced Revision and 1, 7, or 30 day duration, then confirms Share in that workspace. This intent never selects or sends a Revision, duration, or Publication request.",
         args: {
           artifactId: tool.schema
             .string()
@@ -3094,7 +3098,10 @@ async function finalizeArtifactLocked(
   validatePreviewFile(request.preview, entryFile);
 
   const approval = originApprovals.get(request.artifactId);
-  if (requestedOrigins.length > 0) {
+  const requiresOriginApproval =
+    requestedOrigins.length > 0 &&
+    requestedOrigins.some((origin) => origin.startsWith("http://"));
+  if (requiresOriginApproval) {
     if (!request.approvalNonce) {
       const validationToken = await previewServer.register({
         artifactId: request.artifactId,
@@ -4608,9 +4615,7 @@ function createArtifactFrameDocument(
 ) {
   const origin = new URL(baseUrl).origin;
   const csp = createFrameCsp(origin, approvedOrigins);
-  const guard = createArtifactEgressGuardScript({
-    allowHttpNetwork: approvedOrigins.length > 0,
-  });
+  const guard = createArtifactEgressGuardScript();
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeHtmlAttribute(csp)}"><meta http-equiv="x-dns-prefetch-control" content="off"><base href="${escapeHtmlAttribute(baseUrl)}"><script>${escapeInlineScript(guard)}</script>${head}</head><body>${body}</body></html>`;
 }
 

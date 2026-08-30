@@ -152,6 +152,95 @@ describe("artifact workspace", () => {
     expect(container.textContent).not.toContain("read-only");
   });
 
+  it("puts current Artifacts before collapsed Legacy history and Manage controls", async () => {
+    const payload = {
+      projects: [
+        {
+          projectId: "project-current",
+          artifacts: [
+            {
+              artifactId: "artifact-current",
+              slug: "current",
+              title: "Current artifact",
+              kind: null,
+              lifecycleState: "active",
+              revisionCount: 1,
+              storageBytes: 10,
+              lastSyncedAt: "2026-08-29T12:00:00.000Z",
+              creatorLink: {
+                status: "active",
+                expiresAt: "2026-09-28T12:00:00.000Z",
+              },
+              publication: {
+                status: "none",
+                revisionVersion: null,
+                expiresAt: null,
+              },
+              revisions: [
+                { version: 1, createdAt: "2026-08-29T12:00:00.000Z" },
+              ],
+              warnings: [],
+            },
+          ],
+        },
+      ],
+      legacyArtifacts: [
+        {
+          artifactId: "legacy-history",
+          title: "Archived artifact",
+          type: "html",
+          revisionCount: 3,
+          storageBytes: 128,
+          createdAt: "2026-08-01T10:00:00.000Z",
+          updatedAt: "2026-08-03T10:00:00.000Z",
+          privateExpiresAt: "2026-08-31T10:00:00.000Z",
+          status: "active",
+          publicationStatus: "none",
+          publicationExpiresAt: null,
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify(payload))),
+    );
+
+    await act(async () => {
+      root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+
+    const project = container.querySelector(".inventory-project");
+    const legacyHistory = container.querySelector<HTMLDetailsElement>(
+      ".inventory-legacy-history",
+    );
+    expect(project?.textContent).toContain("project-current");
+    expect(legacyHistory).not.toBeNull();
+    expect(project?.compareDocumentPosition(legacyHistory as Node) ?? 0).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(legacyHistory?.open).toBe(false);
+    expect(legacyHistory?.querySelector("summary")?.textContent).toContain(
+      "1 artifact",
+    );
+    expect(legacyHistory?.querySelector("summary")?.textContent).toContain(
+      "read-only",
+    );
+
+    const currentCard = container.querySelector(
+      '[data-artifact-id="artifact-current"]',
+    );
+    expect(currentCard).not.toBeNull();
+    const manage =
+      currentCard?.querySelector<HTMLDetailsElement>(".inventory-manage");
+    expect(manage?.open).toBe(false);
+    expect(manage?.querySelector("button")?.textContent).toContain(
+      "Rotate Creator link",
+    );
+    expect(currentCard?.textContent).toContain("Extend publication");
+    expect(currentCard?.textContent).toContain("Republish");
+  });
+
   it("renders Legacy inventory as read-only with deletion confirmation only", async () => {
     const payload = {
       projects: [],
@@ -179,6 +268,22 @@ describe("artifact workspace", () => {
       await settle();
     });
 
+    const legacyHistory = container.querySelector<HTMLDetailsElement>(
+      ".inventory-legacy-history",
+    );
+    expect(legacyHistory?.open).toBe(false);
+    await act(async () => {
+      legacyHistory?.querySelector("summary")?.click();
+      await settle();
+    });
+    const manage =
+      legacyHistory?.querySelector<HTMLDetailsElement>(".inventory-manage");
+    expect(manage?.open).toBe(false);
+    await act(async () => {
+      manage?.querySelector("summary")?.click();
+      await settle();
+    });
+
     expect(container.textContent).toContain("Read-only cloud history");
     expect(container.textContent).toContain("Archived artifact");
     expect(container.textContent).toContain("128 B");
@@ -186,7 +291,11 @@ describe("artifact workspace", () => {
     expect(container.textContent).toContain(
       "cannot be edited, published, or extended",
     );
-    expect(container.querySelector("button")?.disabled).toBe(true);
+    expect(
+      [...container.querySelectorAll("button")].find(
+        (button) => button.textContent === "Delete Legacy artifact",
+      )?.disabled,
+    ).toBe(true);
     expect(container.textContent).not.toContain("Rotate Creator link");
     expect(container.textContent).not.toContain("Republish");
     expect(container.textContent).not.toContain("Extend publication");
@@ -269,6 +378,17 @@ describe("artifact workspace", () => {
 
     await act(async () => {
       root.render(<App route={{ kind: "inventory" }} />);
+      await settle();
+    });
+    const legacyHistory = container.querySelector<HTMLDetailsElement>(
+      ".inventory-legacy-history",
+    );
+    await act(async () => {
+      legacyHistory?.querySelector("summary")?.click();
+      await settle();
+      legacyHistory
+        ?.querySelector<HTMLElement>(".inventory-manage summary")
+        ?.click();
       await settle();
     });
     const issue = [...container.querySelectorAll("button")].find(
@@ -395,6 +515,12 @@ describe("artifact workspace", () => {
       root.render(<App route={{ kind: "inventory" }} />);
       await settle();
     });
+    const manage =
+      container.querySelector<HTMLDetailsElement>(".inventory-manage");
+    await act(async () => {
+      manage?.querySelector("summary")?.click();
+      await settle();
+    });
     const input = container.querySelector<HTMLInputElement>(
       "#reconnect-artifact-demo",
     );
@@ -508,6 +634,12 @@ describe("artifact workspace", () => {
       root.render(<App route={{ kind: "inventory" }} />);
       await settle();
     });
+    const manage =
+      container.querySelector<HTMLDetailsElement>(".inventory-manage");
+    await act(async () => {
+      manage?.querySelector("summary")?.click();
+      await settle();
+    });
     expect(container.textContent).toContain(
       "permanently remove Creator/public links, cloud metadata, and stored bytes",
     );
@@ -595,6 +727,12 @@ describe("artifact workspace", () => {
       await settle();
     });
 
+    const manage =
+      container.querySelector<HTMLDetailsElement>(".inventory-manage");
+    await act(async () => {
+      manage?.querySelector("summary")?.click();
+      await settle();
+    });
     const deleteButton = [...container.querySelectorAll("button")].find(
       (button) => button.textContent === "Delete cloud copy",
     );
@@ -671,7 +809,7 @@ describe("artifact workspace", () => {
     expect(container.textContent).not.toContain("Delete");
   });
 
-  it("keeps creator publication controls while directing URL recovery to inventory", () => {
+  it("keeps advanced Creator share controls behind Manage share", () => {
     const workspace: CreatorWorkspaceResponse = {
       cloudArtifactId: "artifact-demo",
       cloudProjectId: "project-demo",
@@ -711,7 +849,8 @@ describe("artifact workspace", () => {
     const markup = renderToStaticMarkup(
       <CreatorWorkspace token="creator-token" workspace={workspace} />,
     );
-    expect(markup).toContain("authenticated cloud inventory");
+    expect(markup).not.toContain("authenticated cloud inventory");
+    expect(markup).toContain("Manage share");
     expect(markup).toContain("Extend by 7 days");
     expect(markup).toContain("Republish v1");
     expect(markup).not.toContain(

@@ -61,13 +61,15 @@ Git internals, dependencies, Drafts, and build caches, cannot be re-included.
 Excluded files do not count toward remote limits.
 
 **Requested origin**
-An exact normalized `http` or `https` origin requested by a Draft. It has no
-effect until the Finalize approval handshake succeeds.
+An exact normalized `http` or `https` origin requested by a Draft for the
+advanced plain-HTTP compatibility path. HTTPS dependencies work by default and
+do not need a requested origin.
 
 **Approved origin**
 The exact HTTP(S) origin set approved for one immutable Revision. Panes derives
-CSP directives from it. `ws`, `wss`, and other schemes are unsupported and stay
-blocked; WebSockets are not available.
+CSP directives from it. HTTPS is allowed by default; plain HTTP remains blocked
+unless its exact origin is approved. `ws`, `wss`, and other schemes are
+unsupported and stay blocked; WebSockets are not available.
 
 **Owner credential**
 A persistent local secret for one cloud Artifact. It authorizes Sync and
@@ -83,7 +85,8 @@ link and starts a new period.
 **Publication**
 Server-side state granting public access to exactly one synced Revision for 1,
 7, or 30 days. Seven days is the default. There is at most one active
-Publication per Artifact. Expired and revoked Publication records remain as
+Publication per Artifact. Updating its selected synced Revision preserves its
+Public URL and expiry. Expired and revoked Publication records remain as
 server-side history. Creator exposes the full history; inventory reports the
 current or latest Publication state. Private synced files do not expire with a
 Publication.
@@ -92,22 +95,23 @@ Publication.
 The Public link is an expiring bearer URL. Its token authorizes only the
 Revision selected by its Publication and its supporting files. Active tokens
 are stored server-side as a lookup hash plus recoverable encrypted ciphertext
-under a versioned Worker-managed key. Only the Access-protected inventory can
-reconstruct an active link. Token plaintext and key material are not exposed in
-manifests, logs, or analytics. Public-token plaintext appears only in the
-Access-authorized active-link result, and key material never leaves Worker
-secret storage. Revocation removes recoverable ciphertext immediately; expiry
-removes it when an inventory, Creator, or Public request observes the expired
-record.
+under a versioned Worker-managed key. A Creator-authorized sharing response and
+the Access-protected inventory can reconstruct an active link. Token plaintext
+and key material are not exposed in manifests, logs, or analytics. Public-token
+plaintext appears only in those authorized active-link results, and key
+material never leaves Worker secret storage. Revocation removes recoverable
+ciphertext immediately; expiry removes it when an inventory, Creator, or Public
+request observes the expired record.
 
 **Cloud inventory**
 The Access-protected administrative view of synced cloud Artifacts, grouped by
-project. It shows Revision and storage metadata, Creator expiry, Publication
-status and expiry, and Legacy entries. It does not include local-only Artifacts.
-Access session policy is independent of Creator and Public expiry. Synced cloud
-data remains until explicit deletion. The inventory can rotate Creator links,
-manage Publication, issue adoption or reconnect codes, export Legacy content,
-and explicitly delete cloud copies.
+project. It shows current Artifacts before collapsed Legacy history. Recovery
+and destructive controls are available behind Manage. It shows Revision and
+storage metadata, Creator expiry, and Publication status and expiry. It does not
+include local-only Artifacts. Access session policy is independent of Creator
+and Public expiry. Synced cloud data remains until explicit deletion. The
+inventory can rotate Creator links, manage Publication, issue adoption or
+reconnect codes, export Legacy content, and explicitly delete cloud copies.
 
 **Private R2**
 The Worker-mediated store for exact synchronized file bytes and cloud

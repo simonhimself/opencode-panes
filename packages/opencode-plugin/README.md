@@ -82,11 +82,12 @@ source. Finalize probes and returns a temporary unguessable
 `http://127.0.0.1` Local preview URL. Finalize never contacts Cloudflare.
 
 The local manifest records all local Revision files, including files that will
-not be synchronized. Finalized files are checked by hash and size. Modified
-files, missing files, unsafe paths, and manifest mismatches block preview and
-Sync rather than silently repairing history.
+not be synchronized, plus each Revision's approved origins. Finalized files are
+checked by hash and size. Modified files, missing files, unsafe paths, and
+manifest mismatches block preview and Sync rather than silently repairing
+history.
 
-## Explicit Sync and human Publication
+## Explicit Sync and Creator sharing
 
 `artifact_sync` is the only new cloud creation path. It asks for upload
 permission before first Sync, uploads every unsynced finalized Revision in
@@ -99,10 +100,13 @@ protected local plugin state.
 `openCreatorAfterSuccess` defaults to `false`. With `true`, successful Sync
 requests the separate `artifact_open` permission after Sync and still returns
 the Creator URL when opening is denied or fails. `artifact_publish` is only a
-publish intent: it runs Sync and requests Creator opening. It does not select a
+sharing intent: it runs Sync and requests Creator opening. It does not select a
 Revision, select a duration, or submit a Publication. The human makes those
-choices in the Creator workspace, selecting one synced Revision and 1, 7, or
-30 days. Seven days is the default and permanent Publication is unavailable.
+choices and confirms Share in the Creator workspace, selecting one synced
+Revision and 1, 7, or 30 days. Seven days is the default and permanent
+Publication is unavailable. A confirmed Share returns the selected Revision,
+expiry, and Public URL in the Creator view. Sharing another synced Revision
+while a Share is active updates that same Public URL and expiry in place.
 
 The Owner credential authorizes Sync and Creator-link rotation and is never in
 the repository, manifest, URL, or tool output. A Creator link reads and manages
@@ -113,13 +117,13 @@ surface for synced Artifacts, deletion, recovery, Publication lifecycle, and
 Legacy migration.
 
 An active Public token is retained server-side as a one-way lookup hash and
-recoverable encrypted ciphertext under a versioned Worker-managed key. Only the
-Access-protected inventory can reconstruct its Public URL. Token plaintext and
-key material are not exposed in manifests, logs, or analytics. Public-token
-plaintext appears only in the Access-authorized active-link result, and key
-material never leaves Worker secret storage. Revocation removes recoverable
-ciphertext immediately; expiry removes it when an inventory, Creator, or Public
-request observes the expired record.
+recoverable encrypted ciphertext under a versioned Worker-managed key. A
+Creator-authorized Share response and the Access-protected inventory can
+reconstruct its Public URL. Token plaintext and key material are not exposed in
+manifests, logs, or analytics. Public-token plaintext appears only in those
+authorized active-link results, and key material never leaves Worker secret
+storage. Revocation removes recoverable ciphertext immediately; expiry removes
+it when an inventory, Creator, or Public request observes the expired record.
 
 ## Sync filtering and security
 
@@ -136,10 +140,10 @@ Initial remote limits are 25 MiB per file and 100 MiB per Revision after ignore
 evaluation. These limits do not limit local Drafts or local Revision history.
 Legacy adoption retains its separate 1 MiB UTF-8 source limit.
 
-Network access is denied by default. Finalize can request exact normalized
-`http` or `https` origins. The first call returns `approval-required` without
-promotion. After human approval, the second call must provide the bound nonce
-and unchanged exact origin set. Approved origins are immutable per Revision.
+HTTPS stylesheets, fonts, images, media, scripts, and API calls work by default
+without origin approval. The advanced compatibility path accepts exact
+normalized plain-HTTP origins and requires the existing nonce approval flow.
+Approved origins are immutable per Revision.
 `ws:`, `wss:`, and all other schemes are unsupported, and WebSockets remain
 blocked.
 

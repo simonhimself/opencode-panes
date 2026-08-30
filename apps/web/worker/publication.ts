@@ -1,6 +1,7 @@
 import {
   creatorPublicationExtendRequestSchema,
   creatorPublicationRequestSchema,
+  creatorShareRequestSchema,
   approvedOriginsSchema,
   cloudManifestSchema,
   ownerTokenSchema,
@@ -140,16 +141,19 @@ export async function routePublicationRequest(
   }
 
   const match = new URL(request.url).pathname.match(
-    /^\/api\/creator\/([^/]+)\/(?:publication\/)?(publish|republish|extend|unpublish)$/u,
+    /^\/api\/creator\/([^/]+)\/(?:publication\/)?(share|publish|republish|extend|unpublish)$/u,
   );
   if (!match) return undefined;
   const token = decodeSegment(match[1]);
   if (!token || !ownerTokenSchema.safeParse(token).success) return notFound();
-  if (request.method !== "POST") return methodNotAllowed(["POST"]);
 
   const artifact = await authenticateCreator(token, env.DB);
   if (artifact instanceof Response) return artifact;
   const operation = match[2];
+  if (operation === "share" && request.method === "GET") {
+    return activeShareResponse(env, artifact, new URL(request.url).origin);
+  }
+  if (request.method !== "POST") return methodNotAllowed(["POST"]);
   if (operation === "unpublish") return unpublishPublication(env.DB, artifact);
 
   if (operation === "extend") {
@@ -160,17 +164,18 @@ export async function routePublicationRequest(
     if (!body.ok) return body.response;
     return mutatePublication(env, artifact, "extend", body.data);
   }
-  const body = await parseBody(request, creatorPublicationRequestSchema);
+  const isShare = operation === "share";
+  const body = await parseBody(
+    request,
+    isShare ? creatorShareRequestSchema : creatorPublicationRequestSchema,
+  );
   if (!body.ok) return body.response;
   return mutatePublication(
     env,
     artifact,
-    operation === "extend"
-      ? "extend"
-      : operation === "republish"
-        ? "republish"
-        : "publish",
+    operation === "republish" ? "republish" : "publish",
     body.data,
+    isShare ? new URL(request.url).origin : undefined,
   );
 }
 
@@ -268,6 +273,7 @@ async function mutatePublication(
   artifact: CreatorArtifactRow,
   operation: "publish" | "republish" | "extend",
   body: { revisionVersion?: number; durationDays: 1 | 7 | 30 },
+  publicOrigin?: string,
 ): Promise<Response> {
   const leaseOwner = `publication-${crypto.randomUUID()}`;
   const lease = await acquirePublicationLease(
@@ -297,7 +303,33 @@ async function mutatePublication(
       Date.parse(active.expires_at) > nowDate.getTime() &&
       active.revision_version === revision.version
     ) {
-      return publicationResponse(active, 200);
+      return publicationResponse(env, active, 200, publicOrigin);
+    }
+
+    if (
+      publicOrigin &&
+      active &&
+      Date.parse(active.expires_at) > nowDate.getTime() &&
+      active.revision_version !== revision.version
+    ) {
+      if (!(await recoverPublicUrl(env, active, publicOrigin)))
+        return serviceUnavailable("The Public URL could not be recovered");
+      const updated = await env.DB.prepare(
+        `UPDATE publications SET revision_version = ?
+          WHERE id = ? AND artifact_id = ? AND status = 'active'
+            AND expires_at > ?`,
+      )
+        .bind(revision.version, active.id, artifact.cloud_artifact_id, now)
+        .run();
+      if (updated.meta.changes !== 1)
+        return conflict("Publication is no longer active; retry Share");
+      const updatedPublication = await activePublication(
+        env.DB,
+        artifact.cloud_artifact_id,
+      );
+      if (!updatedPublication || updatedPublication.id !== active.id)
+        return conflict("Publication could not be updated; retry Share");
+      return publicationResponse(env, updatedPublication, 200, publicOrigin);
     }
 
     const publicationId = `publication_${crypto.randomUUID()}`;
@@ -353,7 +385,7 @@ async function mutatePublication(
       .bind(publicationId)
       .first<PublicationRow>();
     if (!created) throw new Error("Created Publication was not found");
-    return publicationResponse(created, 201);
+    return publicationResponse(env, created, 201, publicOrigin);
   } finally {
     await releasePublicationLease(
       env.DB,
@@ -361,6 +393,20 @@ async function mutatePublication(
       leaseOwner,
     );
   }
+}
+
+async function activeShareResponse(
+  env: Env,
+  artifact: CreatorArtifactRow,
+  publicOrigin: string,
+): Promise<Response> {
+  const active = await activePublication(env.DB, artifact.cloud_artifact_id);
+  if (!active) return notFound("Active Share not found");
+  if (Date.parse(active.expires_at) <= Date.now()) {
+    await expirePublication(env.DB, active.id, new Date().toISOString());
+    return gone();
+  }
+  return publicationResponse(env, active, 200, publicOrigin);
 }
 
 async function extendPublication(
@@ -393,7 +439,7 @@ async function extendPublication(
     .first<PublicationRow>();
   if (!updated || updated.status !== "active")
     return conflict("Publication is no longer active; use Republish instead");
-  return publicationResponse(updated, 200);
+  return publicationResponse(env, updated, 200);
 }
 
 async function unpublishPublication(
@@ -458,7 +504,18 @@ async function publicationView(row: PublicationRow): Promise<Publication> {
   });
 }
 
-async function publicationResponse(row: PublicationRow, status: number) {
+async function publicationResponse(
+  env: Env,
+  row: PublicationRow,
+  status: number,
+  publicOrigin?: string,
+) {
+  let publicUrl: string | undefined;
+  if (publicOrigin) {
+    publicUrl = await recoverPublicUrl(env, row, publicOrigin);
+    if (!publicUrl)
+      return serviceUnavailable("The Public URL could not be recovered");
+  }
   return jsonResponse(
     publicationSchema.parse({
       id: row.id,
@@ -468,9 +525,33 @@ async function publicationResponse(row: PublicationRow, status: number) {
       status: "active",
       createdAt: row.created_at,
       expiresAt: row.expires_at,
+      ...(publicUrl ? { publicUrl } : {}),
     }),
     status,
   );
+}
+
+async function recoverPublicUrl(
+  env: Env,
+  row: PublicationRow,
+  publicOrigin: string,
+): Promise<string | undefined> {
+  try {
+    const token = await decryptPublicationToken(env, {
+      id: row.id,
+      artifactId: row.artifact_id,
+      tokenCiphertext: row.token_ciphertext,
+      tokenNonce: row.token_nonce,
+      encryptionKeyVersion: row.encryption_key_version,
+    });
+    return new URL(
+      `/published/${encodeURIComponent(token)}`,
+      publicOrigin,
+    ).toString();
+  } catch {
+    // Metadata operations remain available when recoverable ciphertext is unavailable.
+    return undefined;
+  }
 }
 
 async function publicPublicationStatus(token: string, env: Env) {
@@ -1047,6 +1128,9 @@ function validation(message: string) {
 }
 function conflict(message: string) {
   return jsonResponse({ error: { code: "CONFLICT", message } }, 409);
+}
+function serviceUnavailable(message: string) {
+  return jsonResponse({ error: { code: "SERVICE_UNAVAILABLE", message } }, 503);
 }
 function notFound(message = "Publication not found") {
   return jsonResponse({ error: { code: "NOT_FOUND", message } }, 404);

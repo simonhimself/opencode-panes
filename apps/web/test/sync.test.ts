@@ -650,7 +650,7 @@ describe("first private Sync Worker HTTP seam", () => {
       "application/javascript; charset=utf-8",
     );
     expect(nested.headers.get("Content-Security-Policy")).toContain(
-      "connect-src 'none'",
+      "connect-src https:",
     );
     expect(nested.headers.get("Cache-Control")).toBe("no-store");
     expect(nested.headers.get("Referrer-Policy")).toBe("no-referrer");

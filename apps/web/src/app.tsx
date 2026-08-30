@@ -165,34 +165,6 @@ function InventoryPage() {
   return (
     <main className="inventory-shell" id="main-content">
       <InventoryHeader projectCount={inventory.projects.length} />
-      {legacyArtifacts.length > 0 ? (
-        <section className="inventory-project" aria-labelledby="legacy-heading">
-          <header className="inventory-project-header">
-            <div>
-              <span className="eyebrow">LEGACY</span>
-              <h2 id="legacy-heading">Read-only cloud history</h2>
-            </div>
-            <span className="inventory-project-count">
-              {legacyArtifacts.length} artifact
-              {legacyArtifacts.length === 1 ? "" : "s"}
-            </span>
-          </header>
-          <div className="inventory-artifacts">
-            {legacyArtifacts.map((artifact) => (
-              <LegacyInventoryArtifactCard
-                artifact={artifact}
-                key={artifact.artifactId}
-                onRefresh={async () => {
-                  const loaded = await fetchInventory();
-                  setInventory(loaded);
-                  setError(undefined);
-                }}
-                onNotice={setCopyMessage}
-              />
-            ))}
-          </div>
-        </section>
-      ) : null}
       <div className="inventory-projects">
         {inventory.projects.map((project) => (
           <section
@@ -236,6 +208,37 @@ function InventoryPage() {
             </div>
           </section>
         ))}
+        {legacyArtifacts.length > 0 ? (
+          <details
+            className="inventory-project inventory-legacy-history"
+            aria-labelledby="legacy-heading"
+          >
+            <summary className="inventory-project-header">
+              <div>
+                <span className="eyebrow">LEGACY HISTORY</span>
+                <h2 id="legacy-heading">Read-only cloud history</h2>
+              </div>
+              <span className="inventory-project-count">
+                {legacyArtifacts.length} artifact
+                {legacyArtifacts.length === 1 ? "" : "s"} · read-only
+              </span>
+            </summary>
+            <div className="inventory-artifacts">
+              {legacyArtifacts.map((artifact) => (
+                <LegacyInventoryArtifactCard
+                  artifact={artifact}
+                  key={artifact.artifactId}
+                  onRefresh={async () => {
+                    const loaded = await fetchInventory();
+                    setInventory(loaded);
+                    setError(undefined);
+                  }}
+                  onNotice={setCopyMessage}
+                />
+              ))}
+            </div>
+          </details>
+        ) : null}
       </div>
       <div className="inventory-feedback" aria-live="polite">
         {copyMessage}
@@ -309,86 +312,91 @@ function LegacyInventoryArtifactCard({
         Legacy artifacts preserve their historical source and share records.
         They cannot be edited, published, or extended.
       </p>
-      <div className="inventory-delete-action">
-        <label htmlFor={`legacy-delete-${artifact.artifactId}`}>
-          Type <code>{deletionConfirmation}</code> to permanently remove this
-          Legacy artifact and its historical records.
-        </label>
-        <input
-          id={`legacy-delete-${artifact.artifactId}`}
-          onChange={(event) => setConfirmation(event.target.value)}
-          value={confirmation}
-        />
-        <button
-          className="inventory-danger"
-          disabled={busy || confirmation !== deletionConfirmation}
-          onClick={() => {
-            setBusy(true);
-            void deleteLegacyInventoryArtifact(
-              artifact.artifactId,
-              confirmation,
-            )
-              .then(
-                async () => {
-                  await onRefresh();
-                  onNotice(`${artifact.title}: Legacy artifact deleted`);
-                },
-                (error: unknown) =>
-                  onNotice(`${artifact.title}: ${apiErrorMessage(error)}`),
-              )
-              .finally(() => setBusy(false));
-          }}
-          type="button"
-        >
-          {busy ? "Deleting…" : "Delete Legacy artifact"}
-        </button>
-      </div>
-      <div className="inventory-adoption-action">
-        <button
-          disabled={busy || expired}
-          onClick={() => {
-            setBusy(true);
-            void issueLegacyAdoptionCode(artifact.artifactId)
-              .then((issued) => {
-                setAdoption({
-                  code: issued.code,
-                  expiresAt: issued.expiresAt,
-                  revisionVersion: issued.source.revisionVersion,
-                  type: issued.source.type,
-                });
-                onNotice(`${artifact.title}: adoption code issued`);
-              })
-              .catch((error: unknown) =>
-                onNotice(`${artifact.title}: ${apiErrorMessage(error)}`),
-              )
-              .finally(() => setBusy(false));
-          }}
-          type="button"
-        >
-          {busy ? "Issuing…" : "Export / adopt locally"}
-        </button>
-        {adoption ? (
-          <p>
-            Copy this one-time code now. It is not stored in the browser.
-            <br />
-            Current {adoption.type} v{adoption.revisionVersion}. Expires{" "}
-            {formatInventoryTime(adoption.expiresAt)}.
-            <br />
-            <code>{adoption.code}</code>
+      <details className="inventory-manage">
+        <summary>Manage</summary>
+        <div className="inventory-manage-content">
+          <div className="inventory-delete-action">
+            <label htmlFor={`legacy-delete-${artifact.artifactId}`}>
+              Type <code>{deletionConfirmation}</code> to permanently remove
+              this Legacy artifact and its historical records.
+            </label>
+            <input
+              id={`legacy-delete-${artifact.artifactId}`}
+              onChange={(event) => setConfirmation(event.target.value)}
+              value={confirmation}
+            />
             <button
+              className="inventory-danger"
+              disabled={busy || confirmation !== deletionConfirmation}
               onClick={() => {
-                void copyText(adoption.code).then(
-                  () => onNotice(`${artifact.title}: adoption code copied`),
-                  () => onNotice("Clipboard access is unavailable"),
-                );
+                setBusy(true);
+                void deleteLegacyInventoryArtifact(
+                  artifact.artifactId,
+                  confirmation,
+                )
+                  .then(
+                    async () => {
+                      await onRefresh();
+                      onNotice(`${artifact.title}: Legacy artifact deleted`);
+                    },
+                    (error: unknown) =>
+                      onNotice(`${artifact.title}: ${apiErrorMessage(error)}`),
+                  )
+                  .finally(() => setBusy(false));
               }}
               type="button"
             >
-              Copy code
+              {busy ? "Deleting…" : "Delete Legacy artifact"}
             </button>
-          </p>
-        ) : null}
-      </div>
+          </div>
+          <div className="inventory-adoption-action">
+            <button
+              disabled={busy || expired}
+              onClick={() => {
+                setBusy(true);
+                void issueLegacyAdoptionCode(artifact.artifactId)
+                  .then((issued) => {
+                    setAdoption({
+                      code: issued.code,
+                      expiresAt: issued.expiresAt,
+                      revisionVersion: issued.source.revisionVersion,
+                      type: issued.source.type,
+                    });
+                    onNotice(`${artifact.title}: adoption code issued`);
+                  })
+                  .catch((error: unknown) =>
+                    onNotice(`${artifact.title}: ${apiErrorMessage(error)}`),
+                  )
+                  .finally(() => setBusy(false));
+              }}
+              type="button"
+            >
+              {busy ? "Issuing…" : "Export / adopt locally"}
+            </button>
+            {adoption ? (
+              <p>
+                Copy this one-time code now. It is not stored in the browser.
+                <br />
+                Current {adoption.type} v{adoption.revisionVersion}. Expires{" "}
+                {formatInventoryTime(adoption.expiresAt)}.
+                <br />
+                <code>{adoption.code}</code>
+                <button
+                  onClick={() => {
+                    void copyText(adoption.code).then(
+                      () => onNotice(`${artifact.title}: adoption code copied`),
+                      () => onNotice("Clipboard access is unavailable"),
+                    );
+                  }}
+                  type="button"
+                >
+                  Copy code
+                </button>
+              </p>
+            ) : null}
+          </div>
+        </div>
+      </details>
     </article>
   );
 }
@@ -464,7 +472,7 @@ function InventoryArtifactCard({
     }
   };
   return (
-    <article className="inventory-card">
+    <article className="inventory-card" data-artifact-id={artifact.artifactId}>
       <header className="inventory-card-header">
         <div>
           <span className="eyebrow">
@@ -540,24 +548,6 @@ function InventoryArtifactCard({
           </p>
         ) : null}
         <div className="inventory-action-group">
-          <button
-            disabled={Boolean(busy) || deleting}
-            onClick={() =>
-              void runAction("Creator link rotated", () =>
-                rotateInventoryCreator(artifact.artifactId).then((rotated) => {
-                  setRotatedCreator({
-                    url: rotated.creatorUrl,
-                    expiresAt: rotated.creatorExpiresAt,
-                  });
-                }),
-              )
-            }
-            type="button"
-          >
-            {busy === "Creator link rotated"
-              ? "Rotating…"
-              : "Rotate Creator link"}
-          </button>
           <label>
             Duration
             <select
@@ -599,86 +589,6 @@ function InventoryArtifactCard({
             Unpublish
           </button>
         </div>
-        <div className="inventory-reconnect-action">
-          <label htmlFor={`reconnect-${artifact.artifactId}`}>
-            Type <code>{reconnectConfirmationText(artifact)}</code> to replace
-            the current Owner credential
-          </label>
-          <input
-            id={`reconnect-${artifact.artifactId}`}
-            onChange={(event) => setReconnectConfirmation(event.target.value)}
-            value={reconnectConfirmation}
-          />
-          <button
-            disabled={
-              Boolean(busy) ||
-              deleting ||
-              reconnectConfirmation !== reconnectConfirmationText(artifact)
-            }
-            onClick={() =>
-              void runAction("Reconnect code issued", async () => {
-                const issued = await issueInventoryReconnectCode(
-                  artifact.artifactId,
-                  reconnectConfirmation,
-                );
-                setReconnectCode({
-                  code: issued.reconnectCode,
-                  expiresAt: issued.expiresAt,
-                });
-                setReconnectConfirmation("");
-              })
-            }
-            type="button"
-          >
-            {busy === "Reconnect code issued"
-              ? "Issuing…"
-              : "Issue reconnect code"}
-          </button>
-          {reconnectCode ? (
-            <div className="inventory-reconnect-code" role="alert">
-              <strong>Copy this code now. It will not be shown again.</strong>
-              <code>{reconnectCode.code}</code>
-              <span>
-                Expires {formatInventoryTime(reconnectCode.expiresAt)} (10
-                minutes)
-              </span>
-              <button
-                aria-label="Copy reconnect code"
-                onClick={() =>
-                  void copyText(reconnectCode.code).then(
-                    () => onNotice(`${artifact.title} reconnect code copied`),
-                    () => onNotice("Clipboard access is unavailable"),
-                  )
-                }
-                type="button"
-              >
-                Copy reconnect code
-              </button>
-            </div>
-          ) : null}
-        </div>
-        {rotatedCreator ? (
-          <div className="inventory-creator-link">
-            <span className="eyebrow">NEW CREATOR LINK</span>
-            <a href={rotatedCreator.url} rel="noreferrer" target="_blank">
-              {rotatedCreator.url}
-            </a>
-            <span>
-              Expires {formatInventoryTime(rotatedCreator.expiresAt)} (30 days)
-            </span>
-            <button
-              onClick={() =>
-                void copyText(rotatedCreator.url).then(
-                  () => onNotice(`${artifact.title} Creator URL copied`),
-                  () => onNotice("Clipboard access is unavailable"),
-                )
-              }
-              type="button"
-            >
-              Copy Creator URL
-            </button>
-          </div>
-        ) : null}
         <div className="inventory-action-group">
           <label>
             Republish revision
@@ -716,30 +626,145 @@ function InventoryArtifactCard({
             Republish
           </button>
         </div>
-        <div className="inventory-delete-action">
-          <label htmlFor={`delete-${artifact.artifactId}`}>
-            Type <code>{deletionConfirmation}</code> to permanently remove
-            Creator/public links, cloud metadata, and stored bytes. Canonical
-            local files remain unchanged.
-          </label>
-          <input
-            id={`delete-${artifact.artifactId}`}
-            onChange={(event) => setConfirmation(event.target.value)}
-            value={confirmation}
-          />
-          <button
-            className="inventory-danger"
-            disabled={Boolean(busy) || confirmation !== deletionConfirmation}
-            onClick={() =>
-              void runAction("Cloud copy deleted", () =>
-                deleteInventoryArtifact(artifact.artifactId, confirmation),
-              )
-            }
-            type="button"
-          >
-            Delete cloud copy
-          </button>
-        </div>
+        <details className="inventory-manage">
+          <summary>Manage</summary>
+          <div className="inventory-manage-content">
+            <div className="inventory-action-group">
+              <button
+                disabled={Boolean(busy) || deleting}
+                onClick={() =>
+                  void runAction("Creator link rotated", () =>
+                    rotateInventoryCreator(artifact.artifactId).then(
+                      (rotated) => {
+                        setRotatedCreator({
+                          url: rotated.creatorUrl,
+                          expiresAt: rotated.creatorExpiresAt,
+                        });
+                      },
+                    ),
+                  )
+                }
+                type="button"
+              >
+                {busy === "Creator link rotated"
+                  ? "Rotating…"
+                  : "Rotate Creator link"}
+              </button>
+            </div>
+            <div className="inventory-reconnect-action">
+              <label htmlFor={`reconnect-${artifact.artifactId}`}>
+                Type <code>{reconnectConfirmationText(artifact)}</code> to
+                replace the current Owner credential
+              </label>
+              <input
+                id={`reconnect-${artifact.artifactId}`}
+                onChange={(event) =>
+                  setReconnectConfirmation(event.target.value)
+                }
+                value={reconnectConfirmation}
+              />
+              <button
+                disabled={
+                  Boolean(busy) ||
+                  deleting ||
+                  reconnectConfirmation !== reconnectConfirmationText(artifact)
+                }
+                onClick={() =>
+                  void runAction("Reconnect code issued", async () => {
+                    const issued = await issueInventoryReconnectCode(
+                      artifact.artifactId,
+                      reconnectConfirmation,
+                    );
+                    setReconnectCode({
+                      code: issued.reconnectCode,
+                      expiresAt: issued.expiresAt,
+                    });
+                    setReconnectConfirmation("");
+                  })
+                }
+                type="button"
+              >
+                {busy === "Reconnect code issued"
+                  ? "Issuing…"
+                  : "Issue reconnect code"}
+              </button>
+              {reconnectCode ? (
+                <div className="inventory-reconnect-code" role="alert">
+                  <strong>
+                    Copy this code now. It will not be shown again.
+                  </strong>
+                  <code>{reconnectCode.code}</code>
+                  <span>
+                    Expires {formatInventoryTime(reconnectCode.expiresAt)} (10
+                    minutes)
+                  </span>
+                  <button
+                    aria-label="Copy reconnect code"
+                    onClick={() =>
+                      void copyText(reconnectCode.code).then(
+                        () =>
+                          onNotice(`${artifact.title} reconnect code copied`),
+                        () => onNotice("Clipboard access is unavailable"),
+                      )
+                    }
+                    type="button"
+                  >
+                    Copy reconnect code
+                  </button>
+                </div>
+              ) : null}
+            </div>
+            {rotatedCreator ? (
+              <div className="inventory-creator-link">
+                <span className="eyebrow">NEW CREATOR LINK</span>
+                <a href={rotatedCreator.url} rel="noreferrer" target="_blank">
+                  {rotatedCreator.url}
+                </a>
+                <span>
+                  Expires {formatInventoryTime(rotatedCreator.expiresAt)} (30
+                  days)
+                </span>
+                <button
+                  onClick={() =>
+                    void copyText(rotatedCreator.url).then(
+                      () => onNotice(`${artifact.title} Creator URL copied`),
+                      () => onNotice("Clipboard access is unavailable"),
+                    )
+                  }
+                  type="button"
+                >
+                  Copy Creator URL
+                </button>
+              </div>
+            ) : null}
+            <div className="inventory-delete-action">
+              <label htmlFor={`delete-${artifact.artifactId}`}>
+                Type <code>{deletionConfirmation}</code> to permanently remove
+                Creator/public links, cloud metadata, and stored bytes.
+                Canonical local files remain unchanged.
+              </label>
+              <input
+                id={`delete-${artifact.artifactId}`}
+                onChange={(event) => setConfirmation(event.target.value)}
+                value={confirmation}
+              />
+              <button
+                className="inventory-danger"
+                disabled={
+                  Boolean(busy) || confirmation !== deletionConfirmation
+                }
+                onClick={() =>
+                  void runAction("Cloud copy deleted", () =>
+                    deleteInventoryArtifact(artifact.artifactId, confirmation),
+                  )
+                }
+                type="button"
+              >
+                Delete cloud copy
+              </button>
+            </div>
+          </div>
+        </details>
       </div>
       {artifact.warnings.map((warning) => (
         <p className="inventory-warning" key={warning} role="alert">

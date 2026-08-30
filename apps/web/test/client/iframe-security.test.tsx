@@ -2,6 +2,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CreatorWorkspaceResponse } from "@opencode-panes/contracts";
 import mermaid from "mermaid";
+import {
+  createArtifactNetworkPolicy,
+  isAllowedArtifactNetworkRequest,
+} from "@opencode-panes/renderers/preview-security";
 import { act } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createRoot, type Root } from "react-dom/client";
@@ -56,6 +60,40 @@ afterEach(async () => {
 });
 
 describe("sandboxed artifact iframe", () => {
+  it("allows HTTPS dependencies by default and exact HTTP origins when approved", () => {
+    const policy = createArtifactNetworkPolicy([]);
+
+    for (const source of [
+      policy.connectSrc,
+      policy.imageSrc,
+      policy.mediaSrc,
+      policy.fontSrc,
+      policy.styleSrc,
+      policy.scriptSrc,
+    ]) {
+      expect(source).toContain("https:");
+    }
+    expect(
+      isAllowedArtifactNetworkRequest(
+        "https://cdn.example/app.css",
+        policy.origins,
+      ),
+    ).toBe(true);
+    expect(
+      isAllowedArtifactNetworkRequest(
+        "http://api.example/data",
+        policy.origins,
+      ),
+    ).toBe(false);
+    const approved = createArtifactNetworkPolicy(["http://api.example"]);
+    expect(
+      isAllowedArtifactNetworkRequest(
+        "http://api.example/data",
+        approved.origins,
+      ),
+    ).toBe(true);
+  });
+
   it("allows inline scripts through the parent and tighter artifact CSP intersection", () => {
     const staticHeaders = readFileSync(
       join(process.cwd(), "public/_headers"),
@@ -66,16 +104,22 @@ describe("sandboxed artifact iframe", () => {
       "script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'",
     );
     expect(createArtifactCsp(true)).toContain("script-src 'unsafe-inline'");
-    expect(createArtifactCsp(true)).toContain("connect-src 'none'");
+    expect(createArtifactCsp(true)).toContain("connect-src https:");
+    expect(createArtifactCsp(true)).toContain(
+      "style-src 'unsafe-inline' https:",
+    );
+    expect(createArtifactCsp(true)).toContain("font-src data: https:");
+    expect(createArtifactCsp(true)).toContain("img-src data: blob: https:");
+    expect(createArtifactCsp(true)).toContain("media-src https:");
     expect(createArtifactCsp(true, ["https://api.example"])).toContain(
-      "connect-src https://api.example",
+      "connect-src https: https://api.example",
     );
     expect(createArtifactCsp(true, ["https://api.example"])).toContain(
-      "script-src 'unsafe-inline' https://api.example",
+      "script-src 'unsafe-inline' https: https://api.example",
     );
   });
 
-  it("places a restrictive CSP before HTML artifact content", () => {
+  it("places the CSP before HTML artifact content", () => {
     const marker = '<script src="https://attacker.example/x.js"></script>';
     const srcDoc = createHtmlSrcDoc(marker, "message-nonce");
     const cspPosition = srcDoc.indexOf("Content-Security-Policy");
@@ -83,31 +127,32 @@ describe("sandboxed artifact iframe", () => {
     expect(cspPosition).toBeGreaterThan(-1);
     expect(cspPosition).toBeLessThan(srcDoc.indexOf(marker));
     expect(createArtifactCsp(true)).toContain("default-src 'none'");
-    expect(createArtifactCsp(true)).toContain("connect-src 'none'");
+    expect(createArtifactCsp(true)).toContain("connect-src https:");
     expect(createArtifactCsp(true)).toContain("form-action 'none'");
     expect(createArtifactCsp(true)).toContain("frame-src 'none'");
     expect(createArtifactCsp(true)).toContain("object-src 'none'");
     expect(createArtifactCsp(true)).not.toContain("navigate-to");
     expect(createArtifactCsp(false)).toContain("script-src 'none'");
-    expect(createArtifactCsp(false)).toContain("img-src 'none'");
+    expect(createArtifactCsp(false)).toContain("img-src data: blob: https:");
   });
 
   it("installs common egress guards before the error bridge and guest code", () => {
     const marker = "guest-code-marker";
     const srcDoc = createHtmlSrcDoc(`<script>${marker}</script>`, "nonce");
-    const guardPosition = srcDoc.indexOf("XMLHttpRequest");
+    const guardPosition = srcDoc.indexOf('"WebSocket"');
     const bridgePosition = srcDoc.indexOf(RENDERER_MESSAGE_CHANNEL);
 
     expect(guardPosition).toBeGreaterThan(-1);
     expect(guardPosition).toBeLessThan(bridgePosition);
     expect(bridgePosition).toBeLessThan(srcDoc.indexOf(marker));
-    expect(srcDoc).toContain('lock(globalThis, "fetch"');
     expect(srcDoc).toContain('"WebSocket"');
-    expect(srcDoc).toContain('"EventSource"');
     expect(srcDoc).toContain('"RTCPeerConnection"');
     expect(srcDoc).toContain('"webkitRTCPeerConnection"');
     expect(srcDoc).toContain('lock(globalThis, "open"');
-    expect(srcDoc).toContain('lock(navigator, "sendBeacon"');
+    expect(srcDoc).not.toContain('lock(globalThis, "fetch"');
+    expect(srcDoc).not.toContain('"XMLHttpRequest"');
+    expect(srcDoc).not.toContain('lock(globalThis, "EventSource"');
+    expect(srcDoc).not.toContain('lock(navigator, "sendBeacon"');
     expect(srcDoc).toContain('"dns-prefetch"');
     expect(srcDoc).toContain('http-equiv="x-dns-prefetch-control"');
   });
@@ -298,7 +343,7 @@ describe("sandboxed artifact iframe", () => {
       const srcDoc = frame?.getAttribute("srcdoc") ?? "";
       expect(frame?.getAttribute("sandbox")).toBe("allow-scripts");
       expect(frame?.getAttribute("sandbox")).not.toContain("allow-same-origin");
-      expect(srcDoc).toContain("connect-src https://api.example");
+      expect(srcDoc).toContain("connect-src https: https://api.example");
     },
   );
 });

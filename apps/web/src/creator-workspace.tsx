@@ -1,7 +1,9 @@
+import { publicationSchema } from "@opencode-panes/contracts";
 import type {
   ArtifactType,
   CreatorWorkspaceResponse,
   CreatorWorkspaceRevision,
+  Publication,
 } from "@opencode-panes/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { useEffect, useMemo, useState } from "react";
@@ -15,10 +17,10 @@ import { SourceCode } from "./renderers/source-code";
 import {
   creatorFileUrl,
   creatorRevisionZipUrl,
+  copyText,
   extendCreatorPublication,
   fetchCreatorFile,
   fetchCreatorWorkspace,
-  publishCreatorPublication,
   republishCreatorPublication,
   unpublishCreatorPublication,
   type PublicationDuration,
@@ -69,6 +71,7 @@ export function CreatorWorkspace({
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState<string>();
   const [feedbackError, setFeedbackError] = useState(false);
+  const [sharedPublication, setSharedPublication] = useState<Publication>();
   const revision =
     currentWorkspace.revisions.find(
       (candidate) => candidate.version === version,
@@ -94,22 +97,48 @@ export function CreatorWorkspace({
   useEffect(() => {
     setCurrentWorkspace(workspace);
     setVersion(workspace.revisions[0]?.version ?? 0);
+    if (workspace.publication?.status === "active") {
+      void refreshWorkspace();
+    } else {
+      setSharedPublication(undefined);
+    }
   }, [workspace]);
 
   const refreshWorkspace = async () => {
     const next = await fetchCreatorWorkspace(token);
-    setCurrentWorkspace(next);
+    if (next.publication?.status !== "active") {
+      setSharedPublication(undefined);
+      setCurrentWorkspace(next);
+      return;
+    }
+    try {
+      const activeShare = await fetchActiveShare(token);
+      if (!activeShare) {
+        setSharedPublication(undefined);
+        setCurrentWorkspace(next);
+        return;
+      }
+      setCurrentWorkspace({ ...next, publication: activeShare });
+      setSharedPublication(activeShare);
+    } catch {
+      setSharedPublication(undefined);
+      setCurrentWorkspace(next);
+    }
   };
 
   const runPublicationAction = async (
     action: () => Promise<unknown>,
     success: string,
+    captureLink = false,
   ) => {
     setBusy(true);
     setFeedback(undefined);
     setFeedbackError(false);
     try {
-      await action();
+      const result = await action();
+      if (captureLink) {
+        setSharedPublication(parseShareResult(result));
+      }
       await refreshWorkspace();
       setFeedback(success);
     } catch (caught) {
@@ -221,9 +250,16 @@ export function CreatorWorkspace({
           )
         }
         onPublish={() =>
+          confirmPublicationAction(
+            revision.version,
+            duration,
+            activePublication?.status === "active" &&
+              activePublication.revisionVersion !== revision.version,
+          ) &&
           void runPublicationAction(
-            () => publishCreatorPublication(token, revision.version, duration),
-            `Revision v${revision.version} published.`,
+            () => shareCreatorPublication(token, revision.version, duration),
+            `Revision v${revision.version} shared.`,
+            true,
           )
         }
         onRepublish={() =>
@@ -241,6 +277,18 @@ export function CreatorWorkspace({
         }
         revision={revision}
         history={currentWorkspace.publicationHistory ?? []}
+        sharedPublication={sharedPublication}
+        onCopyLink={(url) =>
+          void copyText(url).then(
+            () => setFeedback("Public link copied."),
+            (caught: unknown) => {
+              setFeedback(
+                caught instanceof Error ? caught.message : String(caught),
+              );
+              setFeedbackError(true);
+            },
+          )
+        }
       />
 
       <section
@@ -270,6 +318,8 @@ function PublicationControls({
   onRepublish,
   onUnpublish,
   revision,
+  sharedPublication,
+  onCopyLink,
 }: {
   activePublication: CreatorWorkspaceResponse["publication"];
   busy: boolean;
@@ -283,8 +333,19 @@ function PublicationControls({
   onRepublish: () => void;
   onUnpublish: () => void;
   revision: CreatorWorkspaceRevision;
+  sharedPublication: Publication | undefined;
+  onCopyLink: (url: string) => void;
 }) {
   const isActive = activePublication?.status === "active";
+  const isCurrentRevision =
+    isActive && activePublication.revisionVersion === revision.version;
+  const sharedUrl = sharedPublication?.publicUrl;
+  const hasPreviousShare = history.length > 0;
+  const primaryAction = isActive
+    ? "Update shared version"
+    : hasPreviousShare
+      ? "Share again"
+      : "Share this version";
   return (
     <section
       className="publication-controls"
@@ -302,36 +363,64 @@ function PublicationControls({
       <p className="publication-summary">
         {isActive
           ? `Revision v${activePublication.revisionVersion} is public until ${formatDateTime(activePublication.expiresAt)}. `
-          : `Revision v${revision.version} is selected. Publishing will make only this synced Revision public.`}
+          : `Revision v${revision.version} is selected. Sharing will make only this synced Revision public.`}
         {isActive ? (
           <>
-            Recover its public URL from the{" "}
-            <a href="/inventory">authenticated cloud inventory</a>.
+            {sharedUrl
+              ? "Use the Copy link or Open link actions below."
+              : "The active Public URL is being recovered."}
           </>
         ) : null}
       </p>
       <div className="publication-actions">
-        <label>
-          <span>Duration</span>
-          <select
+        {!isActive ? (
+          <DurationSelect
+            busy={busy}
+            duration={duration}
+            onDurationChange={onDurationChange}
+          />
+        ) : null}
+        {!isCurrentRevision ? (
+          <button disabled={busy} onClick={onPublish} type="button">
+            {primaryAction}
+          </button>
+        ) : null}
+      </div>
+      {sharedUrl ? (
+        <div className="publication-link" aria-label="Active public share">
+          <p className="publication-feedback" role="status">
+            Revision v{sharedPublication.revisionVersion} shared until{" "}
+            {formatDateTime(sharedPublication.expiresAt)}.
+          </p>
+          <code>{sharedUrl}</code>
+          <a href={sharedUrl} rel="noreferrer" target="_blank">
+            Open link
+          </a>
+          <button
             disabled={busy}
-            onChange={(event) =>
-              onDurationChange(
-                Number(event.target.value) as PublicationDuration,
-              )
-            }
-            value={duration}
+            onClick={() => onCopyLink(sharedUrl)}
+            type="button"
           >
-            <option value={1}>1 day</option>
-            <option value={7}>7 days</option>
-            <option value={30}>30 days</option>
-          </select>
-        </label>
-        <button disabled={busy} onClick={onPublish} type="button">
-          Publish v{revision.version}
-        </button>
-        {isActive ? (
-          <>
+            Copy link
+          </button>
+        </div>
+      ) : null}
+      {isActive ? (
+        <p className="publication-hint">
+          {isCurrentRevision
+            ? "This Revision is already public. Use Copy link or Open link above."
+            : "Updating the shared Revision preserves the existing Public link and expiry."}
+        </p>
+      ) : null}
+      {isActive ? (
+        <details className="publication-management">
+          <summary>Manage share</summary>
+          <div className="publication-actions">
+            <DurationSelect
+              busy={busy}
+              duration={duration}
+              onDurationChange={onDurationChange}
+            />
             <button disabled={busy} onClick={onExtend} type="button">
               Extend by {duration} {duration === 1 ? "day" : "days"}
             </button>
@@ -341,14 +430,8 @@ function PublicationControls({
             <button disabled={busy} onClick={onUnpublish} type="button">
               Unpublish
             </button>
-          </>
-        ) : null}
-      </div>
-      {isActive ? (
-        <p className="publication-hint">
-          Publishing this same Revision keeps its existing expiry. Use Extend
-          when you want to add time.
-        </p>
+          </div>
+        </details>
       ) : null}
       {feedback ? (
         <p
@@ -373,6 +456,85 @@ function PublicationControls({
       ) : null}
     </section>
   );
+}
+
+function DurationSelect({
+  busy,
+  duration,
+  onDurationChange,
+}: {
+  busy: boolean;
+  duration: PublicationDuration;
+  onDurationChange: (duration: PublicationDuration) => void;
+}) {
+  return (
+    <label>
+      <span>Duration</span>
+      <select
+        disabled={busy}
+        onChange={(event) =>
+          onDurationChange(Number(event.target.value) as PublicationDuration)
+        }
+        value={duration}
+      >
+        <option value={1}>1 day</option>
+        <option value={7}>7 days</option>
+        <option value={30}>30 days</option>
+      </select>
+    </label>
+  );
+}
+
+function confirmPublicationAction(
+  version: number,
+  duration: PublicationDuration,
+  isUpdate: boolean,
+): boolean {
+  return globalThis.confirm(
+    isUpdate
+      ? `Update the public link to Revision v${version}? The existing Public link and expiry will be preserved.`
+      : `Share Revision v${version} publicly for ${duration} ${duration === 1 ? "day" : "days"}?`,
+  );
+}
+
+function parseShareResult(value: unknown): Publication {
+  const parsed = publicationSchema.safeParse(value);
+  if (!parsed.success || !parsed.data.publicUrl) {
+    throw new Error("The Public URL was not returned by the server.");
+  }
+  return parsed.data;
+}
+
+async function shareCreatorPublication(
+  token: string,
+  revisionVersion: number,
+  durationDays: PublicationDuration,
+): Promise<Publication> {
+  const response = await fetch(
+    `/api/creator/${encodeURIComponent(token)}/share`,
+    {
+      body: JSON.stringify({ revisionVersion, durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`Share request failed with status ${response.status}`);
+  }
+  return publicationSchema.parse(await response.json());
+}
+
+async function fetchActiveShare(
+  token: string,
+): Promise<Publication | undefined> {
+  const response = await fetch(
+    `/api/creator/${encodeURIComponent(token)}/share`,
+  );
+  if (response.status === 404 || response.status === 410) return undefined;
+  if (!response.ok) {
+    throw new Error(`Share recovery failed with status ${response.status}`);
+  }
+  return parseShareResult(await response.json());
 }
 
 export function CapabilityPreview({

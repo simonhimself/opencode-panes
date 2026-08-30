@@ -144,7 +144,7 @@ describe("artifact_finalize tool", () => {
       frameUrl(shell.body, metadata(result).previewUrl as string),
     );
     expect(frame.body).toContain("document.body.dataset.executed");
-    expect(frame.contentSecurityPolicy).toContain("connect-src 'none'");
+    expect(frame.contentSecurityPolicy).toContain("connect-src https:");
     expect(frame.contentSecurityPolicy).toContain("sandbox allow-scripts");
     expect(frame.contentSecurityPolicy).not.toContain("allow-same-origin");
   });
@@ -173,7 +173,8 @@ describe("artifact_finalize tool", () => {
 
     expect(shell.body).not.toContain('id="action"');
     expect(frame.body).toContain('id="action"');
-    expect(frame.body).toContain('"XMLHttpRequest"');
+    expect(frame.body).toContain('"WebSocket"');
+    expect(frame.body).not.toContain('lock(globalThis, "fetch"');
     const dom = new JSDOM(frame.body, {
       runScripts: "dangerously",
       url: frameUrl(shell.body, previewUrl),
@@ -351,6 +352,46 @@ export default function Counter() {
     );
   });
 
+  it("finalizes HTTPS dependencies without origin approval", async () => {
+    const context = toolContext();
+    const plugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const prepare = await executePluginTool(
+      plugin,
+      "artifact_prepare",
+      {
+        title: "HTTPS dependencies",
+        requestedOrigins: ["https://cdn.example"],
+      },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "index.html"),
+      '<script src="https://cdn.example/app.js"></script><script>fetch("https://api.example/data")</script>',
+    );
+
+    const result = await executePluginTool(
+      plugin,
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+    );
+    expect(metadata(result)).toMatchObject({
+      operation: "finalized",
+      version: 1,
+    });
+    const shell = await getText(metadata(result).previewUrl as string);
+    const frame = await getText(
+      frameUrl(shell.body, metadata(result).previewUrl as string),
+    );
+    expect(frame.contentSecurityPolicy).toContain("script-src");
+    expect(frame.contentSecurityPolicy).toContain("connect-src https:");
+    expect(frame.body).not.toContain('lock(globalThis, "fetch"');
+  });
+
   it("requires origin approval before promotion and applies the approved policy to the HTTP frame", async () => {
     const context = toolContext();
     const plugin = await OpenCodePanesPlugin(
@@ -363,7 +404,7 @@ export default function Counter() {
       {
         title: "Approved origins",
         requestedOrigins: [
-          "HTTPS://API.Example.com:443/",
+          "HTTP://API.Example.com:80/",
           "https://cdn.example.com/",
         ],
       },
@@ -384,7 +425,7 @@ export default function Counter() {
     expect(metadata(approval)).toMatchObject({
       operation: "approval-required",
       artifactId,
-      requestedOrigins: ["https://api.example.com", "https://cdn.example.com"],
+      requestedOrigins: ["http://api.example.com", "https://cdn.example.com"],
     });
     expect(metadata(approval).approvalNonce).toEqual(expect.any(String));
     expect(
@@ -403,7 +444,7 @@ export default function Counter() {
         artifactId,
         entryPath: "index.html",
         adapter: "browser",
-        approvedOrigins: ["https://cdn.example.com", "https://api.example.com"],
+        approvedOrigins: ["http://api.example.com", "https://cdn.example.com"],
         approvalNonce: metadata(approval).approvalNonce,
       },
       context,
@@ -420,7 +461,7 @@ export default function Counter() {
     expect(shell.body).not.toContain("allow-same-origin");
     const frame = await getText(frameUrl(shell.body, previewUrl));
     expect(frame.contentSecurityPolicy).toContain(
-      "connect-src https://api.example.com https://cdn.example.com",
+      "connect-src https: http://api.example.com https://cdn.example.com",
     );
     for (const directive of [
       "img-src",
@@ -431,7 +472,7 @@ export default function Counter() {
     ]) {
       expect(frame.contentSecurityPolicy).toMatch(
         new RegExp(
-          `${directive}[^;]*https://api\\.example\\.com[^;]*https://cdn\\.example\\.com`,
+          `${directive}[^;]*http://api\\.example\\.com[^;]*https://cdn\\.example\\.com`,
         ),
       );
     }
@@ -448,7 +489,7 @@ export default function Counter() {
       ),
     );
     expect(manifest.revisions[0].approvedOrigins).toEqual([
-      "https://api.example.com",
+      "http://api.example.com",
       "https://cdn.example.com",
     ]);
     expect(
@@ -465,7 +506,7 @@ export default function Counter() {
     const prepare = await executePluginTool(
       plugin,
       "artifact_prepare",
-      { title: "Nonce binding", requestedOrigins: ["https://api.example.com"] },
+      { title: "Nonce binding", requestedOrigins: ["http://api.example.com"] },
       context,
     );
     const artifactId = metadata(prepare).artifactId as string;
@@ -486,7 +527,7 @@ export default function Counter() {
           artifactId,
           entryPath: "index.html",
           adapter: "browser",
-          approvedOrigins: ["https://api.example.com"],
+          approvedOrigins: ["http://api.example.com"],
           approvalNonce: metadata(approval).approvalNonce,
         },
         context,
@@ -511,7 +552,7 @@ export default function Counter() {
         artifactId,
         entryPath: "index.html",
         adapter: "browser",
-        approvedOrigins: ["https://api.example.com"],
+        approvedOrigins: ["http://api.example.com"],
         approvalNonce: metadata(freshApproval).approvalNonce,
       },
       context,
@@ -525,7 +566,7 @@ export default function Counter() {
           artifactId,
           entryPath: "index.html",
           adapter: "browser",
-          approvedOrigins: ["https://api.example.com"],
+          approvedOrigins: ["http://api.example.com"],
           approvalNonce: metadata(freshApproval).approvalNonce,
         },
         context,

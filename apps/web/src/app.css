@@ -106,6 +106,10 @@ select,
   background: #171817;
 }
 
+.public-workspace-shell {
+  grid-template-rows: auto minmax(460px, 1fr) auto;
+}
+
 .publication-controls {
   display: grid;
   gap: 12px;
@@ -781,6 +785,28 @@ select,
   gap: 20px;
 }
 
+.inventory-legacy-history > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.inventory-legacy-history > summary::-webkit-details-marker {
+  display: none;
+}
+
+.inventory-legacy-history > summary::before {
+  width: 13px;
+  color: #ff9b51;
+  content: "+";
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.inventory-legacy-history[open] > summary::before {
+  content: "−";
+}
+
 .inventory-project-header {
   padding: 20px 22px;
   border-bottom: 1px solid #3e403d;
@@ -936,6 +962,33 @@ select,
   margin-top: 22px;
   padding-top: 16px;
   border-top: 1px solid #3e403d;
+}
+
+.inventory-manage {
+  margin-top: 2px;
+  padding-top: 14px;
+  border-top: 1px solid #3e403d;
+}
+
+.inventory-manage > summary {
+  width: fit-content;
+  padding: 4px 0;
+  color: #ffc293;
+  cursor: pointer;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.inventory-manage > summary::marker {
+  color: #ff9b51;
+}
+
+.inventory-manage-content {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
 }
 
 .inventory-action-group {

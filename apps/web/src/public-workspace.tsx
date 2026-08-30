@@ -33,8 +33,8 @@ export function PublicWorkspace({
 
   return (
     <main className="creator-workspace-shell public-workspace-shell">
-      <a className="skip-link" href="#public-publication-stage">
-        Skip to publication
+      <a className="skip-link" href="#public-artifact-stage">
+        Skip to artifact preview
       </a>
       <header className="workspace-header">
         <div className="identity-block">
@@ -42,13 +42,31 @@ export function PublicWorkspace({
             OP
           </span>
           <div className="title-block">
-            <span className="eyebrow">PUBLIC PUBLICATION</span>
+            <span className="eyebrow">SHARED ARTIFACT</span>
             <h1>{workspace.artifact.title}</h1>
           </div>
           <span className="type-readout">{typeLabel}</span>
         </div>
-        <div className="instrument-bar" aria-label="Public publication views">
-          <div className="segmented-control" aria-label="Publication view">
+      </header>
+
+      <section
+        aria-label={`${workspace.artifact.title} shared artifact ${mode}`}
+        className="creator-stage"
+        id="public-artifact-stage"
+      >
+        {mode === "preview" ? (
+          <CapabilityPreview client={client} revision={workspace.revision} />
+        ) : (
+          <CapabilityFiles client={client} revision={workspace.revision} />
+        )}
+      </section>
+
+      <aside
+        aria-label="Artifact details and actions"
+        className="public-supporting-panel"
+      >
+        <div className="instrument-bar" aria-label="Shared artifact views">
+          <div className="segmented-control" aria-label="Artifact view">
             <button
               aria-pressed={mode === "preview"}
               onClick={() => setMode("preview")}
@@ -76,6 +94,12 @@ export function PublicWorkspace({
             Download ZIP
           </a>
         </div>
+
+        <div className="public-notice">
+          <strong>User-generated content.</strong> This read-only artifact runs
+          in an isolated viewer. OpenCode Panes does not verify its accuracy.
+        </div>
+
         <div className="status-strip" aria-live="polite">
           <span className="state-dot" />
           <span>
@@ -85,24 +109,7 @@ export function PublicWorkspace({
           <span>v{workspace.revision.version}</span>
           <span>{fileCount} files</span>
         </div>
-      </header>
-
-      <aside className="public-notice">
-        <strong>User-generated content.</strong> This read-only artifact runs in
-        an isolated viewer. OpenCode Panes does not verify its accuracy.
       </aside>
-
-      <section
-        aria-label={`${workspace.artifact.title} publication ${mode}`}
-        className="creator-stage"
-        id="public-publication-stage"
-      >
-        {mode === "preview" ? (
-          <CapabilityPreview client={client} revision={workspace.revision} />
-        ) : (
-          <CapabilityFiles client={client} revision={workspace.revision} />
-        )}
-      </section>
     </main>
   );
 }

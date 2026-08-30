@@ -582,7 +582,7 @@ function routeTemplate(pathname: string): string {
     return "/api/publications/:token";
   }
   if (
-    /^\/api\/creator\/[^/]+\/(?:publish|republish|extend|unpublish)$/u.test(
+    /^\/api\/creator\/[^/]+\/(?:publication\/)?(?:share|publish|republish|extend|unpublish)$/u.test(
       pathname,
     )
   ) {

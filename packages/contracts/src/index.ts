@@ -434,6 +434,13 @@ export const creatorPublicationRequestSchema = z.strictObject({
   ),
 });
 
+export const creatorShareRequestSchema = z.strictObject({
+  revisionVersion: revisionNumberSchema,
+  durationDays: z
+    .union(PUBLICATION_DURATIONS.map((duration) => z.literal(duration)))
+    .default(DEFAULT_PUBLICATION_DURATION),
+});
+
 export const creatorPublicationExtendRequestSchema = z.strictObject({
   durationDays: z.union(
     PUBLICATION_DURATIONS.map((duration) => z.literal(duration)),
@@ -702,6 +709,7 @@ export type PublicationStatusResponse = z.infer<
 export type CreatorPublicationRequest = z.infer<
   typeof creatorPublicationRequestSchema
 >;
+export type CreatorShareRequest = z.infer<typeof creatorShareRequestSchema>;
 export type CreatorPublicationExtendRequest = z.infer<
   typeof creatorPublicationExtendRequestSchema
 >;

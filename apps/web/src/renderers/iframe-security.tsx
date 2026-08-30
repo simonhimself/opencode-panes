@@ -18,7 +18,6 @@ const SHARED_CSP_DIRECTIVES = [
   "base-uri 'none'",
   "form-action 'none'",
   "manifest-src 'none'",
-  "media-src 'none'",
 ] as const;
 
 export type RendererMessage =
@@ -57,9 +56,10 @@ export function createArtifactCsp(
       ? `script-src 'unsafe-inline' ${scriptOrigins}`
       : "script-src 'none'",
     `style-src 'unsafe-inline' ${styleOrigins}`,
-    allowScripts ? `img-src data: blob: ${imageOrigins}` : "img-src 'none'",
+    `img-src data: blob: ${imageOrigins}`,
     `font-src data: ${fontOrigins}`,
     `connect-src ${connectOrigins}`,
+    `media-src ${policy.mediaSrc.join(" ")}`,
   ].join("; ");
 }
 

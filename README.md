@@ -79,16 +79,18 @@ private and never publishes an artifact.
 for the separate browser-open permission after Sync completes. It still returns
 the validated Creator URL if opening is denied or fails. A natural-language
 publish request only runs Sync and opens or returns Creator access. The human
-then selects exactly one synced Revision and a 1-, 7-, or 30-day duration in the
-Creator workspace. Seven days is the default. Permanent Publication is not
-available.
+then selects exactly one synced Revision and confirms Share for 1, 7, or 30
+days in the Creator workspace. Seven days is the default. Confirmed Share
+immediately returns Copy link and Open link actions. Permanent Publication is
+not available.
 
-Only the selected Revision and its selected files are public. A new
-Publication replaces the active one. Reusing a Revision does not extend its
-expiry; extension, unpublish, and republish are explicit actions. Non-secret
-Publication records remain server-side. Creator exposes the full history,
-while inventory reports the current or latest state. Private synced files
-remain until explicit cloud deletion.
+Only the selected Revision and its selected files are public. Sharing a newer
+Revision through an active Publication preserves its Public URL and expiry.
+Expired, revoked, or explicitly rotated shares receive a new Public URL.
+Extension and unpublish remain explicit actions. Non-secret Publication records
+remain server-side. Creator exposes the full history, while inventory reports
+the current or latest state. Private synced files remain until explicit cloud
+deletion.
 
 ## Credentials and access
 
@@ -98,19 +100,20 @@ These capabilities are intentionally separate:
 | ---------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Owner credential | Sync and Creator-link rotation for one cloud Artifact                       | Persistent in protected local plugin state. Replaced on recovery or rotation, never put in a URL or repository.                                                                        |
 | Creator link     | View and manage one private synced Artifact, including Publication actions  | One active bearer link, fixed 30-day expiry. It cannot delete cloud data or open inventory.                                                                                            |
-| Publication      | Server-side record granting public access to one selected synced Revision   | 1, 7, or 30 days. One active Publication per Artifact; records remain server-side, Creator exposes history, and inventory reports current/latest state.                                |
-| Public link      | Bearer URL for its Publication and selected Revision                        | Expires with the Publication and cannot expose other Revisions. Its token is separate from the Publication record.                                                                     |
+| Publication      | Server-side record granting public access to one selected synced Revision   | 1, 7, or 30 days. One active Publication per Artifact; its selected Revision may update without changing its URL or expiry. Records remain server-side.                                |
+| Public link      | Bearer URL for its active Publication                                       | Expires with the Publication and exposes only its currently selected Revision. Its token is separate from the Publication record.                                                      |
 | Cloud inventory  | List and administer synced cloud Artifacts, including deletion and recovery | Access-protected administrative surface. Access session policy is separate from capability expiry; synced data remains until explicit deletion. It does not list local-only Artifacts. |
 
 The inventory is protected by Cloudflare Access and its configured approved
 identity. Creator and Public routes use their own scoped capabilities and are
 not Access login routes. The active Public token is stored server-side as a
 one-way lookup hash plus recoverable encrypted ciphertext under a versioned
-Worker-managed key. Only the Access-protected inventory can reconstruct an
-active Public URL. Public-token plaintext appears only in that authorized
-active-link result. Encryption keys never leave Worker secret storage. Neither
-value appears in manifests, logs, or analytics. Trusted plugin flows separately
-receive the scoped Owner or Creator credential they are designed to persist.
+Worker-managed key. A Creator-authorized sharing response and the
+Access-protected inventory can reconstruct an active Public URL. Public-token
+plaintext appears only in those authorized active-link results. Encryption keys
+never leave Worker secret storage. Neither value appears in manifests, logs, or
+analytics. Trusted plugin flows separately receive the scoped Owner or Creator
+credential they are designed to persist.
 Revocation clears recoverable Public-token ciphertext immediately; expiry
 clears it when an inventory, Creator, or Public request observes the expired
 record.
@@ -143,14 +146,13 @@ Revision, measured from raw bytes after ignore evaluation. These limits do not
 limit local Drafts or local Revision history. The historical Legacy source
 compatibility path retains its separate 1 MiB UTF-8 source limit.
 
-External network access is denied by default. A Draft may request exact
-normalized `http` or `https` origins. The first Finalize call returns
-`approval-required` without promotion. After human approval, a second call must
-provide the bound approval nonce and the unchanged exact origin set. The
-approved set is immutable on that Revision. Panes derives the relevant CSP
-rules and blocks redirects to unapproved origins. `ws:`, `wss:`, and all other
-schemes are unsupported, even when the corresponding HTTP origin is approved.
-WebSockets are not available.
+HTTPS stylesheets, fonts, images, media, scripts, and API calls work by default
+without origin approval. The advanced compatibility path accepts exact
+normalized plain-HTTP origins and requires the existing approval handshake.
+Approved origins are immutable on that Revision. Panes derives the relevant CSP
+rules from this policy. `ws:`, `wss:`, and all other schemes are unsupported,
+even when the corresponding HTTP origin is approved. WebSockets are not
+available.
 
 Cloud deletion is an explicit, exact-confirmation action in the Access-protected
 inventory. It revokes Creator and Public access, removes cloud metadata and
