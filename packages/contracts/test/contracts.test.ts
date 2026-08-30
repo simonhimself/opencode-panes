@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  ARTIFACT_TYPES,
   artifactManifestSchema,
   artifactFilesSchema,
   artifactIdSchema,
@@ -9,28 +8,20 @@ import {
   creatorLinkSchema,
   deriveCloudManifest,
   draftSchema,
-  MAX_ARTIFACT_REVISIONS,
-  MAX_ARTIFACT_SOURCE_BYTES,
-  MAX_ARTIFACT_TOTAL_SOURCE_BYTES,
+  LEGACY_MAX_SOURCE_BYTES,
   MAX_REMOTE_FILE_BYTES,
   MAX_REMOTE_REVISION_BYTES,
   ownerCredentialSchema,
   publicationSchema,
   PUBLICATION_DURATIONS,
-  WORKSPACE_TOKEN_FRAGMENT_KEY,
   artifactResponseSchema,
-  artifactSourceSchema,
+  legacyArtifactSourceSchema,
   approvedOriginsSchema,
-  createArtifactRequestSchema,
-  createArtifactResponseSchema,
-  createRevisionRequestSchema,
   errorEnvelopeSchema,
-  revisionResponseSchema,
   relativePathSchema,
   revisionNumberSchema,
   requestedOriginsSchema,
   syncStateSchema,
-  shareResponseSchema,
   syncCreateRequestSchema,
   syncCreateResponseSchema,
   syncRevisionCommitRequestSchema,
@@ -46,7 +37,6 @@ import {
   RECONNECT_CODE_TTL_MS,
   syncReconnectRequestSchema,
   syncReconnectResponseSchema,
-  workspaceTokenSchema,
 } from "../src/index.js";
 
 const artifact = {
@@ -65,44 +55,6 @@ const revision = {
   source: "<h1>Hello</h1>",
   createdAt: "2026-08-17T12:00:00.000Z",
 } as const;
-
-describe("artifact request contracts", () => {
-  it.each(ARTIFACT_TYPES)("accepts the %s artifact type", (type) => {
-    const result = createArtifactRequestSchema.parse({
-      title: "  Example  ",
-      type,
-      source: "content",
-      sessionId: "session-1",
-    });
-
-    expect(result.title).toBe("Example");
-    expect(result.type).toBe(type);
-  });
-
-  it("rejects unsupported types and unknown fields", () => {
-    expect(
-      createArtifactRequestSchema.safeParse({
-        title: "Example",
-        type: "canvas",
-        source: "content",
-        sessionId: "session-1",
-        extra: true,
-      }).success,
-    ).toBe(false);
-  });
-
-  it("keeps revision creation limited to source", () => {
-    expect(
-      createRevisionRequestSchema.safeParse({ source: "content" }).success,
-    ).toBe(true);
-    expect(
-      createRevisionRequestSchema.safeParse({
-        source: "content",
-        title: "Changed title",
-      }).success,
-    ).toBe(false);
-  });
-});
 
 describe("local-first artifact manifests", () => {
   it("accepts a multi-file manifest with a finalized browser revision", () => {
@@ -202,7 +154,7 @@ describe("local-first artifact manifests", () => {
           kind: "file",
           path: "large.bin",
           sha256: "a".repeat(64),
-          byteSize: MAX_ARTIFACT_SOURCE_BYTES + 1,
+          byteSize: LEGACY_MAX_SOURCE_BYTES + 1,
           mediaType: "application/octet-stream",
         },
       ]).success,
@@ -557,37 +509,28 @@ describe("local-first lifecycle contracts", () => {
   });
 });
 
-describe("artifact source validation", () => {
-  it("exports conservative per-artifact storage limits", () => {
-    expect(MAX_ARTIFACT_REVISIONS).toBe(16);
-    expect(MAX_ARTIFACT_TOTAL_SOURCE_BYTES).toBe(2 * 1024 * 1024);
-    expect(MAX_ARTIFACT_TOTAL_SOURCE_BYTES).toBeGreaterThanOrEqual(
-      MAX_ARTIFACT_SOURCE_BYTES,
-    );
-  });
-
-  it("accepts source at the UTF-8 byte limit", () => {
+describe("legacy artifact source validation", () => {
+  it("keeps the historical UTF-8 byte limit for adoption", () => {
     expect(
-      artifactSourceSchema.safeParse("a".repeat(MAX_ARTIFACT_SOURCE_BYTES))
+      legacyArtifactSourceSchema.safeParse("a".repeat(LEGACY_MAX_SOURCE_BYTES))
         .success,
     ).toBe(true);
-  });
-
-  it("rejects source over the UTF-8 byte limit", () => {
     expect(
-      artifactSourceSchema.safeParse("a".repeat(MAX_ARTIFACT_SOURCE_BYTES + 1))
-        .success,
+      legacyArtifactSourceSchema.safeParse(
+        "a".repeat(LEGACY_MAX_SOURCE_BYTES + 1),
+      ).success,
     ).toBe(false);
   });
 
-  it("measures multibyte source as UTF-8 bytes", () => {
+  it("measures multibyte legacy source as UTF-8 bytes", () => {
     expect(
-      artifactSourceSchema.safeParse("é".repeat(MAX_ARTIFACT_SOURCE_BYTES / 2))
-        .success,
+      legacyArtifactSourceSchema.safeParse(
+        "é".repeat(LEGACY_MAX_SOURCE_BYTES / 2),
+      ).success,
     ).toBe(true);
     expect(
-      artifactSourceSchema.safeParse(
-        "é".repeat(MAX_ARTIFACT_SOURCE_BYTES / 2 + 1),
+      legacyArtifactSourceSchema.safeParse(
+        "é".repeat(LEGACY_MAX_SOURCE_BYTES / 2 + 1),
       ).success,
     ).toBe(false);
   });
@@ -623,61 +566,6 @@ describe("artifact response contracts", () => {
         legacy: { readOnly: true, unexpected: "field" },
       }).success,
     ).toBe(false);
-
-    expect(
-      createArtifactResponseSchema.safeParse({
-        artifact,
-        revision,
-        ownerToken: "owner-token",
-        viewerUrl:
-          "https://panes.example/artifacts/artifact-1#workspaceToken=workspace-token",
-      }).success,
-    ).toBe(true);
-
-    expect(
-      revisionResponseSchema.safeParse({
-        artifactId: artifact.id,
-        revision,
-        viewerUrl: "https://panes.example/artifacts/artifact-1",
-      }).success,
-    ).toBe(true);
-  });
-
-  it("uses a parseable workspace capability fragment without changing the response shape", () => {
-    const result = createArtifactResponseSchema.parse({
-      artifact,
-      revision,
-      ownerToken: "owner-token",
-      viewerUrl:
-        "https://panes.example/artifacts/artifact-1#workspaceToken=workspace-token",
-    });
-    const url = new URL(result.viewerUrl);
-    const fragment = new URLSearchParams(url.hash.slice(1));
-
-    expect(url.search).toBe("");
-    expect(fragment.get(WORKSPACE_TOKEN_FRAGMENT_KEY)).toBe("workspace-token");
-    expect(
-      workspaceTokenSchema.safeParse(fragment.get(WORKSPACE_TOKEN_FRAGMENT_KEY))
-        .success,
-    ).toBe(true);
-    expect(Object.keys(result).sort()).toEqual([
-      "artifact",
-      "ownerToken",
-      "revision",
-      "viewerUrl",
-    ]);
-  });
-
-  it("validates immutable share metadata without an owner token", () => {
-    const result = shareResponseSchema.safeParse({
-      artifactId: artifact.id,
-      revisionId: revision.id,
-      version: revision.version,
-      publicUrl: "https://panes.example/public/share-token",
-      createdAt: "2026-08-17T12:30:00.000Z",
-    });
-
-    expect(result.success).toBe(true);
   });
 });
 

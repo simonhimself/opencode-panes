@@ -10,7 +10,7 @@
     "deploy:dry-run": "wrangler deploy --dry-run",
     "dev": "vite dev",
     "preview": "vite preview",
-    "test": "vitest run --config vitest.config.ts test/api.test.ts test/inventory.test.ts test/legacy-migration.test.ts test/publication.test.ts test/sync.test.ts test/zip.test.ts && vitest run --config vitest.client.config.ts",
+    "test": "vitest run --config vitest.config.ts test/api.test.ts test/inventory.test.ts test/legacy-migration.test.ts test/legacy-mutation-contraction.test.ts test/publication.test.ts test/sync.test.ts test/zip.test.ts && vitest run --config vitest.client.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

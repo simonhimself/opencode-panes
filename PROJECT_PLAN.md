@@ -4,26 +4,26 @@
 
 OpenCode Panes brings a Claude Artifacts-style workflow to OpenCode.
 
-The creator asks OpenCode to make an artifact. An OpenCode plugin sends the generated source to a Cloudflare-hosted renderer and returns a browser URL. The creator can inspect and interact with the result, then continue prompting OpenCode to create new versions of the same artifact.
+The creator asks OpenCode to make an artifact. The plugin prepares a project-local Artifact and Draft, then explicitly Syncs a finalized Revision when a cloud link is needed. The creator can inspect and interact with the result, then continue prompting OpenCode to create new local revisions.
 
 The product is an artifact renderer and lightweight revision store. It is not a chat application, deployment platform, project builder, or collaboration suite.
 
 ## Core Promise
 
-> Ask OpenCode to make an artifact. It opens as a working visual page. Keep prompting, and it updates.
+> Ask OpenCode to make an artifact. It opens as a local working visual page. Keep prompting, finalize revisions, and Sync deliberately.
 
 ## Primary Workflow
 
 1. The creator asks OpenCode to create an artifact, prototype, diagram, document, or visual explanation.
-2. OpenCode calls the `artifact` tool registered by the Panes plugin.
-3. The plugin sends the artifact source to the Panes API on Cloudflare.
-4. The tool returns the private artifact URL and artifact ID.
-5. The creator opens the URL in a browser tab or browser panel.
-6. The page displays the rendered preview and underlying source.
-7. The creator asks OpenCode to revise the artifact.
-8. OpenCode calls the tool again with the existing artifact ID.
-9. Panes stores an immutable revision and refreshes the creator view.
-10. The creator can copy, download, or publish a selected revision.
+2. OpenCode calls `artifact_prepare` or `artifact_import`.
+3. The plugin creates a project-local Artifact and writable Draft without network access.
+4. OpenCode writes or imports complete files into the Draft.
+5. OpenCode calls `artifact_finalize` to record an immutable local Revision and open a local preview.
+6. The creator reviews the local preview and source.
+7. The creator asks OpenCode to revise the artifact, and OpenCode prepares the next Draft.
+8. The creator explicitly calls `artifact_sync` when a cloud identity or link is needed.
+9. Panes stores the selected immutable Revision and returns Creator or public lifecycle links.
+10. The creator can copy or download a selected Revision and manage publication from Inventory.
 
 Legacy adoption is an explicit inventory-to-plugin handoff. The creator issues a
 short-lived adoption code for the current Legacy Revision, then the
@@ -31,11 +31,11 @@ plugin redeems it into a project-local finalized v1 without changing source
 bytes. The original Legacy history stays separate and read-only. The first
 local-first Sync creates a new cloud identity and records the Legacy provenance.
 
-Legacy compatibility is bounded. The legacy `artifact` route may create one v1
-cloud artifact for pre-Ticket-20 compatibility, but it immediately classifies
-that artifact as Legacy. Legacy reads remain available through their expiry;
-source revision, publication, and unpublish mutations are read-only failures.
-New iteration uses the local-first workflow above.
+Legacy compatibility is bounded. The retired source-string mutation routes return
+`410 LOCAL_FIRST_REQUIRED` without parsing, authenticating, looking up, or
+mutating an artifact. Legacy reads, sharing, adoption export, and explicit cloud
+deletion remain available through their migration windows. New iteration uses the
+local-first workflow above.
 
 ## MVP Scope
 
@@ -69,8 +69,8 @@ New iteration uses the local-first workflow above.
 ### OpenCode Integration
 
 - [x] Install the OpenCode server plugin as a private local plugin file
-- [x] Register one `artifact` custom tool
-- [x] Register the local-first `artifact_prepare` and `artifact_finalize` tools
+- [x] Register the local-first `artifact_prepare`, `artifact_import`, `artifact_finalize`, and `artifact_sync` tools
+- [x] Register `artifact_adopt_legacy` and `artifact_reconnect` compatibility tools
 - [x] Register the local-first `artifact_reconnect` tool for Owner credential recovery
 - [x] Associate artifacts with the current OpenCode session ID
 - [x] Return artifact ID, revision, and browser URL in the tool result
@@ -84,16 +84,9 @@ New iteration uses the local-first workflow above.
 
 ## OpenCode Plugin Contract
 
-The plugin registers the legacy cloud tool and the local-first preparation tool:
+The plugin registers the local-first preparation, import, finalization, Sync, and compatibility tools:
 
 ```ts
-artifact({
-  artifactId?: string,
-  title: string,
-  type: "html" | "react" | "svg" | "mermaid" | "markdown" | "code",
-  source: string,
-})
-
 artifact_prepare({
   artifactId?: string,
   title?: string,
@@ -110,14 +103,21 @@ artifact_finalize({
   adapter: "browser" | "renderer",
   renderer?: "react" | "markdown" | "mermaid" | "code",
 })
+
+artifact_sync({
+  artifactId: string,
+  revision?: number,
+  rotateCreatorLink?: boolean,
+})
 ```
 
 Behavior:
 
-- Omitting `artifactId` creates a new artifact.
-- Providing `artifactId` creates a new immutable revision.
-- The OpenCode `sessionID` is recorded automatically from tool context.
-- The tool result contains the artifact ID, revision number, and private viewer URL.
+- `artifact_prepare` or `artifact_import` creates local state and never contacts Cloudflare.
+- `artifact_finalize` records a local immutable Revision and returns a local preview URL.
+- `artifact_sync` is the only new cloud creation path and uploads selected finalized files.
+- The OpenCode `sessionID` is recorded in Sync metadata when available.
+- Adoption writes an unchanged local finalized v1; its first Sync creates a new cloud identity.
 - The source is not repeated in the tool result.
 
 The local-first `artifact_prepare` tool creates a project-local `artifact.json` and writable `draft/` under the Git worktree's `artifacts/` directory, or under the session directory when Git is unavailable. The `artifact_finalize` tool validates a declared Preview entry, promotes the Draft to the next immutable `vN`, records raw file metadata, and returns a temporary loopback Local preview URL. Neither tool contacts Cloudflare or modifies Git state.
@@ -195,16 +195,18 @@ Cloudflare Worker API
 
 ### Worker API
 
-Planned routes:
+Planned and retained routes:
 
 ```text
-POST /api/artifacts
-POST /api/artifacts/:id/revisions
+POST /api/artifacts                         # Legacy mutation contract, returns 410
+POST /api/artifacts/:id/revisions           # Legacy mutation contract, returns 410
 GET  /api/artifacts/:id
 GET  /api/artifacts/:id/revisions
-POST /api/artifacts/:id/publish
-POST /api/artifacts/:id/unpublish
+POST /api/artifacts/:id/publish             # Legacy mutation contract, returns 410
+POST /api/artifacts/:id/unpublish           # Legacy mutation contract, returns 410
 GET  /api/public/:shareToken
+POST /api/sync/artifacts
+POST /api/sync/artifacts/:id/revisions/:version/commit
 ```
 
 ### D1 Data Model
@@ -318,13 +320,13 @@ Exit criteria:
 ### Milestone 1: HTML Vertical Slice
 
 - [x] Create D1 migrations for artifacts and revisions
-- [x] Implement artifact creation API
-- [x] Implement artifact revision API
+- [x] Implement initial source-string artifact API (historical, superseded by Ticket 20; mutation routes now return 410)
+- [x] Implement initial source-string revision API (historical, superseded by Ticket 20; mutation routes now return 410)
 - [x] Implement private artifact retrieval
 - [x] Build the minimal artifact viewer
 - [x] Render HTML in a restricted iframe
 - [x] Add Preview and Code tabs
-- [x] Register the OpenCode `artifact` tool
+- [x] Register the initial OpenCode `artifact` tool (historical, removed by Ticket 20)
 - [ ] Return a working private URL from an OpenCode conversation
 
 Exit criteria:
@@ -352,7 +354,7 @@ Exit criteria:
 
 ### Milestone 3: Publishing
 
-- [x] Add selected-revision publishing
+- [x] Add selected-revision publishing (current lifecycle is managed from Inventory after explicit Sync)
 - [x] Add share-token generation and hashing
 - [x] Add public artifact route
 - [x] Add unpublish and revocation
@@ -366,7 +368,7 @@ Exit criteria:
 
 ### Milestone 4: Private OpenCode Installation
 
-- [x] Add first-upload permission flow
+- [x] Add first-Sync upload permission flow
 - [x] Add optional `/artifact` command
 - [x] Add optional browser auto-open
 - [x] Document project-scoped installation
@@ -374,7 +376,7 @@ Exit criteria:
 - [x] Install the plugin as an auto-discovered global plugin file
 - [x] Add a repository-independent global plugin build and installer
 - [ ] Test with multiple OpenCode-supported model providers
-- [x] Refine tool guidance based on model behavior
+- [x] Refine local-first tool guidance based on model behavior
 
 Exit criteria:
 
@@ -382,7 +384,7 @@ Exit criteria:
 
 ### Milestone 5: Hardening
 
-- [x] Add API and source-size limits
+- [x] Add API and local file/revision-size limits; retain the old source limit only for Legacy adoption
 - [ ] Add rate limiting
 - [x] Add iframe sandbox and CSP regression tests
 - [x] Add malicious HTML, SVG, Markdown, and React test cases
@@ -416,16 +418,16 @@ The MVP is complete when this workflow succeeds:
 1. Install the Panes plugin in OpenCode.
 2. Start an OpenCode session.
 3. Ask: `Create an artifact showing a clickable SaaS onboarding flow.`
-4. OpenCode calls the `artifact` tool without requiring source to be copied manually.
-5. The tool returns a private browser URL.
-6. The URL shows a working interactive preview and its code.
+4. OpenCode calls `artifact_prepare` and writes complete files into the Draft.
+5. OpenCode calls `artifact_finalize` and opens the local preview.
+6. The preview shows the working interactive artifact and its source.
 7. Ask: `Make the second step optional and use a darker visual style.`
-8. OpenCode creates version two of the same artifact.
-9. The open browser viewer detects version two.
+8. OpenCode prepares and finalizes version two locally.
+9. The local preview detects version two.
 10. Both versions remain selectable.
-11. Publish version two.
-12. Open the public URL in a private browser session.
-13. The artifact works without exposing the owner URL, OpenCode session, or unpublished versions.
+11. Explicitly Sync version two when a cloud link is needed.
+12. Open the returned Creator or public URL in a private browser session.
+13. The artifact works without exposing local credentials or unpublished revisions.
 
 ## Later Decisions
 

@@ -104,50 +104,22 @@ describe("global plugin installer", () => {
     })();
 
     expect(typeof module.default).toBe("function");
-    expect(typeof hooks.tool?.artifact?.execute).toBe("function");
+    expect(typeof hooks.tool?.artifact_prepare?.execute).toBe("function");
+    expect(typeof hooks.tool?.artifact_finalize?.execute).toBe("function");
+    expect(typeof hooks.tool?.artifact_sync?.execute).toBe("function");
+    expect(typeof hooks.tool?.artifact_adopt_legacy?.execute).toBe("function");
   }, 15_000);
 
-  it("reads the creation key at runtime and uses the global production defaults", async () => {
+  it("uses the global production defaults for local-first preparation", async () => {
     const configDirectory = join(temporaryDirectory, "runtime-config");
     const inheritedEnvironment = removeEnvironmentVariables([
       "OPENCODE_PANES_API_BASE_URL",
-      "OPENCODE_PANES_CREATE_API_KEY",
-      "OPENCODE_PANES_CREATE_API_KEY_FILE",
       "XDG_STATE_HOME",
     ]);
-    await mkdirForFile(
-      join(configDirectory, "secrets/opencode-panes-create-key"),
-      "runtime-create-key\n",
-    );
     const installedPath = join(configDirectory, "plugins/opencode-panes.js");
     await runInstaller({ OPENCODE_PANES_CONFIG_DIR: configDirectory });
 
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          artifact: {
-            id: "artifact-1",
-            title: "Example",
-            type: "html",
-            currentRevisionId: "revision-1",
-            createdAt: "2026-08-17T12:00:00.000Z",
-            updatedAt: "2026-08-17T12:00:00.000Z",
-          },
-          revision: {
-            id: "revision-1",
-            artifactId: "artifact-1",
-            version: 1,
-            source: "<h1>Hello</h1>",
-            createdAt: "2026-08-17T12:00:00.000Z",
-          },
-          ownerToken: "owner-token",
-          viewerUrl:
-            "https://opencode-panes.simons.workers.dev/artifacts/artifact-1#workspaceToken=workspace-token",
-        }),
-        { headers: { "content-type": "application/json" } },
-      ),
-    );
-    const ask = vi.fn().mockResolvedValue(undefined);
+    const fetchMock = vi.fn<typeof fetch>();
     vi.stubEnv("OPENCODE_PANES_CONFIG_DIR", configDirectory);
     vi.stubEnv("XDG_STATE_HOME", join(temporaryDirectory, "runtime-state"));
     vi.stubGlobal("fetch", fetchMock);
@@ -157,72 +129,8 @@ describe("global plugin installer", () => {
         `${pathToFileURL(installedPath).href}?runtime`
       );
       const hooks = await module.default({});
-      await hooks.tool?.artifact?.execute(
-        { title: "Example", type: "html", source: "<h1>Hello</h1>" },
-        {
-          sessionID: "session-1",
-          messageID: "message-1",
-          agent: "build",
-          directory: configDirectory,
-          worktree: configDirectory,
-          abort: new AbortController().signal,
-          metadata: () => undefined,
-          ask,
-        },
-      );
-    } finally {
-      vi.unstubAllEnvs();
-      vi.unstubAllGlobals();
-      restoreEnvironmentVariables(inheritedEnvironment);
-    }
-
-    expect(fetchMock).toHaveBeenCalledOnce();
-    const [url, init] = fetchMock.mock.calls[0] ?? [];
-    expect(String(url)).toBe(
-      "https://opencode-panes.simons.workers.dev/api/artifacts",
-    );
-    expect(new Headers(init?.headers).get("x-panes-create-key")).toBe(
-      "runtime-create-key",
-    );
-    expect(ask).toHaveBeenCalledOnce();
-  }, 15_000);
-
-  it("uses a 15-second request timeout by default", async () => {
-    const configDirectory = join(temporaryDirectory, "timeout-config");
-    const inheritedEnvironment = removeEnvironmentVariables([
-      "OPENCODE_PANES_API_BASE_URL",
-      "OPENCODE_PANES_CREATE_API_KEY",
-      "OPENCODE_PANES_CREATE_API_KEY_FILE",
-      "XDG_STATE_HOME",
-    ]);
-    const installedPath = join(configDirectory, "plugins/opencode-panes.js");
-    await runInstaller({ OPENCODE_PANES_CONFIG_DIR: configDirectory });
-
-    const fetchMock = vi.fn<typeof fetch>(
-      (_input, init) =>
-        new Promise<Response>((_resolve, reject) => {
-          const signal = init?.signal;
-          if (!signal) {
-            reject(new Error("Expected the request to have an abort signal"));
-            return;
-          }
-          const rejectOnAbort = () => reject(signal.reason);
-          if (signal.aborted) rejectOnAbort();
-          else signal.addEventListener("abort", rejectOnAbort, { once: true });
-        }),
-    );
-    vi.useFakeTimers();
-    vi.stubEnv("OPENCODE_PANES_CONFIG_DIR", configDirectory);
-    vi.stubEnv("XDG_STATE_HOME", join(temporaryDirectory, "timeout-state"));
-    vi.stubGlobal("fetch", fetchMock);
-
-    try {
-      const module = await import(
-        `${pathToFileURL(installedPath).href}?timeout`
-      );
-      const hooks = await module.default({});
-      const execution = hooks.tool?.artifact?.execute(
-        { title: "Example", type: "html", source: "<h1>Hello</h1>" },
+      const result = await hooks.tool?.artifact_prepare?.execute(
+        { title: "Example", requestedOrigins: [] },
         {
           sessionID: "session-1",
           messageID: "message-1",
@@ -234,19 +142,15 @@ describe("global plugin installer", () => {
           ask: vi.fn().mockResolvedValue(undefined),
         },
       );
-
-      const rejection = expect(execution).rejects.toThrow(
-        "Panes API request timed out after 15000 ms",
-      );
-      await vi.advanceTimersByTimeAsync(15_000);
-      await rejection;
+      expect(result).toBeDefined();
     } finally {
-      vi.useRealTimers();
       vi.unstubAllEnvs();
       vi.unstubAllGlobals();
       restoreEnvironmentVariables(inheritedEnvironment);
     }
-  });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+  }, 15_000);
 });
 
 async function runInstaller(environment: Record<string, string>) {

@@ -1,5 +1,4 @@
 import {
-  createArtifactResponseSchema,
   creatorWorkspaceResponseSchema,
   publicationSchema,
   syncCreateResponseSchema,
@@ -485,23 +484,6 @@ describe("local-first publication lifecycle", () => {
     );
     expect((await api(`/api/publications/${token}`)).status).toBe(200);
 
-    const legacyCreate = await api(
-      "/api/artifacts",
-      jsonRequest({
-        title: "Legacy publication",
-        type: "html",
-        source: "<h1>legacy</h1>",
-        sessionId: `legacy-${crypto.randomUUID()}`,
-      }),
-    );
-    const legacy = createArtifactResponseSchema.parse(
-      await legacyCreate.json(),
-    );
-    const legacyPublish = await api(
-      `/api/artifacts/${legacy.artifact.id}/publish`,
-      jsonRequest({ revisionId: legacy.revision.id }, legacy.ownerToken),
-    );
-    expect(legacyPublish.status).toBe(409);
     const unknownToken = "a".repeat(64);
     const unknownResponse = await api(`/api/publications/${unknownToken}`);
     expect(unknownResponse.status).toBe(404);

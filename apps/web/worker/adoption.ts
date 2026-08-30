@@ -1,5 +1,5 @@
 import {
-  MAX_ARTIFACT_SOURCE_BYTES,
+  LEGACY_MAX_SOURCE_BYTES,
   LEGACY_ADOPTION_CODE_PREFIX,
   LEGACY_ADOPTION_CODE_TTL_MS,
   legacyAdoptionIssueResponseSchema,
@@ -69,7 +69,7 @@ export async function issueLegacyAdoptionCode(
       expiresAt,
       artifactId,
       createdAt,
-      MAX_ARTIFACT_SOURCE_BYTES,
+      LEGACY_MAX_SOURCE_BYTES,
     ),
   ]);
   if (result[2]?.meta.changes !== 1)

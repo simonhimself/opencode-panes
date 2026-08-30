@@ -20,22 +20,27 @@ const hooks = await plugin(
     createApiKey: "smoke-check-only",
   },
 );
-const artifact = hooks.tool?.artifact;
+const prepare = hooks.tool?.artifact_prepare;
 const finalize = hooks.tool?.artifact_finalize;
+const sync = hooks.tool?.artifact_sync;
+const adoptLegacy = hooks.tool?.artifact_adopt_legacy;
 
-assert.ok(artifact, "plugin must register the artifact tool");
-assert.equal(typeof artifact.description, "string");
-assert.equal(typeof artifact.execute, "function");
+assert.equal(
+  hooks.tool?.artifact,
+  undefined,
+  "legacy artifact tool must be removed",
+);
+assert.ok(prepare, "plugin must register the artifact_prepare tool");
+assert.equal(typeof prepare.description, "string");
+assert.equal(typeof prepare.execute, "function");
 assert.ok(finalize, "plugin must register the artifact_finalize tool");
 assert.equal(typeof finalize.execute, "function");
-assert.deepEqual(Object.keys(artifact.args).sort(), [
-  "artifactId",
-  "source",
-  "title",
-  "type",
-]);
+assert.ok(sync, "plugin must register the artifact_sync tool");
+assert.equal(typeof sync.execute, "function");
+assert.ok(adoptLegacy, "plugin must register the artifact_adopt_legacy tool");
+assert.equal(typeof adoptLegacy.execute, "function");
 
-console.log("Built plugin smoke check passed: artifact tool registered.");
+console.log("Built plugin smoke check passed: local-first tools registered.");
 
 const globalEntry = pathToFileURL(
   resolve("packages/opencode-plugin/dist/global.js"),
@@ -56,9 +61,10 @@ const globalHooks = await globalPlugin(
     createApiKey: "smoke-check-only",
   },
 );
-assert.equal(typeof globalHooks.tool?.artifact?.execute, "function");
+assert.equal(globalHooks.tool?.artifact, undefined);
+assert.equal(typeof globalHooks.tool?.artifact_prepare?.execute, "function");
 console.log(
-  "Bundled global plugin smoke check passed: artifact tool registered.",
+  "Bundled global plugin smoke check passed: local-first tools registered.",
 );
 
 const isolatedDirectory = await mkdtemp(

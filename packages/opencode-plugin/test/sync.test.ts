@@ -65,6 +65,7 @@ afterEach(async () => {
   await new Promise<void>((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),
   );
+  vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
   await rm(project, { recursive: true, force: true });
@@ -113,6 +114,63 @@ describe("sync and publish intent tools", () => {
     expect(ask).toHaveBeenCalledWith(
       expect.objectContaining({ permission: "artifact_open" }),
     );
+  });
+
+  it("sends the admission key only on first Sync creation", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "First Sync", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+
+    await executeSync({ artifactId: prepared.artifactId }, context);
+    const createRequests = requests.filter(
+      ({ path }) => path === "/api/sync/artifacts",
+    );
+    expect(createRequests).toHaveLength(1);
+    expect(createRequests[0]?.headers["x-panes-create-key"]).toEqual(
+      "admission-key",
+    );
+
+    for (const request of requests.filter(
+      ({ path }) => path !== "/api/sync/artifacts",
+    )) {
+      expect(request.headers["x-panes-create-key"]).toBeUndefined();
+      expect(request.body.toString("utf8")).not.toContain("admission-key");
+    }
+    const state = await readFile(await onlyStateFile(), "utf8");
+    expect(state).not.toContain("admission-key");
+    expect(
+      JSON.stringify(
+        resultMetadata(
+          await executeSync({ artifactId: prepared.artifactId }, context),
+        ),
+      ),
+    ).not.toContain("admission-key");
+  });
+
+  it("passes the configured timeout to a local-first Sync request", async () => {
+    const context = toolContext();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValue(new Error("offline"));
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    vi.stubGlobal("fetch", fetchMock);
+    const plugin = await OpenCodePanesPlugin({} as never, {
+      apiBaseUrl: apiOrigin,
+      requestTimeoutMs: 100,
+    });
+    const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
+    await expect(
+      definition.execute(
+        {
+          artifactId: "legacy-timeout",
+          adoptionCode: "panes-adopt-legacy-" + "a".repeat(32),
+          slug: "timeout",
+        },
+        context,
+      ),
+    ).rejects.toThrow("Could not reach the Panes API at http://127.0.0.1");
+    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), 100);
   });
 
   it("reconnects from the canonical local manifest after protected state loss", async () => {
@@ -776,7 +834,10 @@ async function prepareAndFinalize(
 async function executeSync(
   args: Record<string, unknown>,
   context: ToolContext,
-  options: { failureInjector?: (phase: string) => void } = {},
+  options: {
+    failureInjector?: (phase: string) => void;
+    requestTimeoutMs?: number;
+  } = {},
 ) {
   const plugin = await OpenCodePanesPlugin({} as never, {
     apiBaseUrl: apiOrigin,

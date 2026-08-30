@@ -42,28 +42,22 @@ import {
   normalizePreviewContentType,
 } from "@opencode-panes/renderers/preview-security";
 import {
-  MAX_ARTIFACT_SOURCE_BYTES,
+  LEGACY_MAX_SOURCE_BYTES,
   MAX_ARTIFACT_KIND_LENGTH,
   artifactManifestSchema,
   artifactFilesSchema,
   artifactSlugSchema,
   deriveCloudManifest,
-  WORKSPACE_TOKEN_FRAGMENT_KEY,
   artifactIdSchema,
   artifactTypeSchema,
   draftSchema,
   finalizedRevisionSchema,
   previewEntrySchema,
   relativePathSchema,
-  createArtifactRequestSchema,
-  createArtifactResponseSchema,
-  createRevisionRequestSchema,
   errorEnvelopeSchema,
   ownerTokenSchema,
   requestedOriginsSchema,
   revisionNumberSchema,
-  revisionResponseSchema,
-  workspaceTokenSchema,
   syncCreateResponseSchema,
   syncRevisionCommitResponseSchema,
   syncCreatorRotateResponseSchema,
@@ -98,8 +92,6 @@ const PREVIEW_FRAME_PATH = "__panes__/frame";
 const execFileAsync = promisify(execFile);
 const PROCESS_OWNER_ID = randomUUID();
 
-const TOOL_DESCRIPTION = `Use this tool when the user explicitly requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text. Omit artifactId to create an artifact. Reuse the returned artifact ID when the user asks to revise that artifact so Panes creates an immutable new version. Supply complete standalone source, not a patch or prose description. After success, present viewerUrl exactly as returned, including its fragment; never shorten, sanitize, or rewrite that URL.`;
-
 export interface PanesPluginOptions {
   /** Panes API origin. Defaults to the local Vite/Workers development server. */
   apiBaseUrl?: string;
@@ -117,15 +109,6 @@ interface ResolvedOptions {
   createApiKey?: string;
   requestTimeoutMs: number;
   failureInjector?: (phase: string) => void;
-}
-
-interface StoredArtifactState {
-  apiOrigin: string;
-  artifactId: string;
-  ownerToken: string;
-  viewerUrl: string;
-  title: string;
-  type: ArtifactType;
 }
 
 interface StoredSyncState {
@@ -167,54 +150,6 @@ export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
 
   return {
     tool: {
-      artifact: tool({
-        description: TOOL_DESCRIPTION,
-        args: {
-          artifactId: tool.schema
-            .string()
-            .min(1)
-            .max(128)
-            .regex(/^\S+$/)
-            .optional()
-            .describe(
-              "Existing Panes artifact ID when creating a new revision. Omit only for a new artifact.",
-            ),
-          title: tool.schema
-            .string()
-            .trim()
-            .min(1)
-            .max(200)
-            .describe("Short human-readable artifact title."),
-          type: tool.schema
-            .enum(["html", "react", "svg", "mermaid", "markdown", "code"])
-            .describe("Renderer for this artifact."),
-          source: tool.schema
-            .string()
-            .min(1)
-            .describe(
-              `Complete standalone artifact source, limited to ${MAX_ARTIFACT_SOURCE_BYTES} UTF-8 bytes.`,
-            ),
-        },
-        async execute(args, context) {
-          if (args.artifactId) {
-            return updateArtifact(
-              { ...args, artifactId: args.artifactId },
-              context,
-              options,
-            );
-          }
-
-          return createArtifact(
-            {
-              title: args.title,
-              type: args.type,
-              source: args.source,
-            },
-            context,
-            options,
-          );
-        },
-      }),
       artifact_prepare: tool({
         description:
           "Prepare a project-local Panes artifact or its next writable Draft. This never contacts Cloudflare, changes Git state, or creates a preview. Use normal filesystem tools to create Draft files, then use the finalize tool.",
@@ -981,7 +916,7 @@ async function adoptLegacyArtifact(
             }
             if (
               new TextEncoder().encode(payload.source).byteLength >
-              MAX_ARTIFACT_SOURCE_BYTES
+              LEGACY_MAX_SOURCE_BYTES
             ) {
               throw new Error(
                 "The adopted Legacy source exceeds the local size limit.",
@@ -5180,7 +5115,9 @@ function resolveOptions(
   }
 
   const requestTimeoutMsValue =
-    options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    options && "requestTimeoutMs" in options
+      ? options.requestTimeoutMs
+      : DEFAULT_REQUEST_TIMEOUT_MS;
   if (
     typeof requestTimeoutMsValue !== "number" ||
     !Number.isInteger(requestTimeoutMsValue) ||
@@ -5207,181 +5144,6 @@ function resolveOptions(
     requestTimeoutMs: requestTimeoutMsValue,
     ...(failureInjector ? { failureInjector } : {}),
   };
-}
-
-async function createArtifact(
-  args: {
-    title: string;
-    type: ArtifactType;
-    source: string;
-  },
-  context: ToolContext,
-  options: ResolvedOptions,
-) {
-  const request = createArtifactRequestSchema.safeParse({
-    title: args.title,
-    type: args.type,
-    source: args.source,
-    sessionId: context.sessionID,
-  });
-  if (!request.success) {
-    throw validationError(request.error.issues[0]?.message);
-  }
-
-  await ensureUploadPermission(context, options.apiBaseUrl, {
-    operation: "create",
-    title: request.data.title,
-  });
-
-  const response = await fetchPanes(
-    new URL("/api/artifacts", options.apiBaseUrl),
-    {
-      method: "POST",
-      headers: jsonHeaders(undefined, options.createApiKey),
-      body: JSON.stringify(request.data),
-    },
-    context.abort,
-    options.requestTimeoutMs,
-  );
-  const payload = await parseApiResponse(
-    response,
-    createArtifactResponseSchema,
-    options.createApiKey ? [options.createApiKey] : [],
-  );
-  if (payload.revision.artifactId !== payload.artifact.id) {
-    throw malformedSuccessResponse();
-  }
-  const viewerUrl = validateCreateViewerUrl(
-    payload.viewerUrl,
-    options.apiBaseUrl.origin,
-    payload.artifact.id,
-  );
-
-  try {
-    await writeArtifactState({
-      apiOrigin: options.apiBaseUrl.origin,
-      artifactId: payload.artifact.id,
-      ownerToken: payload.ownerToken,
-      viewerUrl,
-      title: payload.artifact.title,
-      type: payload.artifact.type,
-    });
-  } catch (error) {
-    throw new Error(
-      `Artifact ${payload.artifact.id} was created, but its owner token could not be saved. Future updates are unavailable until state storage is fixed. ${errorMessage(error)}`,
-    );
-  }
-
-  const autoOpenStatus = await maybeOpenViewer(
-    viewerUrl,
-    context,
-    options.autoOpen,
-  );
-  return toolResult({
-    operation: "created",
-    artifactId: payload.artifact.id,
-    title: payload.artifact.title,
-    type: payload.artifact.type,
-    version: payload.revision.version,
-    viewerUrl,
-    autoOpenStatus,
-  });
-}
-
-async function updateArtifact(
-  args: {
-    artifactId: string;
-    title: string;
-    type: ArtifactType;
-    source: string;
-  },
-  context: ToolContext,
-  options: ResolvedOptions,
-) {
-  const artifactId = artifactIdSchema.safeParse(args.artifactId);
-  if (!artifactId.success) {
-    throw validationError("Artifact ID is invalid");
-  }
-
-  const request = createRevisionRequestSchema.safeParse({
-    source: args.source,
-  });
-  if (!request.success) {
-    throw validationError(request.error.issues[0]?.message);
-  }
-
-  const state = await readArtifactState(
-    options.apiBaseUrl.origin,
-    artifactId.data,
-  );
-  if (args.title !== state.title) {
-    throw new Error(
-      `Artifact title is immutable. Retry the update with the stored title ${JSON.stringify(state.title)}.`,
-    );
-  }
-  if (args.type !== state.type) {
-    throw new Error(
-      `Artifact type is immutable. Retry the update with the stored type ${JSON.stringify(state.type)}.`,
-    );
-  }
-  await ensureUploadPermission(context, options.apiBaseUrl, {
-    operation: "update",
-    title: state.title,
-  });
-  const response = await fetchPanes(
-    new URL(
-      `/api/artifacts/${encodeURIComponent(artifactId.data)}/revisions`,
-      options.apiBaseUrl,
-    ),
-    {
-      method: "POST",
-      headers: jsonHeaders(state.ownerToken),
-      body: JSON.stringify(request.data),
-    },
-    context.abort,
-    options.requestTimeoutMs,
-  );
-
-  let payload;
-  try {
-    payload = await parseApiResponse(response, revisionResponseSchema, [
-      state.ownerToken,
-    ]);
-  } catch (error) {
-    if (response.status === 401 || response.status === 403) {
-      throw new Error(
-        `Panes authorization failed for artifact ${artifactId.data}. The locally stored owner token may be missing from the server or no longer valid. Create a new artifact or restore the matching Panes state file.`,
-      );
-    }
-    throw error;
-  }
-  if (
-    payload.artifactId !== artifactId.data ||
-    payload.revision.artifactId !== artifactId.data
-  ) {
-    throw malformedSuccessResponse();
-  }
-  const viewerUrl = validateUpdateViewerUrl(
-    payload.viewerUrl,
-    options.apiBaseUrl.origin,
-    payload.artifactId,
-    state.viewerUrl,
-  );
-
-  const autoOpenStatus = await maybeOpenViewer(
-    viewerUrl,
-    context,
-    options.autoOpen,
-  );
-  return toolResult({
-    operation: "updated",
-    artifactId: payload.artifactId,
-    title: state.title,
-    type: state.type,
-    version: payload.revision.version,
-    viewerUrl,
-    autoOpenStatus,
-  });
 }
 
 function jsonHeaders(ownerToken?: string, createApiKey?: string) {
@@ -5552,38 +5314,7 @@ async function parseApiResponse<T>(
 }
 
 function validationError(message = "Artifact input is invalid") {
-  if (message.includes(String(MAX_ARTIFACT_SOURCE_BYTES))) {
-    return new Error(
-      `Artifact source exceeds the ${MAX_ARTIFACT_SOURCE_BYTES}-byte UTF-8 limit. Reduce the source and call the artifact tool again.`,
-    );
-  }
   return new Error(`Artifact input is invalid: ${message}`);
-}
-
-function toolResult(input: {
-  operation: "created" | "updated";
-  artifactId: string;
-  title: string;
-  type: ArtifactType;
-  version: number;
-  viewerUrl: string;
-  autoOpenStatus: AutoOpenStatus;
-}) {
-  const summary = {
-    artifactId: input.artifactId,
-    version: input.version,
-    title: input.title,
-    type: input.type,
-    viewerUrl: input.viewerUrl,
-    operation: input.operation,
-    autoOpen: input.autoOpenStatus,
-  };
-
-  return {
-    title: `${input.operation === "created" ? "Created" : "Updated"} ${input.title}`,
-    output: JSON.stringify(summary),
-    metadata: summary,
-  };
 }
 
 async function maybeOpenViewer(
@@ -5659,7 +5390,7 @@ function isLoopbackHost(url: URL) {
 async function ensureUploadPermission(
   context: ToolContext,
   apiBaseUrl: URL,
-  metadata: { operation: "create" | "update" | "sync"; title: string },
+  metadata: { operation: "sync"; title: string },
 ) {
   await context.ask({
     permission: "artifact_upload",
@@ -5972,162 +5703,8 @@ async function writeProtectedJson(path: string, value: unknown) {
   await restrictPermissions(path, 0o600);
 }
 
-async function writeArtifactState(state: StoredArtifactState) {
-  const directory = artifactStateDirectory(state.apiOrigin);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await restrictPermissions(directory, 0o700);
-
-  const target = artifactStatePath(state.apiOrigin, state.artifactId);
-  const temporary = join(directory, `.${randomUUID()}.tmp`);
-  const handle = await open(temporary, "wx", 0o600);
-  try {
-    await handle.writeFile(`${JSON.stringify(state)}\n`, { encoding: "utf8" });
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-
-  try {
-    await rename(temporary, target);
-    await restrictPermissions(target, 0o600);
-  } catch (error) {
-    await unlink(temporary).catch(() => undefined);
-    throw error;
-  }
-}
-
-async function readArtifactState(apiOrigin: string, artifactId: string) {
-  const path = artifactStatePath(apiOrigin, artifactId);
-  let raw: string;
-  try {
-    raw = await readFile(path, "utf8");
-  } catch (error) {
-    if (isNodeError(error) && error.code === "ENOENT") {
-      throw new Error(
-        `No local owner token was found for artifact ${artifactId} at ${apiOrigin}. Only the OpenCode instance that created an artifact, or a restored Panes state file, can update it.`,
-      );
-    }
-    throw new Error(
-      `Could not read local Panes state for artifact ${artifactId}. ${errorMessage(error)}`,
-    );
-  }
-
-  let value: unknown;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    throw new Error(
-      `Local Panes state for artifact ${artifactId} is malformed. Restore or remove that state file, then create a new artifact.`,
-    );
-  }
-
-  if (!isStoredArtifactState(value, apiOrigin, artifactId)) {
-    throw new Error(
-      `Local Panes state for artifact ${artifactId} is invalid or belongs to another API origin.`,
-    );
-  }
-  return value;
-}
-
-function isStoredArtifactState(
-  value: unknown,
-  apiOrigin: string,
-  artifactId: string,
-): value is StoredArtifactState {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const state = value as Record<string, unknown>;
-  return (
-    Object.keys(state).length === 6 &&
-    state.apiOrigin === apiOrigin &&
-    state.artifactId === artifactId &&
-    ownerTokenSchema.safeParse(state.ownerToken).success &&
-    isWorkspaceViewerUrl(state.viewerUrl, apiOrigin, artifactId) &&
-    typeof state.title === "string" &&
-    state.title.length > 0 &&
-    artifactTypeSchema.safeParse(state.type).success
-  );
-}
-
-function isWorkspaceViewerUrl(
-  value: unknown,
-  apiOrigin: string,
-  artifactId: string,
-) {
-  try {
-    validateCreateViewerUrl(value, apiOrigin, artifactId);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function validateCreateViewerUrl(
-  value: unknown,
-  apiOrigin: string,
-  artifactId: string,
-) {
-  const url = parseViewerUrl(value, apiOrigin, artifactId);
-  const fragment = new URLSearchParams(url.hash.slice(1));
-  const entries = [...fragment.entries()];
-  if (
-    entries.length !== 1 ||
-    entries[0]?.[0] !== WORKSPACE_TOKEN_FRAGMENT_KEY ||
-    !workspaceTokenSchema.safeParse(entries[0]?.[1]).success
-  ) {
-    throw malformedSuccessResponse();
-  }
-  return url.href;
-}
-
-function validateUpdateViewerUrl(
-  value: unknown,
-  apiOrigin: string,
-  artifactId: string,
-  storedViewerUrl: string,
-) {
-  const storedUrl = validateCreateViewerUrl(
-    storedViewerUrl,
-    apiOrigin,
-    artifactId,
-  );
-  const url = parseViewerUrl(value, apiOrigin, artifactId);
-  if (url.hash && url.href !== storedUrl) {
-    throw malformedSuccessResponse();
-  }
-  return storedUrl;
-}
-
-function parseViewerUrl(value: unknown, apiOrigin: string, artifactId: string) {
-  if (typeof value !== "string") throw malformedSuccessResponse();
-
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw malformedSuccessResponse();
-  }
-  if (
-    url.origin !== apiOrigin ||
-    url.username ||
-    url.password ||
-    url.pathname !== `/artifacts/${encodeURIComponent(artifactId)}` ||
-    url.search
-  ) {
-    throw malformedSuccessResponse();
-  }
-  return url;
-}
-
 function malformedSuccessResponse() {
   return new Error("Panes API returned a malformed success response");
-}
-
-function artifactStateDirectory(apiOrigin: string) {
-  return join(stateRootDirectory(), "origins", sha256(apiOrigin), "artifacts");
-}
-
-function artifactStatePath(apiOrigin: string, artifactId: string) {
-  return join(artifactStateDirectory(apiOrigin), `${sha256(artifactId)}.json`);
 }
 
 function syncStatePath(

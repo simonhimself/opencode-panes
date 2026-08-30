@@ -12,7 +12,6 @@ import {
   type LegacyArtifactPresentation,
   type PublicPublicationResponse,
   type Revision,
-  type ShareResponse,
 } from "@opencode-panes/contracts";
 
 const SESSION_TOKEN_PREFIX = "opencode-panes:workspace-token:";
@@ -690,35 +689,6 @@ export async function fetchCreatorFile(
   return response;
 }
 
-export function publishRevision(
-  artifactId: string,
-  token: string,
-  revisionId: string,
-  fetcher: Fetcher = fetch,
-): Promise<ShareResponse | null> {
-  return requestJson<ShareResponse | null>(
-    `/api/artifacts/${encodeURIComponent(artifactId)}/publish`,
-    {
-      body: JSON.stringify({ revisionId }),
-      headers: privateHeaders(token, true),
-      method: "POST",
-    },
-    fetcher,
-  );
-}
-
-export function unpublishArtifact(
-  artifactId: string,
-  token: string,
-  fetcher: Fetcher = fetch,
-): Promise<null> {
-  return requestJson<null>(
-    `/api/artifacts/${encodeURIComponent(artifactId)}/unpublish`,
-    { headers: privateHeaders(token), method: "POST" },
-    fetcher,
-  );
-}
-
 export function safeDownloadFilename(
   title: string,
   type: ArtifactType,
@@ -759,10 +729,8 @@ export async function copyText(value: string): Promise<void> {
   await navigator.clipboard.writeText(value);
 }
 
-function privateHeaders(token: string, json = false): Headers {
-  const headers = new Headers({ Authorization: `Bearer ${token}` });
-  if (json) headers.set("Content-Type", "application/json");
-  return headers;
+function privateHeaders(token: string): Headers {
+  return new Headers({ Authorization: `Bearer ${token}` });
 }
 
 export function includeRevision(

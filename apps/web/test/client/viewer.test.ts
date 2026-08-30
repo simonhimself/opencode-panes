@@ -12,7 +12,6 @@ import {
   getStoredPublicUrl,
   parseViewerRoute,
   publicUrlStorageKey,
-  publishRevision,
   republishInventoryPublication,
   rotateInventoryCreator,
   safeDownloadFilename,
@@ -181,25 +180,6 @@ describe("viewer API requests", () => {
 
     await fetchPublicArtifact("public-token", fetcher);
     expect(headers.has("Authorization")).toBe(false);
-  });
-
-  it("publishes the explicitly selected revision with private authorization", async () => {
-    let request: RequestInit | undefined;
-    const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
-      request = init;
-      return new Response(null, { status: 204 });
-    };
-
-    await expect(
-      publishRevision(ARTIFACT.id, "workspace-token", "revision-1", fetcher),
-    ).resolves.toBeNull();
-    expect(request?.method).toBe("POST");
-    expect(new Headers(request?.headers).get("Authorization")).toBe(
-      "Bearer workspace-token",
-    );
-    expect(JSON.parse(String(request?.body))).toEqual({
-      revisionId: "revision-1",
-    });
   });
 
   it("sends inventory lifecycle mutations without private bearer credentials", async () => {

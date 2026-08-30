@@ -1,17 +1,8 @@
 import {
-  MAX_ARTIFACT_REVISIONS,
-  MAX_ARTIFACT_SOURCE_BYTES,
-  MAX_ARTIFACT_TOTAL_SOURCE_BYTES,
   WORKSPACE_TOKEN_FRAGMENT_KEY,
   artifactIdSchema,
   artifactResponseSchema,
-  createArtifactRequestSchema,
-  createArtifactResponseSchema,
-  createRevisionRequestSchema,
   ownerTokenSchema,
-  revisionIdSchema,
-  revisionResponseSchema,
-  shareResponseSchema,
   type ApiErrorCode,
   type Artifact,
   type ErrorIssue,
@@ -30,12 +21,9 @@ import {
   issueInventoryReconnectCode,
   rotateInventoryCreator,
 } from "./inventory";
-import { getLegacyArtifact, LEGACY_PRIVATE_TTL_MS } from "./legacy";
+import { getLegacyArtifact } from "./legacy";
 import { issueLegacyAdoptionCode, redeemLegacyAdoption } from "./adoption";
 
-// JSON can encode one UTF-8 source byte as a six-byte Unicode escape.
-export const MAX_JSON_BODY_BYTES = MAX_ARTIFACT_SOURCE_BYTES * 6 + 16 * 1024;
-const CREATE_KEY_HEADER = "X-Panes-Create-Key";
 const JSON_HEADERS = {
   "Cache-Control": "no-store",
   "Content-Type": "application/json; charset=utf-8",
@@ -62,11 +50,6 @@ interface RevisionRow {
   created_at: string;
 }
 
-interface ActiveShareRow {
-  token_hash: string;
-  revision_id: string;
-}
-
 interface PublicShareRow extends RevisionRow {
   title: string;
   type: Artifact["type"];
@@ -81,22 +64,6 @@ interface TimingSafeSubtleCrypto extends SubtleCrypto {
     right: ArrayBuffer | ArrayBufferView,
   ): boolean;
 }
-
-interface Parser<T> {
-  safeParse(value: unknown):
-    | { success: true; data: T }
-    | {
-        success: false;
-        error: {
-          issues: ReadonlyArray<{
-            path: readonly PropertyKey[];
-            message: string;
-          }>;
-        };
-      };
-}
-
-type ParsedBody<T> = { ok: true; data: T } | { ok: false; response: Response };
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -224,13 +191,8 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
   }
 
   if (pathname === "/api/artifacts") {
-    if (request.method !== "POST") return methodNotAllowed(["POST"]);
-    const admissionError = await requireCreateAdmission(
-      request,
-      env.PANES_CREATE_API_KEY,
-    );
-    if (admissionError) return admissionError;
-    return createArtifact(request, env.DB);
+    if (request.method === "POST") return legacyMutationResponse();
+    return methodNotAllowed(["POST"]);
   }
 
   const publicMatch = pathname.match(/^\/api\/public\/([^/]+)$/);
@@ -247,10 +209,9 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
     /^\/api\/artifacts\/([^/]+)\/revisions$/,
   );
   if (revisionsMatch) {
+    if (request.method === "POST") return legacyMutationResponse();
     const artifactId = parseArtifactId(revisionsMatch[1]);
     if (artifactId instanceof Response) return artifactId;
-    if (request.method === "POST")
-      return createRevision(request, env.DB, artifactId);
     if (request.method === "GET")
       return listRevisions(request, env.DB, artifactId);
     return methodNotAllowed(["GET", "POST"]);
@@ -258,20 +219,16 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
 
   const publishMatch = pathname.match(/^\/api\/artifacts\/([^/]+)\/publish$/);
   if (publishMatch) {
-    if (request.method !== "POST") return methodNotAllowed(["POST"]);
-    const artifactId = parseArtifactId(publishMatch[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return publishRevision(request, env.DB, artifactId);
+    if (request.method === "POST") return legacyMutationResponse();
+    return methodNotAllowed(["POST"]);
   }
 
   const unpublishMatch = pathname.match(
     /^\/api\/artifacts\/([^/]+)\/unpublish$/,
   );
   if (unpublishMatch) {
-    if (request.method !== "POST") return methodNotAllowed(["POST"]);
-    const artifactId = parseArtifactId(unpublishMatch[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return unpublishArtifact(request, env.DB, artifactId);
+    if (request.method === "POST") return legacyMutationResponse();
+    return methodNotAllowed(["POST"]);
   }
 
   const artifactMatch = pathname.match(/^\/api\/artifacts\/([^/]+)$/);
@@ -283,167 +240,6 @@ async function routeRequest(request: Request, env: Env): Promise<Response> {
   }
 
   return errorResponse(404, "NOT_FOUND", "Route not found");
-}
-
-async function createArtifact(
-  request: Request,
-  db: D1Database,
-): Promise<Response> {
-  const body = await parseJsonBody(request, createArtifactRequestSchema);
-  if (!body.ok) return body.response;
-
-  const artifactId = `artifact_${crypto.randomUUID()}`;
-  const revisionId = `revision_${crypto.randomUUID()}`;
-  const ownerToken = randomToken();
-  const workspaceToken = randomToken();
-  const [ownerTokenHash, workspaceTokenHash] = await Promise.all([
-    hashToken(ownerToken),
-    hashToken(workspaceToken),
-  ]);
-  const now = new Date().toISOString();
-
-  await db.batch([
-    db
-      .prepare(
-        `INSERT INTO artifacts
-          (id, owner_token_hash, workspace_token_hash, opencode_session_id, title, type, current_revision_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .bind(
-        artifactId,
-        ownerTokenHash,
-        workspaceTokenHash,
-        body.data.sessionId,
-        body.data.title,
-        body.data.type,
-        revisionId,
-        now,
-        now,
-      ),
-    db
-      .prepare(
-        `INSERT INTO revisions (id, artifact_id, version, source, created_at)
-         VALUES (?, ?, 1, ?, ?)`,
-      )
-      .bind(revisionId, artifactId, body.data.source, now),
-    db
-      .prepare(
-        `INSERT INTO legacy_artifacts
-          (artifact_id, migrated_at, private_expires_at)
-         VALUES (?, ?, ?)`,
-      )
-      .bind(
-        artifactId,
-        now,
-        new Date(Date.parse(now) + LEGACY_PRIVATE_TTL_MS).toISOString(),
-      ),
-  ]);
-
-  const artifact: Artifact = {
-    id: artifactId,
-    title: body.data.title,
-    type: body.data.type,
-    currentRevisionId: revisionId,
-    createdAt: now,
-    updatedAt: now,
-  };
-  const revision: Revision = {
-    id: revisionId,
-    artifactId,
-    version: 1,
-    source: body.data.source,
-    createdAt: now,
-  };
-
-  return jsonResponse(
-    createArtifactResponseSchema.parse({
-      artifact,
-      revision,
-      ownerToken,
-      viewerUrl: viewerUrl(request, artifactId, workspaceToken),
-    }),
-    201,
-  );
-}
-
-async function createRevision(
-  request: Request,
-  db: D1Database,
-  artifactId: string,
-): Promise<Response> {
-  const artifact = await authenticateOwner(request, db, artifactId);
-  if (artifact instanceof Response) return artifact;
-  const legacyWriteError = await rejectLegacyWrite(db, artifactId);
-  if (legacyWriteError) return legacyWriteError;
-
-  const body = await parseJsonBody(request, createRevisionRequestSchema);
-  if (!body.ok) return body.response;
-
-  const revisionId = `revision_${crypto.randomUUID()}`;
-  const now = new Date().toISOString();
-  const sourceBytes = utf8ByteLength(body.data.source);
-
-  const [insertResult] = await db.batch([
-    db
-      .prepare(
-        `INSERT INTO revisions (id, artifact_id, version, source, created_at)
-         SELECT ?, ?, COALESCE(MAX(version), 0) + 1, ?, ?
-         FROM revisions
-         WHERE artifact_id = ?
-         HAVING COUNT(*) < ?
-            AND COALESCE(SUM(length(CAST(source AS BLOB))), 0) + ? <= ?`,
-      )
-      .bind(
-        revisionId,
-        artifactId,
-        body.data.source,
-        now,
-        artifactId,
-        MAX_ARTIFACT_REVISIONS,
-        sourceBytes,
-        MAX_ARTIFACT_TOTAL_SOURCE_BYTES,
-      ),
-    db
-      .prepare(
-        `UPDATE artifacts
-         SET current_revision_id = ?, updated_at = ?
-         WHERE id = ?
-           AND EXISTS (
-             SELECT 1 FROM revisions WHERE id = ? AND artifact_id = ?
-           )`,
-      )
-      .bind(revisionId, now, artifactId, revisionId, artifactId),
-  ]);
-
-  if (!insertResult)
-    throw new Error("Revision batch returned no insert result");
-  if (insertResult.meta.changes === 0) {
-    return errorResponse(
-      409,
-      "CONFLICT",
-      "Artifact revision storage limit reached",
-    );
-  }
-
-  const row = await db
-    .prepare(
-      `SELECT id, artifact_id, version, source, created_at
-       FROM revisions
-       WHERE id = ? AND artifact_id = ?`,
-    )
-    .bind(revisionId, artifactId)
-    .first<RevisionRow>();
-
-  if (!row) throw new Error("Created revision was not found");
-
-  return jsonResponse(
-    revisionResponseSchema.parse({
-      artifactId,
-      revision: toRevision(row),
-      viewerUrl: viewerUrl(request, artifactId),
-    }),
-    201,
-  );
 }
 
 async function getArtifact(
@@ -502,133 +298,13 @@ async function listRevisions(
     .bind(artifactId)
     .all<RevisionRow>();
 
-  // The 2 MiB aggregate cap bounds this source-bearing response to about 12 MiB
+  // Legacy source-bearing responses remain bounded by the retained adoption cap.
   // even when every source byte needs JSON escaping, so a lazy source route is
   // unnecessary for the MVP and the existing client contract remains intact.
   return jsonResponse({
     artifactId,
     revisions: result.results.map(toRevision),
   });
-}
-
-async function publishRevision(
-  request: Request,
-  db: D1Database,
-  artifactId: string,
-): Promise<Response> {
-  const artifact = await authenticateArtifact(request, db, artifactId, false);
-  if (artifact instanceof Response) return artifact;
-  const legacyWriteError = await rejectLegacyWrite(db, artifactId);
-  if (legacyWriteError) return legacyWriteError;
-
-  const body = await parsePublishBody(request);
-  if (!body.ok) return body.response;
-
-  const revision = await db
-    .prepare(
-      `SELECT id, artifact_id, version, source, created_at
-       FROM revisions
-       WHERE id = ? AND artifact_id = ?`,
-    )
-    .bind(body.data.revisionId, artifactId)
-    .first<RevisionRow>();
-
-  if (!revision) {
-    return errorResponse(404, "NOT_FOUND", "Revision not found");
-  }
-
-  const activeShare = await db
-    .prepare(
-      `SELECT token_hash, revision_id
-       FROM shares
-       WHERE artifact_id = ? AND revoked_at IS NULL
-       LIMIT 1`,
-    )
-    .bind(artifactId)
-    .first<ActiveShareRow>();
-
-  // Only hashes are persisted, so an unchanged active share has no token to return again.
-  if (activeShare?.revision_id === revision.id)
-    return new Response(null, { status: 204 });
-
-  const shareToken = randomToken();
-  const tokenHash = await hashToken(shareToken);
-  const now = new Date().toISOString();
-
-  const [, insertResult] = await db.batch([
-    db
-      .prepare(
-        `UPDATE shares
-         SET revoked_at = ?
-         WHERE token_hash = ? AND artifact_id = ? AND revoked_at IS NULL`,
-      )
-      .bind(now, activeShare?.token_hash ?? "", artifactId),
-    db
-      .prepare(
-        `INSERT INTO shares (token_hash, artifact_id, revision_id, created_at, revoked_at)
-         SELECT ?, ?, ?, ?, NULL
-         WHERE NOT EXISTS (
-           SELECT 1 FROM shares WHERE artifact_id = ? AND revoked_at IS NULL
-         )`,
-      )
-      .bind(tokenHash, artifactId, revision.id, now, artifactId),
-  ]);
-
-  if (!insertResult) throw new Error("Publish batch returned no insert result");
-  if (insertResult.meta.changes === 0) {
-    const winner = await db
-      .prepare(
-        `SELECT token_hash, revision_id
-         FROM shares
-         WHERE artifact_id = ? AND revoked_at IS NULL
-         LIMIT 1`,
-      )
-      .bind(artifactId)
-      .first<ActiveShareRow>();
-
-    if (winner?.revision_id === revision.id) {
-      return new Response(null, { status: 204 });
-    }
-
-    return errorResponse(
-      409,
-      "CONFLICT",
-      "Artifact publication changed; retry the request",
-    );
-  }
-
-  return jsonResponse(
-    shareResponseSchema.parse({
-      artifactId,
-      revisionId: revision.id,
-      version: revision.version,
-      publicUrl: publicUrl(request, shareToken),
-      createdAt: now,
-    }),
-    201,
-  );
-}
-
-async function unpublishArtifact(
-  request: Request,
-  db: D1Database,
-  artifactId: string,
-): Promise<Response> {
-  const artifact = await authenticateArtifact(request, db, artifactId, false);
-  if (artifact instanceof Response) return artifact;
-  const legacyWriteError = await rejectLegacyWrite(db, artifactId);
-  if (legacyWriteError) return legacyWriteError;
-
-  await db
-    .prepare(
-      `UPDATE shares
-       SET revoked_at = ?
-       WHERE artifact_id = ? AND revoked_at IS NULL`,
-    )
-    .bind(new Date().toISOString(), artifactId)
-    .run();
-
-  return new Response(null, { status: 204 });
 }
 
 async function getPublicShare(
@@ -677,14 +353,6 @@ async function getPublicShare(
     publishedAt: row.published_at,
     ...(row.public_expires_at !== null ? { legacy: { readOnly: true } } : {}),
   });
-}
-
-async function authenticateOwner(
-  request: Request,
-  db: D1Database,
-  artifactId: string,
-): Promise<ArtifactRow | Response> {
-  return authenticateArtifact(request, db, artifactId, true);
 }
 
 async function authenticateArtifact(
@@ -751,148 +419,6 @@ async function authenticateArtifact(
   return artifact;
 }
 
-async function rejectLegacyWrite(
-  db: D1Database,
-  artifactId: string,
-): Promise<Response | undefined> {
-  const legacyArtifact = await getLegacyArtifact(db, artifactId);
-  if (!legacyArtifact) return undefined;
-  if (legacyArtifact.private_expires_at <= new Date().toISOString()) {
-    return legacyGoneResponse("This legacy artifact has expired");
-  }
-  return errorResponse(409, "CONFLICT", "Legacy artifacts are read-only");
-}
-
-async function parseJsonBody<T>(
-  request: Request,
-  parser: Parser<T>,
-): Promise<ParsedBody<T>> {
-  const parsedJson = await readJson(request);
-  if (!parsedJson.ok) return parsedJson;
-
-  const result = parser.safeParse(parsedJson.data);
-  if (result.success) return { ok: true, data: result.data };
-
-  const issues = result.error.issues.map(toErrorIssue);
-  const sourceTooLarge = result.error.issues.some(
-    (issue) =>
-      issue.path[0] === "source" && issue.message.includes("UTF-8 bytes"),
-  );
-  return {
-    ok: false,
-    response: errorResponse(
-      sourceTooLarge ? 413 : 400,
-      sourceTooLarge ? "SOURCE_TOO_LARGE" : "VALIDATION_ERROR",
-      sourceTooLarge
-        ? "Artifact source is too large"
-        : "Request validation failed",
-      issues,
-    ),
-  };
-}
-
-async function parsePublishBody(
-  request: Request,
-): Promise<ParsedBody<{ revisionId: string }>> {
-  const parsedJson = await readJson(request);
-  if (!parsedJson.ok) return parsedJson;
-
-  if (
-    typeof parsedJson.data !== "object" ||
-    parsedJson.data === null ||
-    Array.isArray(parsedJson.data)
-  ) {
-    return validationResponse([{ path: [], message: "Expected an object" }]);
-  }
-
-  const record = parsedJson.data as Record<string, unknown>;
-  const keys = Object.keys(record);
-  if (keys.length !== 1 || keys[0] !== "revisionId") {
-    return validationResponse([
-      { path: [], message: "Expected only the revisionId property" },
-    ]);
-  }
-
-  const revisionId = revisionIdSchema.safeParse(record.revisionId);
-  if (!revisionId.success) {
-    return validationResponse(revisionId.error.issues.map(toErrorIssue));
-  }
-
-  return { ok: true, data: { revisionId: revisionId.data } };
-}
-
-async function readJson(request: Request): Promise<ParsedBody<unknown>> {
-  const contentType = request.headers.get("Content-Type")?.toLowerCase() ?? "";
-  if (!contentType.startsWith("application/json")) {
-    return validationResponse([
-      { path: [], message: "Content-Type must be application/json" },
-    ]);
-  }
-
-  const contentLength = Number(request.headers.get("Content-Length"));
-  if (Number.isFinite(contentLength) && contentLength > MAX_JSON_BODY_BYTES) {
-    return sourceTooLargeResponse();
-  }
-
-  const bytes = await readBoundedBody(request, MAX_JSON_BODY_BYTES);
-  if (!bytes) return sourceTooLargeResponse();
-
-  try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    return { ok: true, data: JSON.parse(text) as unknown };
-  } catch {
-    return validationResponse([
-      { path: [], message: "Body must be valid UTF-8 JSON" },
-    ]);
-  }
-}
-
-async function readBoundedBody(
-  request: Request,
-  maxBytes: number,
-): Promise<Uint8Array | undefined> {
-  if (!request.body) return new Uint8Array();
-
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let totalBytes = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    totalBytes += value.byteLength;
-    if (totalBytes > maxBytes) {
-      await reader.cancel("Request body exceeds the JSON limit");
-      return undefined;
-    }
-    chunks.push(value);
-  }
-
-  const body = new Uint8Array(totalBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return body;
-}
-
-async function requireCreateAdmission(
-  request: Request,
-  expectedKey: string | undefined,
-): Promise<Response | undefined> {
-  if (expectedKey === undefined) return undefined;
-
-  const providedKey = request.headers.get(CREATE_KEY_HEADER) ?? "";
-  if (await timingSafeSecretEqual(providedKey, expectedKey)) return undefined;
-
-  return errorResponse(
-    401,
-    "UNAUTHORIZED",
-    "Artifact creation requires a valid admission key",
-  );
-}
-
 function parseArtifactId(segment: string | undefined): string | Response {
   const value = decodePathSegment(segment);
   const parsed = artifactIdSchema.safeParse(value);
@@ -911,12 +437,6 @@ function decodePathSegment(segment: string | undefined): string | undefined {
   }
 }
 
-function randomToken(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  return bytesToHex(bytes);
-}
-
 async function hashToken(token: string): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
@@ -933,25 +453,6 @@ function constantTimeHashEqual(left: string, right: string): boolean {
     leftBytes,
     rightBytes,
   );
-}
-
-async function timingSafeSecretEqual(
-  left: string,
-  right: string,
-): Promise<boolean> {
-  const encoder = new TextEncoder();
-  const [leftHash, rightHash] = await Promise.all([
-    crypto.subtle.digest("SHA-256", encoder.encode(left)),
-    crypto.subtle.digest("SHA-256", encoder.encode(right)),
-  ]);
-  return (crypto.subtle as TimingSafeSubtleCrypto).timingSafeEqual(
-    leftHash,
-    rightHash,
-  );
-}
-
-function utf8ByteLength(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -1005,13 +506,6 @@ function viewerUrl(
   return url.toString();
 }
 
-function publicUrl(request: Request, shareToken: string): string {
-  return new URL(
-    `/shared/${encodeURIComponent(shareToken)}`,
-    request.url,
-  ).toString();
-}
-
 function rejectCrossOriginRequest(request: Request): Response | undefined {
   const origin = request.headers.get("Origin");
   if (!origin || origin === new URL(request.url).origin) return undefined;
@@ -1029,7 +523,7 @@ function preflightResponse(request: Request): Response {
   return new Response(null, {
     status: 204,
     headers: {
-      "Access-Control-Allow-Headers": `Authorization, Content-Type, ${CREATE_KEY_HEADER}`,
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
       "Access-Control-Allow-Methods": "DELETE, GET, POST, OPTIONS",
       "Access-Control-Allow-Origin": origin,
       "Access-Control-Max-Age": "600",
@@ -1154,41 +648,6 @@ function methodNotAllowed(methods: string[]): Response {
   );
 }
 
-function sourceTooLargeResponse(): ParsedBody<never> {
-  return {
-    ok: false,
-    response: errorResponse(
-      413,
-      "SOURCE_TOO_LARGE",
-      "Artifact source is too large",
-    ),
-  };
-}
-
-function validationResponse(issues: ErrorIssue[]): ParsedBody<never> {
-  return {
-    ok: false,
-    response: errorResponse(
-      400,
-      "VALIDATION_ERROR",
-      "Request validation failed",
-      issues,
-    ),
-  };
-}
-
-function toErrorIssue(issue: {
-  path: readonly PropertyKey[];
-  message: string;
-}): ErrorIssue {
-  return {
-    path: issue.path.map((part) =>
-      typeof part === "number" ? part : String(part),
-    ),
-    message: issue.message,
-  };
-}
-
 function errorResponse(
   status: number,
   code: ApiErrorCode,
@@ -1198,6 +657,23 @@ function errorResponse(
 ): Response {
   const error = issues ? { code, message, issues } : { code, message };
   return jsonResponse({ error }, status, extraHeaders);
+}
+
+const LEGACY_MUTATION_MESSAGE =
+  "Legacy mutation is no longer supported. Create or adopt a project-local Artifact and Sync it.";
+
+function legacyMutationResponse(): Response {
+  return errorResponse(
+    410,
+    "LOCAL_FIRST_REQUIRED",
+    LEGACY_MUTATION_MESSAGE,
+    undefined,
+    {
+      "Cache-Control": "no-store",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    },
+  );
 }
 
 function legacyGoneResponse(message: string): Response {

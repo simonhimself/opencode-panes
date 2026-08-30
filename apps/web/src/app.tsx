@@ -19,7 +19,6 @@ import { CreatorWorkspace } from "./creator-workspace";
 import { PublicWorkspace } from "./public-workspace";
 import {
   ApiError,
-  clearStoredPublicUrl,
   copyText,
   createSerializedPoller,
   downloadSource,
@@ -31,7 +30,6 @@ import {
   fetchPublicArtifact,
   fetchPublicationStatus,
   followCurrentRevision,
-  getStoredPublicUrl,
   includeRevision,
   issueInventoryReconnectCode,
   issueLegacyAdoptionCode,
@@ -40,10 +38,7 @@ import {
   extendInventoryPublication,
   republishInventoryPublication,
   rotateInventoryCreator,
-  publishRevision,
   selectRevision,
-  storePublicUrl,
-  unpublishArtifact,
   unpublishInventoryPublication,
   type RevisionSelection,
   type ViewerRoute,
@@ -69,12 +64,6 @@ interface WorkspaceProps {
   revisions: Revision[];
   selection: RevisionSelection;
   setSelection: (selection: RevisionSelection) => void;
-}
-
-interface Notice {
-  kind: "error" | "info" | "success";
-  text: string;
-  url?: string;
 }
 
 export function App({ route, workspaceAccess }: AppProps) {
@@ -105,9 +94,9 @@ export function App({ route, workspaceAccess }: AppProps) {
   }
   return (
     <EntryState eyebrow="OpenCode Panes" title="No artifact is open.">
-      Open a viewer URL returned by the OpenCode artifact tool. Creator links
-      use
-      <code>/artifacts/:id</code>; legacy public links use{" "}
+      Prepare or import a project-local Artifact, finalize a Revision, and use
+      the explicit Sync result to open its Creator or public route. Legacy
+      migration links may still use <code>/artifacts/:id</code> or{" "}
       <code>/shared/:token</code>. New publications use{" "}
       <code>/published/:token</code>.
     </EntryState>
@@ -831,7 +820,6 @@ function PrivateArtifactView({
   const [legacy, setLegacy] = useState<LegacyArtifactPresentation>();
   const [error, setError] = useState<unknown>();
   const [refreshError, setRefreshError] = useState<string>();
-  const [notice, setNotice] = useState<Notice>();
   const currentRevisionVersion = useRef(0);
   const token = access.status === "ready" ? access.token : undefined;
 
@@ -939,7 +927,7 @@ function PrivateArtifactView({
         title="This creator workspace cannot be authorized."
       >
         {access.status === "invalid"
-          ? "The workspace token in this link is malformed. Return to OpenCode and request the artifact viewer URL again."
+          ? "The legacy migration workspace token in this link is malformed. Return to Inventory or OpenCode and request a current Creator route again."
           : "Open the complete viewer URL from OpenCode. It includes a one-time #workspaceToken fragment that this tab stores only for this artifact."}
       </EntryState>
     );
@@ -980,66 +968,12 @@ function PrivateArtifactView({
   if (!artifact || !selection)
     return <LoadingState label="Loading creator workspace" />;
 
-  const handlePublish = async (revision: Revision) => {
-    try {
-      const published = await publishRevision(
-        artifact.id,
-        access.token,
-        revision.id,
-      );
-      if (!published) {
-        const storedUrl = getStoredPublicUrl(artifact.id, revision.id);
-        if (storedUrl) {
-          setNotice({
-            kind: "info",
-            text: `Version ${revision.version} is already published. Its public URL was recovered from this tab's session storage.`,
-            url: storedUrl,
-          });
-          return;
-        }
-        setNotice({
-          kind: "info",
-          text: `Version ${revision.version} is already published. The server stores only a hash of the existing share token, so it cannot return or reconstruct that public URL. Publish another version to create a new link, or use the link you previously saved.`,
-        });
-        return;
-      }
-      storePublicUrl(
-        published.artifactId,
-        published.revisionId,
-        published.publicUrl,
-      );
-      setNotice({
-        kind: "success",
-        text: `Version ${published.version} is public.`,
-        url: published.publicUrl,
-      });
-    } catch (caught) {
-      setNotice({ kind: "error", text: apiErrorMessage(caught) });
-    }
-  };
-
-  const handleUnpublish = async () => {
-    try {
-      await unpublishArtifact(artifact.id, access.token);
-      clearStoredPublicUrl(artifact.id);
-      setNotice({
-        kind: "success",
-        text: "Public access is now revoked. Unpublish is safe to repeat if no share was active.",
-      });
-    } catch (caught) {
-      setNotice({ kind: "error", text: apiErrorMessage(caught) });
-    }
-  };
-
   return (
     <>
       <ArtifactWorkspace
         artifact={artifact}
         isPublic={false}
         {...(legacy ? { legacy } : {})}
-        {...(legacy
-          ? {}
-          : { onPublish: handlePublish, onUnpublish: handleUnpublish })}
         revisions={revisions}
         selection={selection}
         setSelection={setSelection}
@@ -1049,7 +983,6 @@ function PrivateArtifactView({
           Live update paused: {refreshError}
         </div>
       ) : null}
-      {notice ? <ActionNotice notice={notice} /> : null}
     </>
   );
 }
@@ -1494,27 +1427,6 @@ function EntryState({
         <p>{children}</p>
       </section>
     </main>
-  );
-}
-
-function ActionNotice({ notice }: { notice: Notice }) {
-  const handleCopy = async () => {
-    if (notice.url) await copyText(notice.url);
-  };
-  return (
-    <aside className={`action-notice is-${notice.kind}`} role="status">
-      <p>{notice.text}</p>
-      {notice.url ? (
-        <div>
-          <a href={notice.url} rel="noreferrer" target="_blank">
-            {notice.url}
-          </a>
-          <button onClick={() => void handleCopy()} type="button">
-            Copy public URL
-          </button>
-        </div>
-      ) : null}
-    </aside>
   );
 }
 

@@ -175,11 +175,13 @@ describe("legacy migration classification", () => {
         body: "not json",
       },
     );
-    expect(malformedWrite.status).toBe(409);
+    expect(malformedWrite.status).toBe(410);
     expect(
       ((await malformedWrite.json()) as { error: { message: string } }).error
         .message,
-    ).toBe("Legacy artifacts are read-only");
+    ).toBe(
+      "Legacy mutation is no longer supported. Create or adopt a project-local Artifact and Sync it.",
+    );
 
     await env.DB.prepare(
       "UPDATE legacy_artifacts SET private_expires_at = ? WHERE artifact_id = ?",
