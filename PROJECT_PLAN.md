@@ -1,441 +1,260 @@
 # OpenCode Panes Project Plan
 
-## Product Summary
+## Accepted direction
 
-OpenCode Panes brings a Claude Artifacts-style workflow to OpenCode.
+This document supersedes the earlier remote-first, source-string plan. The old
+`POST /api/artifacts` and source-string revision or Publication workflow is
+historical compatibility only. Its mutation routes return
+`410 LOCAL_FIRST_REQUIRED`. New implementation and usage must follow the
+local-first plan below.
 
-The creator asks OpenCode to make an artifact. An OpenCode plugin sends the generated source to a Cloudflare-hosted renderer and returns a browser URL. The creator can inspect and interact with the result, then continue prompting OpenCode to create new versions of the same artifact.
+OpenCode Panes is a browser-side artifact workspace with immutable local
+Revisions and an optional private cloud copy. It is not a chat application,
+deployment platform, project builder, collaboration suite, backend host, or
+general-purpose server runtime.
 
-The product is an artifact renderer and lightweight revision store. It is not a chat application, deployment platform, project builder, or collaboration suite.
+## Product promise
 
-## Core Promise
+> Ask OpenCode to make an artifact. Review it locally, revise it locally, Sync
+> deliberately, and Publish only after a human chooses what to share.
 
-> Ask OpenCode to make an artifact. It opens as a working visual page. Keep prompting, and it updates.
+The project filesystem is canonical. Cloudflare is an optional synchronized
+copy and sharing surface.
 
-## Primary Workflow
+## Canonical local workflow
 
-1. The creator asks OpenCode to create an artifact, prototype, diagram, document, or visual explanation.
-2. OpenCode calls the `artifact` tool registered by the Panes plugin.
-3. The plugin sends the artifact source to the Panes API on Cloudflare.
-4. The tool returns the private artifact URL and artifact ID.
-5. The creator opens the URL in a browser tab or browser panel.
-6. The page displays the rendered preview and underlying source.
-7. The creator asks OpenCode to revise the artifact.
-8. OpenCode calls the tool again with the existing artifact ID.
-9. Panes stores an immutable revision and refreshes the creator view.
-10. The creator can copy, download, or publish a selected revision.
+1. `artifact_prepare` creates a project-local Artifact and writable Draft with
+   no network access.
+2. OpenCode's normal filesystem tools create or import complete Draft files.
+3. `artifact_finalize` validates one Preview entry, runs a local preview, and
+   promotes the Draft to the next immutable contiguous `vN` Revision.
+4. The creator reviews the Revision-specific loopback Local preview and source.
+5. A new request prepares the next Draft from the latest Revision. Existing
+   Drafts require an explicit resume or discard choice.
+6. `artifact_sync` is called explicitly when a private cloud copy or link is
+   needed. It uploads every unsynced finalized Revision in order.
+7. Sync returns the Cloud inventory URL and a Creator URL when one is available,
+   but does not Publish. Owner recovery requires an explicit later Creator-link
+   rotation before a new Creator URL is available.
+8. For a publish request, Sync completes first and may open Creator access. The
+   human selects exactly one synced Revision and a 1-, 7-, or 30-day duration in
+   Creator. The Creator viewer submits the Publication.
 
-## MVP Scope
+The canonical layout is:
 
-### Artifact Types
-
-- [x] Single-file HTML
-- [x] Single React component
-- [x] SVG
-- [x] Mermaid
-- [x] Markdown
-- [x] Source code
-
-### Creator Experience
-
-- [x] Private artifact URL
-- [x] Rendered preview
-- [x] Preview and Code toggle
-- [x] Artifact title and type
-- [x] Version selector
-- [x] Automatic refresh while OpenCode creates a new revision
-- [x] Copy source
-- [x] Download source
-- [x] Publish a selected revision
-- [x] Read-only public artifact page
-- [x] Mobile-friendly public viewer
-- [x] Runtime error display
-- [x] Copy error details for use in an OpenCode follow-up prompt
-- [x] Stop or reload a misbehaving preview
-
-### OpenCode Integration
-
-- [x] Install the OpenCode server plugin as a private local plugin file
-- [x] Register one `artifact` custom tool
-- [x] Associate artifacts with the current OpenCode session ID
-- [x] Return artifact ID, revision, and browser URL in the tool result
-- [x] Request permission before uploading source for the first time
-- [x] Provide an optional `/artifact` command
-- [x] Provide an optional browser auto-open setting
-- [x] Document project and global installation
-- [x] Bundle and install a global plugin file with no repository dependency
-
-## OpenCode Plugin Contract
-
-The plugin registers one tool:
-
-```ts
-artifact({
-  artifactId?: string,
-  title: string,
-  type: "html" | "react" | "svg" | "mermaid" | "markdown" | "code",
-  source: string,
-})
+```text
+<git-worktree>/artifacts/<slug>/
+  artifact.json
+  .panesignore       # optional
+  draft/
+  draft.json
+  v1/
+  v2/
 ```
 
-Behavior:
+Without Git, the root is `<session-directory>/artifacts/`. A normalized
+`remote.origin.url` supplies project identity when available. Otherwise
+`artifacts/.panes-project.json` supplies a generated identity. Panes never
+merges slug collisions and never uses the directory name as cloud identity.
 
-- Omitting `artifactId` creates a new artifact.
-- Providing `artifactId` creates a new immutable revision.
-- The OpenCode `sessionID` is recorded automatically from tool context.
-- The tool result contains the artifact ID, revision number, and private viewer URL.
-- The source is not repeated in the tool result.
+`artifact.json` is the local non-secret Revision ledger. It includes all local
+files, including files excluded from Sync, and contains no credentials, bearer
+tokens, reconnect codes, or admission secrets. Panes does not stage, commit,
+branch, revert, or rewrite Git state.
 
-Initial tool guidance:
+## Draft, Revision, and import contract
 
-> Use this tool when the user requests an artifact, prototype, interactive design, diagram, visual explanation, substantial document, or standalone code preview. Prefer an artifact when the result is easier to understand visually than as terminal text.
+- Drafts are temporary and writable. Preparing a next Draft copies the latest
+  finalized Revision. Drafts are never uploaded.
+- Finalized Revisions are immutable by workflow, contiguous, and stored as
+  `v1`, `v2`, and so on. Hash, size, path, or manifest changes block preview
+  and Sync. A Git restore or explicit new Draft can recover the workflow.
+- Finalization uses a recoverable journal and promotion sequence. It returns a
+  Local preview URL only after the Revision is promoted.
+- `artifact_import` stages a file or directory, preserves exact bytes, nested
+  files, empty directories, and portable modes, and rejects unsafe paths and
+  symlinks. It never deletes a source during ordinary import.
+- A source-path import returns a five-minute verification receipt bound to the
+  source snapshot, source path, import operation, and destination Artifact. The
+  receipt is valid for five minutes. Only a separate Import call with explicit
+  confirmation can delete it. Panes
+  re-hashes immediately before deletion and leaves the source untouched when
+  the receipt is expired or the source changed.
 
-## User Interface
+## Preview adapters and runtime policy
 
-The browser viewer is a compact artifact workspace, not a separate chat application.
+Each Revision declares one normalized relative Preview entry and adapter:
 
-### Creator View
-
-- Header with title, version, copy, download, and publish actions
-- Preview and Code tabs
-- Full-height artifact canvas
-- Build or runtime error state
-- New-revision polling while the page is open
-
-### Public View
-
-- Read-only selected revision
-- Preview and Code tabs
-- Copy source and copy link actions
-- User-generated content notice
-- Responsive full-screen canvas
-
-## Rendering Model
-
-All artifact rendering happens in the browser.
-
-| Artifact type | Initial renderer |
+| Adapter | Supported entry |
 | --- | --- |
-| HTML | Sandboxed `srcdoc` iframe |
-| React | `esbuild-wasm` in a Web Worker, executed in a sandboxed iframe |
-| SVG | Sanitized SVG rendered in an isolated iframe |
-| Mermaid | Mermaid with strict security mode |
-| Markdown | `react-markdown` with raw HTML disabled |
-| Code | Syntax-highlighted source view |
+| `browser` | HTML, SVG, or browser-built output served directly |
+| `renderer` | React, Markdown, Mermaid, or code source wrapped at request time |
 
-React version one is intentionally constrained:
+Stored source bytes are never transformed for the renderer wrapper. Framework
+source is allowed, but an unsupported framework must be built locally into a
+browser entry before Finalize. Panes does not run a framework server, backend,
+database, container, or cloud build.
 
-- One JSX or TSX component
-- Fixed React and ReactDOM runtime
-- Fixed allowlist of supported libraries
-- No arbitrary npm installation
-- No server-side code
-- No arbitrary network access
+Local preview and cloud delivery share sandbox, CSP, MIME, routing, and network
+policy. The local server binds only to IPv4 loopback and returns temporary
+process-local URLs. Preview path traversal, aliases, escaping symlinks, and
+changed finalized files are rejected.
 
-Candidate built-in libraries:
+External access is denied by default. A Draft may request exact normalized
+`http` or `https` origins. Finalize first validates the preview and returns an
+approval-required result when origins need approval. A second call must carry
+the bound nonce and the unchanged exact origin set. Approved origins are
+immutable per Revision and become derived CSP directives. Redirects to
+unapproved origins remain blocked. `ws:`, `wss:`, and all other schemes are
+unsupported; WebSockets are not available.
 
-- React and ReactDOM
-- Lucide icons
-- Recharts
-- D3
-- Framer Motion
-- A small utility CSS bundle
+## Synchronization and storage
 
-The final allowlist should stay small until real artifacts demonstrate a need for more.
+Sync is explicit and is the only new cloud creation path. Create, import,
+Finalize, Local preview, and revision do not contact Cloudflare. First Sync
+uses a stable idempotency key, creates the cloud identity, stores the Owner
+credential in protected plugin state, records only the non-secret cloud mapping
+in `artifact.json`, and then uploads unsynced Revisions in local version order.
+Interrupted Sync uses local checkpoints and server leases to resume without
+renumbering or duplicating a cloud Artifact. A multi-Revision Sync may commit
+earlier Revisions before a later one fails.
 
-## Cloudflare Architecture
+R2 stores exact selected file bytes and non-secret cloud manifests. D1 stores
+relational metadata, hashes, lifecycle state, and inventory data. New Revisions
+do not store source-text bodies in D1. Temporary uncommitted upload objects are
+eligible for scheduled cleanup after a 24-hour grace period; committed objects
+are protected from that cleanup.
 
-The MVP uses one Workers project:
+The local manifest can contain more files than the cloud copy. Before upload,
+Panes applies an optional Artifact-root `.panesignore` using ordered
+Gitignore-style rules and negation. Mandatory exclusions cannot be re-included:
+
+- `.panesignore`, `artifact.json`, `draft/`, and `draft.json`;
+- Git internals, dependency directories, and local build caches;
+- `.env` files and common `.pem`, `.key`, and `.p12` files.
+
+Panes derives a separate filtered cloud manifest containing only synchronized
+Revisions, Preview entries, approved origins, and exact selected files. Ignored
+filenames, paths, hashes, and sizes never appear in it. The cloud manifest
+cannot be ignored, and neither it nor the canonical local manifest is uploaded
+as Revision content. Public and Creator delivery is mediated by the Worker
+from private R2. The R2 bucket is never public.
+
+Initial remote limits are 25 MiB per file and 100 MiB per Revision, measured in
+raw bytes after ignore evaluation. They do not constrain local Drafts or local
+Revision history. Legacy compatibility retains a separate 1 MiB UTF-8 source
+limit.
+
+## Credentials, lifecycle, and access
+
+Panes keeps capabilities separate:
+
+- The Owner credential authorizes Sync and Creator-link rotation for one cloud
+  Artifact. It persists in protected local plugin state until replaced or
+  locally removed. Cloud deletion invalidates it server-side but cannot remove
+  the protected local state file. It is never in a URL, manifest, log, or tool
+  result.
+- A Creator link is one active private bearer capability with a fixed 30-day
+  expiry. It reads all synced Revisions and manages Publication, but cannot
+  delete cloud data or access inventory. Reusing it does not extend it;
+  rotation revokes it and starts a new 30-day period.
+- A Publication grants public access to exactly one synced Revision for 1, 7,
+  or 30 days. Seven days is the default, permanent Publication is unavailable,
+  and there is at most one active Publication per Artifact. Expired and revoked
+  Publication records remain server-side. Creator exposes the full history;
+  inventory reports the current or latest state. Private synced files remain
+  until explicit cloud deletion.
+- A Public link is the bearer URL for that Publication. It cannot expose later
+  or other private Revisions. Active Public tokens use a one-way lookup hash
+  plus recoverable encrypted ciphertext under a versioned Worker-managed key.
+  Only the Access-protected inventory reconstructs an active Public URL. Public
+  token plaintext appears only in that authorized active-link result;
+  encryption keys never leave Worker secret storage. Neither enters manifests,
+  logs, or analytics. Revocation clears recoverable ciphertext immediately;
+  expiry clears it when an inventory, Creator, or Public request observes the
+  expired record.
+- Cloud inventory is an Access-protected administrative surface for synced
+  Artifacts. It groups by project and shows revision count, storage size, last
+  Sync, Creator expiry, Publication status and expiry, and Legacy state. It has
+  no knowledge of local-only Artifacts. Its Access session policy is separate
+  from capability expiry; synced cloud data remains until explicit deletion.
+
+Cloud deletion requires exact human confirmation in inventory. It revokes all
+active Creator and Public capabilities, removes D1 metadata and private R2
+objects in resumable batches when no longer referenced, and never modifies
+local project files.
+
+Owner recovery starts in Access-protected inventory. It issues a hashed,
+single-use reconnect code valid for 10 minutes; issuing a newer code revokes an
+older unused code. `artifact_reconnect` validates the local canonical manifest
+and synchronized Revision metadata before redeeming the code. Recovery replaces
+only the Owner credential, leaves Creator access and Publication unchanged, and
+writes the replacement to protected local state.
+
+The optional `PANES_CREATE_API_KEY` authorizes only first-Sync cloud-Artifact
+creation. It is not a generic artifact credential and is not stored in local
+Artifact state.
+
+## Legacy migration
+
+Existing remote-first source-string Artifacts are classified as Legacy. They
+remain readable but read-only during a bounded migration window and appear in
+a separate inventory grouping. One stable migration timestamp gives Legacy
+private access 30 days and Legacy public links 7 days. Rerunning migration
+never extends those deadlines.
+
+Authenticated inventory export issues an adoption code for the current Legacy
+Revision. `artifact_adopt_legacy` copies unchanged source bytes into a new
+project-local finalized `v1` with the matching Preview adapter. The code is
+short-lived, bound to one local destination, and retry-safe only for that same
+binding. Adoption stores no Owner credential. The original Legacy Artifact and
+history remain separate and read-only until explicit inventory deletion.
+
+The first later Sync creates a new cloud identity and records Legacy provenance.
+The old source-string create, revise, and Publication mutations are not a new
+workflow and return `410 LOCAL_FIRST_REQUIRED`.
+
+## Plugin contract
+
+The installed plugin registers these local-first and compatibility tools:
 
 ```text
-OpenCode plugin
-      |
-      v
-Cloudflare Worker API
-      |
-      +-- D1 artifact metadata and source revisions
-      +-- Workers Static Assets artifact viewer
+artifact_prepare
+artifact_import
+artifact_finalize
+artifact_sync
+artifact_publish
+artifact_adopt_legacy
+artifact_reconnect
+artifact_discover
+artifact_reopen
 ```
 
-### Worker API
+`artifact_sync.openCreatorAfterSuccess` defaults to false. Setting it true
+requests the separate browser-open permission only after successful Sync and
+still returns an available URL if opening fails. After Owner recovery, explicit
+Creator-link rotation is required before a URL is available.
+`artifact_publish` never selects a Revision or duration and never submits a
+Publication. The installed plugin is sufficient; no Panes skill, slash command,
+package publication, backend hosting, or automatic Git action is required.
 
-Planned routes:
+## Scope status
 
-```text
-POST /api/artifacts
-POST /api/artifacts/:id/revisions
-GET  /api/artifacts/:id
-GET  /api/artifacts/:id/revisions
-POST /api/artifacts/:id/publish
-POST /api/artifacts/:id/unpublish
-GET  /api/public/:shareToken
-```
+- [x] Project-local Artifact, Draft, immutable Revision, discovery, reopen, and
+  recoverable finalization.
+- [x] File and directory import with raw-byte preservation and verification
+  receipts.
+- [x] Browser and renderer Preview adapters with approved-origin security.
+- [x] Explicit private Sync, filtered cloud manifests, private R2, limits,
+  resumable upload, and Owner state recovery.
+- [x] Creator links, human-controlled Publication, selected-Revision public
+  isolation, encrypted recoverable active Public tokens, and inventory actions.
+- [x] Legacy read-only migration, bounded expiry, inventory export and adoption,
+  and new cloud identity after adoption.
+- [x] Private local plugin build and installation with no registry publication.
+- [ ] Rate limiting and broader cross-browser hostile-artifact testing remain
+  validation work. Primary and additional-provider OpenCode acceptance is
+  complete; only the time-gated natural Publication-expiry observation remains.
 
-### D1 Data Model
-
-`artifacts`
-
-```text
-id
-owner_token_hash
-opencode_session_id
-title
-type
-current_revision_id
-created_at
-updated_at
-```
-
-`revisions`
-
-```text
-id
-artifact_id
-version
-source
-created_at
-```
-
-`shares`
-
-```text
-token_hash
-artifact_id
-revision_id
-created_at
-revoked_at
-```
-
-Initial source size limit: 1 MB per revision.
-
-## Security Requirements
-
-Generated code is untrusted.
-
-- [x] Render executable artifacts in an iframe with `sandbox="allow-scripts"`
-- [x] Never add `allow-same-origin`
-- [x] Set `referrerpolicy="no-referrer"`
-- [x] Block external subresource egress by default with parent and iframe CSPs
-- [x] Block nested frames, objects, forms, popups, and top navigation
-- [x] Prevent artifact code from accessing Panes cookies, DOM, or storage
-- [x] Render Markdown without raw HTML
-- [x] Sanitize SVG before rendering
-- [x] Use Mermaid strict security mode
-- [x] Compile React in a terminateable Web Worker with source and time limits
-- [x] Provide reload and stop controls for responsive previews
-- [x] Generate tokens with Web Crypto
-- [x] Store hashes of owner and share tokens, not plaintext tokens
-- [x] Keep private and public URLs separate
-- [x] Never log artifact source or private tokens by default
-
-Initial iframe CSP:
-
-```text
-default-src 'none';
-script-src 'unsafe-inline';
-style-src 'unsafe-inline';
-img-src data: blob:;
-font-src data:;
-connect-src 'none';
-frame-src 'none';
-object-src 'none';
-base-uri 'none';
-form-action 'none';
-```
-
-## Explicit Non-Goals
-
-- Built-in chat or model selection
-- Claude, OpenAI, or Workers AI calls from inside artifacts
-- MCP Apps support
-- Git repositories or Cloudflare Artifacts storage
-- Multi-file projects
-- Arbitrary npm dependencies
-- Vite or server-side build jobs
-- Cloudflare Sandbox SDK
-- Workers for Platforms
-- Queues, Workflows, or Durable Objects
-- R2 storage unless source-size evidence requires it
-- Full-stack applications
-- Artifact-owned databases or persistent app state
-- Team collaboration, comments, or approvals
-- Community gallery or marketplace
-- Native OpenCode desktop or web UI modifications
-- A custom OpenCode message-part type
-
-## Milestones
-
-### Milestone 0: Foundation
-
-- [x] Choose package names and repository layout
-- [x] Create the Workers application
-- [x] Create the OpenCode plugin package
-- [x] Configure TypeScript, formatting, tests, and CI
-- [x] Add local development instructions
-- [ ] Record architectural decisions in short ADRs
-
-Exit criteria:
-
-- The Worker and plugin run locally.
-- CI validates both packages.
-
-### Milestone 1: HTML Vertical Slice
-
-- [x] Create D1 migrations for artifacts and revisions
-- [x] Implement artifact creation API
-- [x] Implement artifact revision API
-- [x] Implement private artifact retrieval
-- [x] Build the minimal artifact viewer
-- [x] Render HTML in a restricted iframe
-- [x] Add Preview and Code tabs
-- [x] Register the OpenCode `artifact` tool
-- [ ] Return a working private URL from an OpenCode conversation
-
-Exit criteria:
-
-- Asking OpenCode for an HTML artifact produces a working browser preview.
-- Asking for a revision updates the same artifact and preserves version one.
-
-### Milestone 2: Artifact Parity
-
-- [x] Add React rendering
-- [x] Add SVG rendering
-- [x] Add Mermaid rendering
-- [x] Add Markdown rendering
-- [x] Add dependency-free source syntax highlighting
-- [x] Add version selection
-- [x] Add copy and download
-- [x] Add creator-view polling
-- [x] Add runtime error capture
-- [x] Add reload and stop controls
-
-Exit criteria:
-
-- Every MVP artifact type can be created and revised through OpenCode.
-- Previous versions remain selectable.
-
-### Milestone 3: Publishing
-
-- [x] Add selected-revision publishing
-- [x] Add share-token generation and hashing
-- [x] Add public artifact route
-- [x] Add unpublish and revocation
-- [x] Add public user-generated content notice
-- [x] Add responsive public viewer
-- [x] Verify private revisions cannot be accessed from public links
-
-Exit criteria:
-
-- A creator can publish one immutable revision and share it without exposing the private workspace or later revisions.
-
-### Milestone 4: Private OpenCode Installation
-
-- [x] Add first-upload permission flow
-- [x] Add optional `/artifact` command
-- [x] Add optional browser auto-open
-- [x] Document project-scoped installation
-- [x] Document global installation
-- [x] Install the plugin as an auto-discovered global plugin file
-- [x] Add a repository-independent global plugin build and installer
-- [ ] Test with multiple OpenCode-supported model providers
-- [x] Refine tool guidance based on model behavior
-
-Exit criteria:
-
-- The private operator can load the built plugin from OpenCode's local plugin directory and create an artifact using the documented steps.
-
-### Milestone 5: Hardening
-
-- [x] Add API and source-size limits
-- [ ] Add rate limiting
-- [x] Add iframe sandbox and CSP regression tests
-- [x] Add malicious HTML, SVG, Markdown, and React test cases
-- [x] Add revision authorization tests
-- [x] Add public-share revocation tests
-- [ ] Add mobile and desktop browser tests
-- [x] Add structured Worker logging without source contents
-- [x] Deploy a production instance on Cloudflare
-
-Exit criteria:
-
-- Security tests cover each executable or sanitizable artifact type.
-- The hosted test service supports the documented private local-plugin workflow.
-
-## MVP Release Status
-
-- [x] Local implementation, automated tests, builds, built-plugin smoke check, audit, and generated-config deploy dry-run pass
-- [x] MIT licensing, local release documentation, optional command template, and no-secret CI workflow are present
-- [x] Keep the plugin private and install it as an auto-discovered local plugin file
-- [x] Create and migrate a production D1 database
-- [x] Deploy the Worker and viewer to production
-- [ ] Run real cross-browser hostile-artifact and infinite-loop testing
-- [ ] Complete a real OpenCode conversation acceptance test across supported model providers
-
-Deployment does not imply production readiness. Rate limiting, real host/provider acceptance, and cross-browser hostile testing remain open. The plugin is intentionally private and local-only; registry publication and external-user release validation are not project goals.
-
-## MVP Acceptance Test
-
-The MVP is complete when this workflow succeeds:
-
-1. Install the Panes plugin in OpenCode.
-2. Start an OpenCode session.
-3. Ask: `Create an artifact showing a clickable SaaS onboarding flow.`
-4. OpenCode calls the `artifact` tool without requiring source to be copied manually.
-5. The tool returns a private browser URL.
-6. The URL shows a working interactive preview and its code.
-7. Ask: `Make the second step optional and use a darker visual style.`
-8. OpenCode creates version two of the same artifact.
-9. The open browser viewer detects version two.
-10. Both versions remain selectable.
-11. Publish version two.
-12. Open the public URL in a private browser session.
-13. The artifact works without exposing the owner URL, OpenCode session, or unpublished versions.
-
-## Later Decisions
-
-These require usage evidence before implementation:
-
-- Authentication beyond private owner tokens
-- Larger source and binary asset storage in R2
-- More React libraries
-- Persistent artifact storage
-- AI calls from inside artifacts
-- MCP integrations
-- Native OpenCode artifact panes if OpenCode adds a supported extension point
-- Support for other coding agents
-
-## References
-
-### Claude Artifacts
-
-- [What are artifacts and how do I use them?](https://support.claude.com/en/articles/9487310-what-are-artifacts-and-how-do-i-use-them)
-- [Publish and share artifacts](https://support.claude.com/en/articles/9547008-publish-and-share-artifacts)
-- [Creating with artifacts](https://academy.claude.com/courses/claude-101/creating-with-artifacts)
-
-### OpenCode
-
-- [Plugins](https://opencode.ai/docs/plugins/)
-- [Custom tools](https://opencode.ai/docs/custom-tools/)
-- [Server](https://opencode.ai/docs/server/)
-- [SDK](https://opencode.ai/docs/sdk/)
-- [TUI plugin specification](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/specs/tui-plugins.md)
-- [Inline artifact rendering request](https://github.com/anomalyco/opencode/issues/25076)
-
-### Cloudflare
-
-- [Workers Static Assets](https://developers.cloudflare.com/workers/static-assets/)
-- [D1](https://developers.cloudflare.com/d1/)
-- [Workers best practices](https://developers.cloudflare.com/workers/best-practices/workers-best-practices/)
-
-## Progress Log
-
-Add short dated entries here when a milestone changes state or a material product decision is made.
-
-| Date | Update |
-| --- | --- |
-| 2026-08-17 | Initial creator-first plan recorded. Scope reduced to an OpenCode plugin, browser renderer, Worker API, and D1 revision storage. |
-| 2026-08-18 | Completed the local-only MVP release pass: MIT licensing, CI, root build and generated-config deploy scripts, deployment instructions, safe lexical source highlighting, an optional `/artifact` command template, and a deterministic built-plugin registration smoke check. Local verification passed; production D1 and deployment, cross-browser hostile-loop testing, and real OpenCode/provider acceptance remained open. |
-| 2026-08-18 | Deployed the protected test service to `opencode-panes.simons.workers.dev` with a production D1 database and required creation secret. Verified create, private read, revision, publish, public read, revocation, and response headers. |
-| 2026-08-18 | Ran a real OpenCode live acceptance pass. Creation, owner-token revision, version polling, immutable public pinning, revocation, mobile layout, and all six renderers passed. Browser inspection found the parent CSP blocked `srcdoc` scripts; the deployed hotfix corrected the CSP intersection and added a regression test. The model also omitted the creator fragment in its final Markdown link despite the structured tool result being correct, so tool guidance now requires preserving `viewerUrl` exactly. Workers Logs were enabled after confirming prior log claims were not observable; the final query found 112 invocations and zero error events. |
-| 2026-08-18 | Made plugin distribution explicitly private and local-only. Registry publication and external-user release validation were removed from scope; the supported installation is an auto-discovered OpenCode plugin file. |
-| 2026-08-28 | Added a standalone bundled global plugin and atomic installer. The installed plugin no longer imports or depends on the source repository. |
+The repository's local checks cover the implemented contracts. Deployment or a
+hosted test service does not imply production readiness.

@@ -21,7 +21,6 @@ export const OpenCodePanesGlobalPlugin: Plugin = async (input, options) => {
   const resolvedOptions: PluginOptions = {
     apiBaseUrl:
       process.env.OPENCODE_PANES_API_BASE_URL ?? PRODUCTION_API_BASE_URL,
-    autoOpen: false,
     requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
     ...options,
   };

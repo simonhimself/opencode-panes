@@ -1,19 +1,27 @@
 import {
   artifactIdSchema,
   workspaceTokenSchema,
+  type Publication,
   type Artifact,
   type ArtifactType,
+  type CreatorWorkspaceResponse,
+  type InventoryResponse,
+  type InventoryCreatorRotateResponse,
+  type InventoryReconnectCodeResponse,
+  type LegacyAdoptionIssueResponse,
+  type LegacyArtifactPresentation,
+  type PublicPublicationResponse,
   type Revision,
-  type ShareResponse,
 } from "@opencode-panes/contracts";
 
 const SESSION_TOKEN_PREFIX = "opencode-panes:workspace-token:";
-const PUBLIC_URL_PREFIX = "opencode-panes:public-url:";
-const PUBLIC_REVISION_PREFIX = "opencode-panes:public-revision:";
 
 export type ViewerRoute =
   | { kind: "artifact"; artifactId: string }
+  | { kind: "creator"; token: string }
   | { kind: "shared"; token: string }
+  | { kind: "published"; token: string }
+  | { kind: "inventory" }
   | { kind: "home" }
   | { kind: "not-found" };
 
@@ -26,12 +34,14 @@ export interface PublicArtifactResponse {
   artifact: Pick<Artifact, "id" | "title" | "type">;
   revision: Revision;
   publishedAt: string;
+  legacy?: { readOnly: true };
 }
 
 export interface ArtifactResponse {
   artifact: Artifact;
   revision: Revision;
   viewerUrl: string;
+  legacy?: LegacyArtifactPresentation;
 }
 
 export interface RevisionListResponse {
@@ -43,6 +53,11 @@ export interface PrivateWorkspaceData {
   current: ArtifactResponse;
   revisions: Revision[];
 }
+
+export type CreatorWorkspaceData = CreatorWorkspaceResponse;
+export type PublicWorkspaceData = PublicPublicationResponse;
+export type InventoryData = InventoryResponse;
+export type PublicationDuration = 1 | 7 | 30;
 
 export interface RevisionSelection {
   followLatest: boolean;
@@ -109,12 +124,22 @@ export class ApiError extends Error {
 
 export function parseViewerRoute(pathname: string): ViewerRoute {
   if (pathname === "/" || pathname === "") return { kind: "home" };
+  if (pathname === "/inventory" || pathname === "/inventory/")
+    return { kind: "inventory" };
 
   const artifactMatch = pathname.match(/^\/artifacts\/([^/]+)\/?$/);
   if (artifactMatch) {
     const artifactId = decodeSegment(artifactMatch[1]);
     if (artifactIdSchema.safeParse(artifactId).success) {
       return { kind: "artifact", artifactId: artifactId as string };
+    }
+  }
+
+  const creatorMatch = pathname.match(/^\/creator\/([^/]+)\/?$/);
+  if (creatorMatch) {
+    const token = decodeSegment(creatorMatch[1]);
+    if (workspaceTokenSchema.safeParse(token).success) {
+      return { kind: "creator", token: token as string };
     }
   }
 
@@ -126,71 +151,19 @@ export function parseViewerRoute(pathname: string): ViewerRoute {
     }
   }
 
+  const publishedMatch = pathname.match(/^\/published\/([^/]+)\/?$/);
+  if (publishedMatch) {
+    const token = decodeSegment(publishedMatch[1]);
+    if (workspaceTokenSchema.safeParse(token).success) {
+      return { kind: "published", token: token as string };
+    }
+  }
+
   return { kind: "not-found" };
 }
 
 export function workspaceTokenStorageKey(artifactId: string): string {
   return `${SESSION_TOKEN_PREFIX}${artifactId}`;
-}
-
-export function publicUrlStorageKey(
-  artifactId: string,
-  revisionId: string,
-): string {
-  return `${PUBLIC_URL_PREFIX}${artifactId}:${revisionId}`;
-}
-
-export function storePublicUrl(
-  artifactId: string,
-  revisionId: string,
-  publicUrl: string,
-  storage: StorageLike = sessionStorage,
-): void {
-  if (!isPublicViewerUrl(publicUrl)) return;
-  const activeKey = `${PUBLIC_REVISION_PREFIX}${artifactId}`;
-  try {
-    const previousRevisionId = storage.getItem(activeKey);
-    if (previousRevisionId && previousRevisionId !== revisionId) {
-      storage.removeItem(publicUrlStorageKey(artifactId, previousRevisionId));
-    }
-    storage.setItem(publicUrlStorageKey(artifactId, revisionId), publicUrl);
-    storage.setItem(activeKey, revisionId);
-  } catch {
-    // Publishing still succeeds when storage is unavailable or full.
-  }
-}
-
-export function getStoredPublicUrl(
-  artifactId: string,
-  revisionId: string,
-  storage: StorageLike = sessionStorage,
-): string | undefined {
-  const key = publicUrlStorageKey(artifactId, revisionId);
-  try {
-    const value = storage.getItem(key);
-    if (!value) return undefined;
-    if (isPublicViewerUrl(value)) return value;
-    storage.removeItem(key);
-  } catch {
-    // Treat unavailable storage as a cache miss.
-  }
-  return undefined;
-}
-
-export function clearStoredPublicUrl(
-  artifactId: string,
-  storage: StorageLike = sessionStorage,
-): void {
-  const activeKey = `${PUBLIC_REVISION_PREFIX}${artifactId}`;
-  try {
-    const revisionId = storage.getItem(activeKey);
-    if (revisionId) {
-      storage.removeItem(publicUrlStorageKey(artifactId, revisionId));
-    }
-    storage.removeItem(activeKey);
-  } catch {
-    // Unpublish still succeeds when storage is unavailable.
-  }
 }
 
 export function createSerializedPoller<T>(
@@ -366,33 +339,292 @@ export function fetchPublicArtifact(
   );
 }
 
-export function publishRevision(
-  artifactId: string,
+export function fetchPublicationStatus(
   token: string,
-  revisionId: string,
   fetcher: Fetcher = fetch,
-): Promise<ShareResponse | null> {
-  return requestJson<ShareResponse | null>(
-    `/api/artifacts/${encodeURIComponent(artifactId)}/publish`,
+  signal?: AbortSignal,
+): Promise<PublicWorkspaceData> {
+  return requestJson<PublicWorkspaceData>(
+    `/api/publications/${encodeURIComponent(token)}`,
+    signal ? { signal } : {},
+    fetcher,
+  );
+}
+
+export function fetchInventory(
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<InventoryData> {
+  return requestJson<InventoryData>(
+    "/api/inventory",
+    signal ? { signal } : {},
+    fetcher,
+  );
+}
+
+export function rotateInventoryCreator(
+  artifactId: string,
+  fetcher: Fetcher = fetch,
+): Promise<InventoryCreatorRotateResponse> {
+  return requestJson<InventoryCreatorRotateResponse>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/creator/rotate`,
     {
-      body: JSON.stringify({ revisionId }),
-      headers: privateHeaders(token, true),
+      body: "{}",
+      headers: { "Content-Type": "application/json" },
       method: "POST",
     },
     fetcher,
   );
 }
 
-export function unpublishArtifact(
+export function issueInventoryReconnectCode(
   artifactId: string,
+  confirmation: string,
+  fetcher: Fetcher = fetch,
+): Promise<InventoryReconnectCodeResponse> {
+  return requestJson<InventoryReconnectCodeResponse>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/reconnect-code`,
+    {
+      body: JSON.stringify({ confirmation }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function issueLegacyAdoptionCode(
+  artifactId: string,
+  fetcher: Fetcher = fetch,
+): Promise<LegacyAdoptionIssueResponse> {
+  return requestJson<LegacyAdoptionIssueResponse>(
+    `/api/inventory/legacy/artifacts/${encodeURIComponent(artifactId)}/adoption-code`,
+    {
+      body: "{}",
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function extendInventoryPublication(
+  artifactId: string,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/publication/extend`,
+    {
+      body: JSON.stringify({ durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function republishInventoryPublication(
+  artifactId: string,
+  revisionVersion: number,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/publication/republish`,
+    {
+      body: JSON.stringify({ revisionVersion, durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function unpublishInventoryPublication(
+  artifactId: string,
+  fetcher: Fetcher = fetch,
+): Promise<null> {
+  return requestJson<null>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}/publication/unpublish`,
+    {
+      body: "{}",
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export async function deleteInventoryArtifact(
+  artifactId: string,
+  confirmation: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> {
+  await requestJson<null>(
+    `/api/inventory/artifacts/${encodeURIComponent(artifactId)}`,
+    {
+      body: JSON.stringify({ confirmation }),
+      headers: { "Content-Type": "application/json" },
+      method: "DELETE",
+    },
+    fetcher,
+  );
+}
+
+export async function deleteLegacyInventoryArtifact(
+  artifactId: string,
+  confirmation: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> {
+  await requestJson<null>(
+    `/api/inventory/legacy/artifacts/${encodeURIComponent(artifactId)}`,
+    {
+      body: JSON.stringify({ confirmation }),
+      headers: { "Content-Type": "application/json" },
+      method: "DELETE",
+    },
+    fetcher,
+  );
+}
+
+export function publicFileUrl(
+  token: string,
+  path: string,
+  download = false,
+): string {
+  const encodedPath = path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = `/api/publications/${encodeURIComponent(token)}/files/${encodedPath}`;
+  return download ? `${url}?download=1` : url;
+}
+
+export async function fetchPublicFile(
+  token: string,
+  path: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+  download = false,
+): Promise<Response> {
+  const response = await fetcher(
+    publicFileUrl(token, path, download),
+    signal ? { signal } : undefined,
+  );
+  if (!response.ok) await throwApiError(response);
+  return response;
+}
+
+export function fetchCreatorWorkspace(
+  token: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+): Promise<CreatorWorkspaceData> {
+  return requestJson<CreatorWorkspaceData>(
+    `/api/creator/${encodeURIComponent(token)}`,
+    signal ? { signal } : {},
+    fetcher,
+  );
+}
+
+export function publishCreatorPublication(
+  token: string,
+  revisionVersion: number,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/creator/${encodeURIComponent(token)}/publish`,
+    {
+      body: JSON.stringify({ revisionVersion, durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function republishCreatorPublication(
+  token: string,
+  revisionVersion: number,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/creator/${encodeURIComponent(token)}/republish`,
+    {
+      body: JSON.stringify({ revisionVersion, durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function extendCreatorPublication(
+  token: string,
+  durationDays: PublicationDuration,
+  fetcher: Fetcher = fetch,
+): Promise<Publication> {
+  return requestJson<Publication>(
+    `/api/creator/${encodeURIComponent(token)}/extend`,
+    {
+      body: JSON.stringify({ durationDays }),
+      headers: { "Content-Type": "application/json" },
+      method: "POST",
+    },
+    fetcher,
+  );
+}
+
+export function unpublishCreatorPublication(
   token: string,
   fetcher: Fetcher = fetch,
 ): Promise<null> {
   return requestJson<null>(
-    `/api/artifacts/${encodeURIComponent(artifactId)}/unpublish`,
-    { headers: privateHeaders(token), method: "POST" },
+    `/api/creator/${encodeURIComponent(token)}/unpublish`,
+    { method: "POST" },
     fetcher,
   );
+}
+
+export function creatorFileUrl(
+  token: string,
+  version: number,
+  path: string,
+  download = false,
+): string {
+  const encodedPath = path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  const url = `/api/creator/${encodeURIComponent(token)}/revisions/${version}/files/${encodedPath}`;
+  return download ? `${url}?download=1` : url;
+}
+
+export function creatorRevisionZipUrl(token: string, version: number): string {
+  return `/api/creator/${encodeURIComponent(token)}/revisions/${version}/download.zip`;
+}
+
+export function publicRevisionZipUrl(token: string): string {
+  return `/api/publications/${encodeURIComponent(token)}/download.zip`;
+}
+
+export async function fetchCreatorFile(
+  token: string,
+  version: number,
+  path: string,
+  fetcher: Fetcher = fetch,
+  signal?: AbortSignal,
+  download = false,
+): Promise<Response> {
+  const response = await fetcher(
+    creatorFileUrl(token, version, path, download),
+    signal ? { signal } : undefined,
+  );
+  if (!response.ok) await throwApiError(response);
+  return response;
 }
 
 export function safeDownloadFilename(
@@ -435,10 +667,8 @@ export async function copyText(value: string): Promise<void> {
   await navigator.clipboard.writeText(value);
 }
 
-function privateHeaders(token: string, json = false): Headers {
-  const headers = new Headers({ Authorization: `Bearer ${token}` });
-  if (json) headers.set("Content-Type", "application/json");
-  return headers;
+function privateHeaders(token: string): Headers {
+  return new Headers({ Authorization: `Bearer ${token}` });
 }
 
 export function includeRevision(
@@ -459,25 +689,26 @@ async function requestJson<T>(
   fetcher: Fetcher,
 ): Promise<T> {
   const response = await fetcher(input, init);
-  if (!response.ok) {
-    let message = `Request failed with status ${response.status}`;
-    let code: string | undefined;
-    try {
-      const payload = (await response.json()) as {
-        error?: { code?: unknown; message?: unknown };
-      };
-      if (typeof payload.error?.message === "string") {
-        message = payload.error.message;
-      }
-      if (typeof payload.error?.code === "string") code = payload.error.code;
-    } catch {
-      // Keep the status-based fallback when the response is not JSON.
-    }
-    throw new ApiError(response.status, message, code);
-  }
+  if (!response.ok) await throwApiError(response);
 
   if (response.status === 204) return null as T;
   return (await response.json()) as T;
+}
+
+async function throwApiError(response: Response): Promise<never> {
+  let message = `Request failed with status ${response.status}`;
+  let code: string | undefined;
+  try {
+    const payload = (await response.json()) as {
+      error?: { code?: unknown; message?: unknown };
+    };
+    if (typeof payload.error?.message === "string")
+      message = payload.error.message;
+    if (typeof payload.error?.code === "string") code = payload.error.code;
+  } catch {
+    // Keep the status-based fallback when the response is not JSON.
+  }
+  throw new ApiError(response.status, message, code);
 }
 
 function downloadMimeType(type: ArtifactType): string {
@@ -493,22 +724,6 @@ function decodeSegment(value: string | undefined): string | undefined {
     return decodeURIComponent(value);
   } catch {
     return undefined;
-  }
-}
-
-function isPublicViewerUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return (
-      (url.protocol === "http:" || url.protocol === "https:") &&
-      !url.username &&
-      !url.password &&
-      /^\/shared\/[^/]+\/?$/.test(url.pathname) &&
-      !url.search &&
-      !url.hash
-    );
-  } catch {
-    return false;
   }
 }
 

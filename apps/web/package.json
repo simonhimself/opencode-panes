@@ -10,13 +10,15 @@
     "deploy:dry-run": "wrangler deploy --dry-run",
     "dev": "vite dev",
     "preview": "vite preview",
-    "test": "vitest run --config vitest.config.ts test/api.test.ts && vitest run --config vitest.client.config.ts",
+    "test": "vitest run --config vitest.config.ts test/api.test.ts test/inventory.test.ts test/legacy-migration.test.ts test/legacy-mutation-contraction.test.ts test/publication.test.ts test/storage.test.ts test/sync-boundaries.test.ts test/sync.test.ts test/zip.test.ts && vitest run --config vitest.client.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@opencode-panes/contracts": "*",
+    "@opencode-panes/renderers": "*",
     "dompurify": "^3.4.13",
     "esbuild-wasm": "^0.28.2",
+    "jose": "^6.2.10",
     "mermaid": "^11.16.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
@@ -26,6 +28,7 @@
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.52.1",
     "@cloudflare/vitest-pool-workers": "^0.21.3",
+    "@types/jsdom": "^21.1.7",
     "@types/node": "^22.15.30",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",

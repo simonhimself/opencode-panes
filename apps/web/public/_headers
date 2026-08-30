@@ -5,3 +5,11 @@
   Referrer-Policy: no-referrer
   Permissions-Policy: accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), xr-spatial-tracking=()
   X-DNS-Prefetch-Control: off
+
+/creator/*
+  Cache-Control: no-store
+  Referrer-Policy: no-referrer
+
+/published/*
+  Cache-Control: no-store
+  Referrer-Policy: no-referrer

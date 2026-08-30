@@ -1,7 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import type { CreatorWorkspaceResponse } from "@opencode-panes/contracts";
+import mermaid from "mermaid";
+import { act } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CreatorWorkspace } from "../../src/creator-workspace";
 import {
   EXECUTABLE_IFRAME_SANDBOX,
   MAX_RENDERER_ERROR_MESSAGE_CHARS,
@@ -16,6 +21,40 @@ import {
 } from "../../src/renderers/iframe-security";
 import { createHtmlSrcDoc } from "../../src/renderers/html";
 
+vi.mock("mermaid", () => ({
+  default: {
+    initialize: vi.fn(),
+    render: vi.fn(async () => ({
+      svg: '<svg style="max-width:100px"><style>.node{fill:#000}.node .label text{text-anchor:middle}</style><g class="node" style="color:#fffaf0"><rect style="fill:#165dcc;stroke:#171717;stroke-width:2px"/><g class="label"><text y="-10.1" style="fill:#fffaf0"><tspan class="text-outer-tspan row" x="0"><tspan>Readable</tspan><tspan> node</tspan></tspan></text></g></g><script>alert(1)</script></svg>',
+    })),
+  },
+}));
+
+vi.mock("../../src/renderers/react-compiler", () => ({
+  startReactCompilation: vi.fn(() => ({
+    promise: Promise.resolve("globalThis.__PANES_COMPONENT__ = () => null;"),
+    stop: vi.fn(),
+  })),
+}));
+
+let container: HTMLDivElement;
+let root: Root;
+
+beforeEach(() => {
+  (
+    globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
+  ).IS_REACT_ACT_ENVIRONMENT = true;
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  vi.unstubAllGlobals();
+});
+
 describe("sandboxed artifact iframe", () => {
   it("allows inline scripts through the parent and tighter artifact CSP intersection", () => {
     const staticHeaders = readFileSync(
@@ -28,6 +67,12 @@ describe("sandboxed artifact iframe", () => {
     );
     expect(createArtifactCsp(true)).toContain("script-src 'unsafe-inline'");
     expect(createArtifactCsp(true)).toContain("connect-src 'none'");
+    expect(createArtifactCsp(true, ["https://api.example"])).toContain(
+      "connect-src https://api.example",
+    );
+    expect(createArtifactCsp(true, ["https://api.example"])).toContain(
+      "script-src 'unsafe-inline' https://api.example",
+    );
   });
 
   it("places a restrictive CSP before HTML artifact content", () => {
@@ -165,4 +210,134 @@ describe("sandboxed artifact iframe", () => {
     time += RENDERER_ERROR_WINDOW_MS + 1;
     expect(accept(message)).toBe(true);
   });
+
+  it("keeps Creator code in an opaque script-free iframe", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response('<script>alert("x")</script>')),
+    );
+
+    await renderCreatorWorkspace(
+      "code",
+      "text/plain",
+      '<script>alert("x")</script>',
+    );
+
+    const frame = container.querySelector("iframe");
+    const srcDoc = frame?.getAttribute("srcdoc") ?? "";
+    expect(frame?.getAttribute("sandbox")).toBe("");
+    expect(srcDoc).toContain("script-src 'none'");
+    expect(srcDoc).toContain(
+      "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;",
+    );
+    expect(srcDoc).not.toContain("<script>alert");
+    expect(srcDoc).not.toContain("allow-same-origin");
+  });
+
+  it("gives Creator Markdown a readable isolated canvas", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("# Readable preview")),
+    );
+
+    await renderCreatorWorkspace(
+      "markdown",
+      "text/markdown",
+      "# Readable preview",
+    );
+
+    const srcDoc =
+      container.querySelector("iframe")?.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain("color-scheme:light");
+    expect(srcDoc).toContain("background:#f1f0ea");
+    expect(srcDoc).toContain("color:#1f211f");
+  });
+
+  it("preserves safe Mermaid presentation colors on a readable canvas", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("graph TD; A-->B;")),
+    );
+
+    await renderCreatorWorkspace("mermaid", "text/plain", "graph TD; A-->B;");
+
+    const srcDoc =
+      container.querySelector("iframe")?.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain("data-panes-mermaid-canvas");
+    expect(srcDoc).toContain('fill="#165dcc"');
+    expect(srcDoc).toContain('fill="#fffaf0"');
+    expect(srcDoc).toContain('text-anchor="middle"');
+    expect(srcDoc).toContain("Readable node");
+    expect(srcDoc).toContain("background:#f1f0ea");
+    expect(srcDoc).toContain("box-sizing:border-box;width:100vw");
+    expect(srcDoc).not.toContain("max-width:100px");
+    expect(srcDoc).not.toContain(".node{fill:#000}");
+    expect(srcDoc).not.toContain("<script>alert(1)</script>");
+    expect(mermaid.initialize).toHaveBeenCalledWith(
+      expect.objectContaining({
+        flowchart: { htmlLabels: false },
+        htmlLabels: false,
+      }),
+    );
+  });
+
+  it.each([
+    ["mermaid", "graph TD; A-->B;"],
+    ["react", "export default function App() { return null; }"],
+  ] as const)(
+    "uses the existing sandboxed %s renderer path with approved origins",
+    async (renderer, source) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => new Response(source)),
+      );
+
+      await renderCreatorWorkspace(renderer, "text/plain", source);
+
+      const frame = container.querySelector("iframe");
+      const srcDoc = frame?.getAttribute("srcdoc") ?? "";
+      expect(frame?.getAttribute("sandbox")).toBe("allow-scripts");
+      expect(frame?.getAttribute("sandbox")).not.toContain("allow-same-origin");
+      expect(srcDoc).toContain("connect-src https://api.example");
+    },
+  );
 });
+
+async function renderCreatorWorkspace(
+  renderer: "code" | "markdown" | "mermaid" | "react",
+  mediaType: string,
+  source: string,
+): Promise<void> {
+  const workspace: CreatorWorkspaceResponse = {
+    cloudArtifactId: "artifact-creator-test",
+    cloudProjectId: "project-creator-test",
+    creatorExpiresAt: "2026-09-28T10:00:00.000Z",
+    revisions: [
+      {
+        approvedOrigins: ["https://api.example"],
+        createdAt: "2026-08-29T12:00:00.000Z",
+        files: [
+          {
+            byteSize: new TextEncoder().encode(source).byteLength,
+            kind: "file",
+            mediaType,
+            path: "entry.txt",
+            sha256: "a".repeat(64),
+          },
+        ],
+        id: "revision-1",
+        preview: { adapter: "renderer", entryPath: "entry.txt", renderer },
+        version: 1,
+      },
+    ],
+    slug: "creator-test",
+    title: "Creator test",
+  };
+
+  await act(async () => {
+    root.render(
+      <CreatorWorkspace token="creator-token" workspace={workspace} />,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
+}

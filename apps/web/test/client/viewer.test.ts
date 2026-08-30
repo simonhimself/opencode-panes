@@ -2,18 +2,18 @@ import type { Artifact, Revision } from "@opencode-panes/contracts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   captureWorkspaceAccess,
-  clearStoredPublicUrl,
   createSerializedPoller,
+  deleteInventoryArtifact,
+  extendInventoryPublication,
   fetchPrivateWorkspace,
   fetchPublicArtifact,
   followCurrentRevision,
-  getStoredPublicUrl,
   parseViewerRoute,
-  publicUrlStorageKey,
-  publishRevision,
+  republishInventoryPublication,
+  rotateInventoryCreator,
   safeDownloadFilename,
   selectRevision,
-  storePublicUrl,
+  unpublishInventoryPublication,
   workspaceTokenStorageKey,
 } from "../../src/viewer";
 
@@ -126,6 +126,11 @@ describe("viewer API requests", () => {
             artifact: ARTIFACT,
             revision: REVISIONS[0],
             viewerUrl: "https://panes.example/artifacts/artifact-1",
+            legacy: {
+              readOnly: true,
+              migratedAt: "2026-08-17T10:00:00.000Z",
+              privateExpiresAt: "2026-09-16T10:00:00.000Z",
+            },
           };
       return new Response(JSON.stringify(body), {
         headers: { "Content-Type": "application/json" },
@@ -149,6 +154,7 @@ describe("viewer API requests", () => {
       "revision-2",
       "revision-1",
     ]);
+    expect(workspace.current.legacy?.readOnly).toBe(true);
   });
 
   it("does not send private authorization to the public endpoint", async () => {
@@ -172,22 +178,39 @@ describe("viewer API requests", () => {
     expect(headers.has("Authorization")).toBe(false);
   });
 
-  it("publishes the explicitly selected revision with private authorization", async () => {
-    let request: RequestInit | undefined;
-    const fetcher = async (_input: RequestInfo | URL, init?: RequestInit) => {
-      request = init;
+  it("sends inventory lifecycle mutations without private bearer credentials", async () => {
+    const calls: Array<{ init: RequestInit | undefined; url: string }> = [];
+    const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ init, url: String(input) });
       return new Response(null, { status: 204 });
     };
 
-    await expect(
-      publishRevision(ARTIFACT.id, "workspace-token", "revision-1", fetcher),
-    ).resolves.toBeNull();
-    expect(request?.method).toBe("POST");
-    expect(new Headers(request?.headers).get("Authorization")).toBe(
-      "Bearer workspace-token",
+    await rotateInventoryCreator("artifact-1", fetcher);
+    await extendInventoryPublication("artifact-1", 7, fetcher);
+    await republishInventoryPublication("artifact-1", 2, 30, fetcher);
+    await unpublishInventoryPublication("artifact-1", fetcher);
+    await deleteInventoryArtifact(
+      "artifact-1",
+      "DELETE CLOUD COPY OF Test artifact",
+      fetcher,
     );
-    expect(JSON.parse(String(request?.body))).toEqual({
-      revisionId: "revision-1",
+
+    expect(calls.map(({ init }) => init?.method)).toEqual([
+      "POST",
+      "POST",
+      "POST",
+      "POST",
+      "DELETE",
+    ]);
+    for (const { init } of calls) {
+      expect(new Headers(init?.headers).has("Authorization")).toBe(false);
+      expect(new Headers(init?.headers).get("Content-Type")).toBe(
+        "application/json",
+      );
+    }
+    expect(JSON.parse(String(calls[2]?.init?.body))).toEqual({
+      revisionVersion: 2,
+      durationDays: 30,
     });
   });
 });
@@ -269,35 +292,6 @@ describe("serialized polling", () => {
     pending.resolve(2);
     await poll;
     expect(apply).not.toHaveBeenCalled();
-  });
-});
-
-describe("public URL session storage", () => {
-  beforeEach(() => sessionStorage.clear());
-
-  it("keeps only the active artifact/revision URL and clears it on unpublish", () => {
-    const firstUrl = "https://panes.example/shared/first-token";
-    const secondUrl = "https://panes.example/shared/second-token";
-    storePublicUrl(ARTIFACT.id, "revision-1", firstUrl);
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-1")).toBe(firstUrl);
-
-    storePublicUrl(ARTIFACT.id, "revision-2", secondUrl);
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-1")).toBeUndefined();
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-2")).toBe(secondUrl);
-
-    clearStoredPublicUrl(ARTIFACT.id);
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-2")).toBeUndefined();
-  });
-
-  it("rejects malformed stored URLs", () => {
-    sessionStorage.setItem(
-      publicUrlStorageKey(ARTIFACT.id, "revision-1"),
-      "javascript:alert(1)",
-    );
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-1")).toBeUndefined();
-    expect(
-      sessionStorage.getItem(publicUrlStorageKey(ARTIFACT.id, "revision-1")),
-    ).toBeNull();
   });
 });
 

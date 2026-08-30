@@ -4,13 +4,26 @@
   "main": "./worker/index.ts",
   "compatibility_date": "2026-08-18",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    // These are production policy values, not credential material. The
+    // matching Access application protects only /inventory and
+    // /api/inventory* on the workers.dev hostname.
+    "PANES_ACCESS_ALLOWED_EMAIL": "simonhimself@gmail.com",
+    "PANES_ACCESS_ISSUER": "https://adsdasd.cloudflareaccess.com",
+    "PANES_ACCESS_AUDIENCE": "8defff93e1db0b5ea650b2d7e75f67b6d22a3597a67bada071458ebe8dc48725",
+  },
   // Production admission control. Upload the value as an encrypted Worker secret.
   "secrets": {
-    "required": ["PANES_CREATE_API_KEY"],
+    // Versioned AES-GCM key material. Set with `wrangler secret put`; never
+    // place a value in this file or in source control.
+    "required": ["PANES_CREATE_API_KEY", "PUBLICATION_ENCRYPTION_KEY_V1"],
   },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
+  },
+  "triggers": {
+    "crons": ["17 * * * *"],
   },
   "assets": {
     "not_found_handling": "single-page-application",
@@ -22,6 +35,12 @@
       "database_name": "opencode-panes",
       "database_id": "52f1b05b-0aa6-421d-ab8f-30cc914c3d9b",
       "migrations_dir": "./migrations",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "PRIVATE_ARTIFACTS",
+      "bucket_name": "opencode-panes-private",
     },
   ],
 }

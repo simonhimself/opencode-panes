@@ -1,0 +1,29 @@
+{
+  "name": "@opencode-panes/renderers",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    "./iframe-security": {
+      "types": "./iframe-security.d.ts",
+      "import": "./iframe-security.js",
+      "default": "./iframe-security.js"
+    },
+    "./preview-security": {
+      "types": "./preview-security.d.ts",
+      "import": "./preview-security.js",
+      "default": "./preview-security.js"
+    },
+    "./react-build": {
+      "types": "./react-build.d.ts",
+      "import": "./react-build.js",
+      "default": "./react-build.js"
+    },
+    "./react-browser-runtime": {
+      "types": "./react-browser-runtime.d.ts",
+      "import": "./react-browser-runtime.js",
+      "default": "./react-browser-runtime.js"
+    }
+  }
+}

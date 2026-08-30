@@ -15,7 +15,13 @@ export default defineConfig(async () => {
       cloudflareTest({
         wrangler: { configPath: "./wrangler.jsonc" },
         miniflare: {
-          bindings: { TEST_MIGRATIONS: migrations },
+          bindings: {
+            TEST_MIGRATIONS: migrations,
+            // Test-only deterministic material. Production uses the required
+            // Worker secret declared in wrangler.jsonc.
+            PUBLICATION_ENCRYPTION_KEY_V1:
+              "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+          },
         },
       }),
     ],

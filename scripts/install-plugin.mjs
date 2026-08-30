@@ -17,7 +17,12 @@ const defaultSourcePath = join(
   repositoryDirectory,
   "packages/opencode-plugin/dist/global.js",
 );
+const defaultCompilerWasmPath = join(
+  repositoryDirectory,
+  "packages/opencode-plugin/dist/react-compiler.wasm",
+);
 const pluginFileName = "opencode-panes.js";
+const compilerWasmFileName = "react-compiler.wasm";
 
 export async function installPlugin(environment = process.env) {
   const configDirectory = opencodeConfigDirectory(environment);
@@ -26,6 +31,8 @@ export async function installPlugin(environment = process.env) {
   );
   const destinationPath = join(pluginDirectory, pluginFileName);
   const source = await readFile(defaultSourcePath);
+  const compilerWasm = await readFile(defaultCompilerWasmPath);
+  const compilerWasmPath = join(pluginDirectory, compilerWasmFileName);
 
   await mkdir(pluginDirectory, { recursive: true, mode: 0o700 });
   const temporaryPath = join(
@@ -40,6 +47,10 @@ export async function installPlugin(environment = process.env) {
     });
     await chmod(temporaryPath, 0o644);
     await rename(temporaryPath, destinationPath);
+    await writeFile(compilerWasmPath, compilerWasm, {
+      flag: "w",
+      mode: 0o644,
+    });
   } catch (error) {
     await unlink(temporaryPath).catch(() => undefined);
     throw error;

@@ -1,4 +1,4 @@
-import { MAX_ARTIFACT_SOURCE_BYTES } from "@opencode-panes/contracts";
+import { MAX_REMOTE_FILE_BYTES } from "@opencode-panes/contracts";
 
 interface CompileResponse {
   id: string;
@@ -24,12 +24,10 @@ export function startReactCompilation(
 
   const promise = new Promise<string>((resolve, reject) => {
     rejectTask = reject;
-    if (byteLength > MAX_ARTIFACT_SOURCE_BYTES) {
+    if (byteLength > MAX_REMOTE_FILE_BYTES) {
       settled = true;
       reject(
-        new Error(
-          `React artifact source exceeds ${MAX_ARTIFACT_SOURCE_BYTES} UTF-8 bytes`,
-        ),
+        new Error(`React entry exceeds ${MAX_REMOTE_FILE_BYTES} UTF-8 bytes`),
       );
       return;
     }
