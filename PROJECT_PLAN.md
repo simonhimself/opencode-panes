@@ -22,7 +22,7 @@ The product is an artifact renderer and lightweight revision store. It is not a 
 6. The creator reviews the local preview and source.
 7. The creator asks OpenCode to revise the artifact, and OpenCode prepares the next Draft.
 8. The creator explicitly calls `artifact_sync` when a cloud identity or link is needed.
-9. Panes stores the selected immutable Revision and returns Creator or public lifecycle links.
+9. Sync stores every unsynced immutable Revision in order and returns Creator or public lifecycle links.
 10. The creator can copy or download a selected Revision and manage publication from Inventory.
 
 Legacy adoption is an explicit inventory-to-plugin handoff. The creator issues a
@@ -106,7 +106,6 @@ artifact_finalize({
 
 artifact_sync({
   artifactId: string,
-  revision?: number,
   rotateCreatorLink?: boolean,
 })
 ```
@@ -115,7 +114,7 @@ Behavior:
 
 - `artifact_prepare` or `artifact_import` creates local state and never contacts Cloudflare.
 - `artifact_finalize` records a local immutable Revision and returns a local preview URL.
-- `artifact_sync` is the only new cloud creation path and uploads selected finalized files.
+- `artifact_sync` is the only new cloud creation path and uploads every unsynced finalized Revision in order, including only the files selected by the local ignore rules.
 - The OpenCode `sessionID` is recorded in Sync metadata when available.
 - Adoption writes an unchanged local finalized v1; its first Sync creates a new cloud identity.
 - The source is not repeated in the tool result.
@@ -244,7 +243,7 @@ created_at
 revoked_at
 ```
 
-Initial source size limit: 1 MB per revision.
+Initial remote source limits: 25 MB per file and 100 MB per Revision. Historical Legacy source compatibility remains capped at 1 MB.
 
 ## Security Requirements
 

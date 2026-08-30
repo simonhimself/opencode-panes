@@ -32,27 +32,27 @@ npm run install:plugin
 
 This atomically writes only `opencode-panes.js` to `~/.config/opencode/plugins/` (or the directory selected by `XDG_CONFIG_HOME`). Set `OPENCODE_PANES_CONFIG_DIR` or `OPENCODE_PANES_PLUGIN_DIR` to test or target another config/plugin directory. The installed module has no repository imports and needs no config-directory `package.json`.
 
-The global entry uses `https://opencode-panes.simons.workers.dev`, keeps browser opening disabled, and uses a 15-second request timeout. It reads the optional creation key at startup from `<OpenCode config directory>/secrets/opencode-panes-create-key`; set `OPENCODE_PANES_CREATE_API_KEY_FILE` for another path or use `OPENCODE_PANES_CREATE_API_KEY`. Explicit plugin options remain overrides. Restart OpenCode after installation.
+The global entry uses `https://opencode-panes.simons.workers.dev`, keeps browser opening disabled, and uses a 15-second request timeout. It reads the optional first-Sync admission key at startup from `<OpenCode config directory>/secrets/opencode-panes-create-key`; set `OPENCODE_PANES_CREATE_API_KEY_FILE` for another path or use `OPENCODE_PANES_CREATE_API_KEY`. Explicit plugin options remain overrides. Restart OpenCode after installation.
 
 The built package entry remains available for project-local development through an auto-discovered file in `.opencode/plugins/` or `~/.config/opencode/plugins/`. See `packages/opencode-plugin/README.md` for package details.
 
-The local-first `artifact_prepare`, `artifact_import`, `artifact_finalize`, and `artifact_sync` tools create project-local files and explicitly synchronize selected revisions to the cloud. Legacy artifacts remain readable for 30 days, but source revisions and publication mutations are rejected with a local-first migration response. The `artifact_adopt_legacy` tool copies a Legacy payload into an unchanged local finalized v1 without storing an Owner credential. The creator viewer supports all six MVP renderers, immutable revision selection and polling, source highlighting, copy/download, and runtime controls. Local-first public links use `/published/:token`, expose one pinned revision through Worker-mediated private R2 routes, and have no revision or creator controls. The authenticated `/inventory` view groups cloud Artifacts by project and supports separate Legacy history, Creator-link rotation, Publication lifecycle actions, confirmed cloud-copy deletion, and short-lived, single-use Owner reconnect-code issuance without reading or deleting canonical local files. The plugin's `artifact_reconnect` tool redeems a reconnect code after local protected state loss and stores a replacement Owner credential in protected state. Legacy `/shared/:token` links remain separate and expire after migration-scoped access windows.
+The local-first `artifact_prepare`, `artifact_import`, `artifact_finalize`, and `artifact_sync` tools create project-local files. `artifact_sync` explicitly synchronizes all unsynced finalized revisions in order. Legacy artifacts remain readable for 30 days, but source revisions and publication mutations are rejected with a local-first migration response. The `artifact_adopt_legacy` tool copies a Legacy payload into an unchanged local finalized v1 without storing an Owner credential. The creator viewer supports all six MVP renderers, immutable revision selection and polling, source highlighting, copy/download, and runtime controls. Local-first public links use `/published/:token`, expose one pinned revision through Worker-mediated private R2 routes, and have no revision or creator controls. The authenticated `/inventory` view groups cloud Artifacts by project and supports separate Legacy history, Creator-link rotation, Publication lifecycle actions, confirmed cloud-copy deletion, and short-lived, single-use Owner reconnect-code issuance without reading or deleting canonical local files. The plugin's `artifact_reconnect` tool redeems a reconnect code after local protected state loss and stores a replacement Owner credential in protected state. Legacy `/shared/:token` links remain separate and expire after migration-scoped access windows.
 
 To adopt a Legacy artifact, use the authenticated inventory action to issue a short-lived adoption code, then call the plugin's `artifact_adopt_legacy` tool with the Legacy ID, code, and a local slug. The code is consumed once and permits retries only for the exact bound local destination. The plugin stores only a digest-keyed checkpoint, redeems the authorized current Revision, preserves its exact source bytes, and finalizes a local v1. The original Legacy artifact remains separate and read-only. Later `artifact_sync` creates a new cloud identity with the Legacy provenance attached.
 
 ## Creation Key
 
-Production creation admission is optional in code but recommended. The Worker reads `PANES_CREATE_API_KEY`. Launch OpenCode with the matching plugin-side variable instead of putting the key in configuration:
+Production first-Sync admission is optional in code but recommended. `PANES_CREATE_API_KEY` is the admission key for first-Sync cloud-Artifact creation, not a generic artifact-creation credential. The retired `POST /api/artifacts` route returns `410 LOCAL_FIRST_REQUIRED` regardless of whether a key is supplied. The Worker reads `PANES_CREATE_API_KEY`. Launch OpenCode with the matching plugin-side variable instead of putting the key in configuration:
 
 ```sh
 OPENCODE_PANES_CREATE_API_KEY="your-key" opencode
 ```
 
-The plugin sends the key only when creating an artifact.
+The plugin sends the key only on the first Sync request that creates a cloud Artifact.
 
 ## Live Test Service
 
-The test deployment is available at `https://opencode-panes.simons.workers.dev`. Configure the plugin with that URL and provide the matching creation key through `OPENCODE_PANES_CREATE_API_KEY`. The service rejects artifact creation without the key; existing creator and public URLs use their own scoped capability tokens.
+The test deployment is available at `https://opencode-panes.simons.workers.dev`. Configure the plugin with that URL and provide the matching admission key through `OPENCODE_PANES_CREATE_API_KEY`. The service rejects first-Sync cloud-Artifact creation without the key; the retired `POST /api/artifacts` route returns 410 regardless of the key. Existing creator and public URLs use their own scoped capability tokens.
 
 ## Optional Command
 

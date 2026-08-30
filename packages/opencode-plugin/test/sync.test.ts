@@ -148,29 +148,123 @@ describe("sync and publish intent tools", () => {
     ).not.toContain("admission-key");
   });
 
-  it("passes the configured timeout to a local-first Sync request", async () => {
-    const context = toolContext();
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockRejectedValue(new Error("offline"));
-    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
-    vi.stubGlobal("fetch", fetchMock);
-    const plugin = await OpenCodePanesPlugin({} as never, {
-      apiBaseUrl: apiOrigin,
-      requestTimeoutMs: 100,
+  it("aborts a pending first Sync request at its configured timeout", async () => {
+    const prepared = await prepareAndFinalize(toolContext(), "Sync timeout", {
+      "index.html": Buffer.from("<h1>timeout</h1>"),
     });
-    const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
-    await expect(
-      definition.execute(
-        {
-          artifactId: "legacy-timeout",
-          adoptionCode: "panes-adopt-legacy-" + "a".repeat(32),
-          slug: "timeout",
-        },
-        context,
-      ),
-    ).rejects.toThrow("Could not reach the Panes API at http://127.0.0.1");
-    expect(timeoutSpy).toHaveBeenCalledWith(expect.any(Function), 100);
+    const callerController = new AbortController();
+    let releasePermission!: () => void;
+    const permission = new Promise<void>((resolve) => {
+      releasePermission = resolve;
+    });
+    let resolvePermissionRequest!: () => void;
+    const permissionRequested = new Promise<void>((resolve) => {
+      resolvePermissionRequest = resolve;
+    });
+    const ask = vi.fn(() => {
+      resolvePermissionRequest();
+      return permission;
+    });
+    const context = {
+      ...toolContext(ask),
+      abort: callerController.signal,
+    };
+    const request: { url?: URL; init?: RequestInit | undefined } = {};
+    let requestAbortListener: (() => void) | undefined;
+    let requestAbortListenerRemoved = false;
+    let resolveRequest!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      resolveRequest = resolve;
+    });
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      request.url = new URL(String(input));
+      request.init = init;
+      resolveRequest();
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) {
+          reject(new Error("Expected the request to have an abort signal"));
+          return;
+        }
+        requestAbortListener = () => {
+          signal.removeEventListener("abort", requestAbortListener!);
+          requestAbortListenerRemoved = true;
+          reject(signal.reason);
+        };
+        if (signal.aborted) requestAbortListener();
+        else
+          signal.addEventListener("abort", requestAbortListener, {
+            once: true,
+          });
+      });
+    });
+    const addCallerListener = vi.spyOn(
+      callerController.signal,
+      "addEventListener",
+    );
+    const removeCallerListener = vi.spyOn(
+      callerController.signal,
+      "removeEventListener",
+    );
+    let execution: Promise<unknown> | undefined;
+    let fakeTimersInstalled = false;
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      execution = executeSync({ artifactId: prepared.artifactId }, context, {
+        requestTimeoutMs: 100,
+      });
+      await permissionRequested;
+      expect(ask).toHaveBeenCalledOnce();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      fakeTimersInstalled = true;
+      releasePermission();
+      await requestStarted;
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(request.url?.pathname).toBe("/api/sync/artifacts");
+      expect(request.init?.headers).toMatchObject({
+        "x-panes-create-key": "admission-key",
+      });
+      expect(String(request.init?.body)).not.toContain("admission-key");
+
+      vi.advanceTimersByTime(100);
+      await expect(execution).rejects.toThrow(
+        "Panes API request timed out after 100 ms",
+      );
+      expect(request.init?.signal?.aborted).toBe(true);
+      expect(requestAbortListenerRemoved).toBe(true);
+      expect(addCallerListener).toHaveBeenCalledOnce();
+      expect(removeCallerListener).toHaveBeenCalledWith(
+        "abort",
+        addCallerListener.mock.calls[0]?.[1],
+      );
+      expect(vi.getTimerCount()).toBe(0);
+
+      const localManifestSource = await readFile(
+        join(project, "artifacts", "sync-timeout", "artifact.json"),
+        "utf8",
+      );
+      const localManifest = JSON.parse(localManifestSource) as {
+        cloud?: unknown;
+      };
+      expect(localManifest.cloud).toBeUndefined();
+      expect(localManifestSource).not.toContain("sync-owner-");
+      const stateFiles = await readdir(join(stateHome, "opencode-panes"), {
+        recursive: true,
+      });
+      expect(stateFiles.some((file) => file.includes("/sync/"))).toBe(false);
+      const timeoutError = await execution.catch((error) => error);
+      expect(String(timeoutError)).not.toContain("admission-key");
+      expect(String(timeoutError)).not.toContain("sync-owner-");
+    } finally {
+      if (execution) {
+        releasePermission();
+        if (!callerController.signal.aborted) {
+          callerController.abort(new Error("test cleanup"));
+        }
+        await execution.catch(() => undefined);
+      }
+      if (fakeTimersInstalled) vi.useRealTimers();
+    }
   });
 
   it("reconnects from the canonical local manifest after protected state loss", async () => {

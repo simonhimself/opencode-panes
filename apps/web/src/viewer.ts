@@ -15,8 +15,6 @@ import {
 } from "@opencode-panes/contracts";
 
 const SESSION_TOKEN_PREFIX = "opencode-panes:workspace-token:";
-const PUBLIC_URL_PREFIX = "opencode-panes:public-url:";
-const PUBLIC_REVISION_PREFIX = "opencode-panes:public-revision:";
 
 export type ViewerRoute =
   | { kind: "artifact"; artifactId: string }
@@ -166,66 +164,6 @@ export function parseViewerRoute(pathname: string): ViewerRoute {
 
 export function workspaceTokenStorageKey(artifactId: string): string {
   return `${SESSION_TOKEN_PREFIX}${artifactId}`;
-}
-
-export function publicUrlStorageKey(
-  artifactId: string,
-  revisionId: string,
-): string {
-  return `${PUBLIC_URL_PREFIX}${artifactId}:${revisionId}`;
-}
-
-export function storePublicUrl(
-  artifactId: string,
-  revisionId: string,
-  publicUrl: string,
-  storage: StorageLike = sessionStorage,
-): void {
-  if (!isPublicViewerUrl(publicUrl)) return;
-  const activeKey = `${PUBLIC_REVISION_PREFIX}${artifactId}`;
-  try {
-    const previousRevisionId = storage.getItem(activeKey);
-    if (previousRevisionId && previousRevisionId !== revisionId) {
-      storage.removeItem(publicUrlStorageKey(artifactId, previousRevisionId));
-    }
-    storage.setItem(publicUrlStorageKey(artifactId, revisionId), publicUrl);
-    storage.setItem(activeKey, revisionId);
-  } catch {
-    // Publishing still succeeds when storage is unavailable or full.
-  }
-}
-
-export function getStoredPublicUrl(
-  artifactId: string,
-  revisionId: string,
-  storage: StorageLike = sessionStorage,
-): string | undefined {
-  const key = publicUrlStorageKey(artifactId, revisionId);
-  try {
-    const value = storage.getItem(key);
-    if (!value) return undefined;
-    if (isPublicViewerUrl(value)) return value;
-    storage.removeItem(key);
-  } catch {
-    // Treat unavailable storage as a cache miss.
-  }
-  return undefined;
-}
-
-export function clearStoredPublicUrl(
-  artifactId: string,
-  storage: StorageLike = sessionStorage,
-): void {
-  const activeKey = `${PUBLIC_REVISION_PREFIX}${artifactId}`;
-  try {
-    const revisionId = storage.getItem(activeKey);
-    if (revisionId) {
-      storage.removeItem(publicUrlStorageKey(artifactId, revisionId));
-    }
-    storage.removeItem(activeKey);
-  } catch {
-    // Unpublish still succeeds when storage is unavailable.
-  }
 }
 
 export function createSerializedPoller<T>(
@@ -786,22 +724,6 @@ function decodeSegment(value: string | undefined): string | undefined {
     return decodeURIComponent(value);
   } catch {
     return undefined;
-  }
-}
-
-function isPublicViewerUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return (
-      (url.protocol === "http:" || url.protocol === "https:") &&
-      !url.username &&
-      !url.password &&
-      /^\/(?:shared|published)\/[^/]+\/?$/.test(url.pathname) &&
-      !url.search &&
-      !url.hash
-    );
-  } catch {
-    return false;
   }
 }
 

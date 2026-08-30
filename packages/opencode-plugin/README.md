@@ -41,7 +41,7 @@ The installed global entry defaults to `https://opencode-panes.simons.workers.de
 
 Prefer `OPENCODE_PANES_CREATE_API_KEY` over a config value. An explicit `createApiKey` option takes precedence. The key is sent only to `POST /api/sync/artifacts` and is not stored in local artifact state or returned to the model.
 
-The current test service uses `https://opencode-panes.simons.workers.dev` and requires the separately provided creation key.
+The current test service uses `https://opencode-panes.simons.workers.dev` and requires the separately provided first-Sync admission key for new cloud-Artifact creation.
 
 Every Sync requests `artifact_upload` permission for the exact API origin. Browser opening is disabled by default and uses a separate `artifact_open` permission. Sync credentials are stored atomically under `$XDG_STATE_HOME/opencode-panes`, or the platform state-directory fallback, and never appear in tool output. Local titles and kinds remain stable across revisions.
 

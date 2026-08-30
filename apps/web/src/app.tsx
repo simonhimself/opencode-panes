@@ -57,8 +57,6 @@ interface WorkspaceProps {
   artifact: Pick<Artifact, "id" | "title" | "type">;
   isPublic: boolean;
   legacy?: LegacyArtifactPresentation | { readOnly: true };
-  onPublish?: (revision: Revision) => Promise<void>;
-  onUnpublish?: () => Promise<void>;
   publishedAt?: string;
   publicUrl?: string;
   revisions: Revision[];
@@ -1092,8 +1090,6 @@ function ArtifactWorkspace({
   artifact,
   isPublic,
   legacy,
-  onPublish,
-  onUnpublish,
   publishedAt,
   publicUrl,
   revisions,
@@ -1104,7 +1100,6 @@ function ArtifactWorkspace({
   const [stopped, setStopped] = useState(false);
   const [generation, setGeneration] = useState(0);
   const [rendererError, setRendererError] = useState<string>();
-  const [busyAction, setBusyAction] = useState<string>();
   const [actionFeedback, setActionFeedback] = useState<string>();
   const selectedRevision =
     revisions.find((revision) => revision.id === selection.revisionId) ??
@@ -1122,15 +1117,6 @@ function ArtifactWorkspace({
       </EntryState>
     );
   }
-
-  const runAction = async (label: string, action: () => Promise<void>) => {
-    setBusyAction(label);
-    try {
-      await action();
-    } finally {
-      setBusyAction(undefined);
-    }
-  };
 
   const handleCopy = async () => {
     try {
@@ -1259,34 +1245,7 @@ function ArtifactWorkspace({
               <button onClick={() => void handleCopyLink()} type="button">
                 Copy link
               </button>
-            ) : legacy ? null : (
-              <>
-                <button
-                  disabled={Boolean(busyAction) || !onPublish}
-                  onClick={() =>
-                    onPublish
-                      ? void runAction("Publishing", () =>
-                          onPublish(selectedRevision),
-                        )
-                      : undefined
-                  }
-                  type="button"
-                >
-                  Publish v{selectedRevision.version}
-                </button>
-                <button
-                  disabled={Boolean(busyAction) || !onUnpublish}
-                  onClick={() =>
-                    onUnpublish
-                      ? void runAction("Unpublishing", onUnpublish)
-                      : undefined
-                  }
-                  type="button"
-                >
-                  Unpublish
-                </button>
-              </>
-            )}
+            ) : null}
           </div>
 
           <div className="runtime-group">
@@ -1321,9 +1280,7 @@ function ArtifactWorkspace({
           {publishedAt ? (
             <span>Published {formatTimestamp(publishedAt)}</span>
           ) : null}
-          {busyAction || actionFeedback ? (
-            <strong>{busyAction ?? actionFeedback}</strong>
-          ) : null}
+          {actionFeedback ? <strong>{actionFeedback}</strong> : null}
         </div>
       </header>
 

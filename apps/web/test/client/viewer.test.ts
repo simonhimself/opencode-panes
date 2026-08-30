@@ -2,21 +2,17 @@ import type { Artifact, Revision } from "@opencode-panes/contracts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   captureWorkspaceAccess,
-  clearStoredPublicUrl,
   createSerializedPoller,
   deleteInventoryArtifact,
   extendInventoryPublication,
   fetchPrivateWorkspace,
   fetchPublicArtifact,
   followCurrentRevision,
-  getStoredPublicUrl,
   parseViewerRoute,
-  publicUrlStorageKey,
   republishInventoryPublication,
   rotateInventoryCreator,
   safeDownloadFilename,
   selectRevision,
-  storePublicUrl,
   unpublishInventoryPublication,
   workspaceTokenStorageKey,
 } from "../../src/viewer";
@@ -296,35 +292,6 @@ describe("serialized polling", () => {
     pending.resolve(2);
     await poll;
     expect(apply).not.toHaveBeenCalled();
-  });
-});
-
-describe("public URL session storage", () => {
-  beforeEach(() => sessionStorage.clear());
-
-  it("keeps only the active artifact/revision URL and clears it on unpublish", () => {
-    const firstUrl = "https://panes.example/shared/first-token";
-    const secondUrl = "https://panes.example/shared/second-token";
-    storePublicUrl(ARTIFACT.id, "revision-1", firstUrl);
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-1")).toBe(firstUrl);
-
-    storePublicUrl(ARTIFACT.id, "revision-2", secondUrl);
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-1")).toBeUndefined();
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-2")).toBe(secondUrl);
-
-    clearStoredPublicUrl(ARTIFACT.id);
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-2")).toBeUndefined();
-  });
-
-  it("rejects malformed stored URLs", () => {
-    sessionStorage.setItem(
-      publicUrlStorageKey(ARTIFACT.id, "revision-1"),
-      "javascript:alert(1)",
-    );
-    expect(getStoredPublicUrl(ARTIFACT.id, "revision-1")).toBeUndefined();
-    expect(
-      sessionStorage.getItem(publicUrlStorageKey(ARTIFACT.id, "revision-1")),
-    ).toBeNull();
   });
 });
 
