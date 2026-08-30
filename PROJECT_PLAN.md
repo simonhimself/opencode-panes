@@ -106,6 +106,7 @@ artifact_finalize({
 
 artifact_sync({
   artifactId: string,
+  openCreatorAfterSuccess?: boolean,
   rotateCreatorLink?: boolean,
 })
 ```
@@ -115,6 +116,7 @@ Behavior:
 - `artifact_prepare` or `artifact_import` creates local state and never contacts Cloudflare.
 - `artifact_finalize` records a local immutable Revision and returns a local preview URL.
 - `artifact_sync` is the only new cloud creation path and uploads every unsynced finalized Revision in order, including only the files selected by the local ignore rules.
+- `artifact_sync.openCreatorAfterSuccess` defaults to `false`. When `true`, successful Sync requests opening the validated Creator URL through the separate `artifact_open` permission; Sync still returns the URL if opening is denied or fails.
 - The OpenCode `sessionID` is recorded in Sync metadata when available.
 - Adoption writes an unchanged local finalized v1; its first Sync creates a new cloud identity.
 - The source is not repeated in the tool result.
