@@ -21,29 +21,27 @@ import PanesPlugin from "file:///absolute/path/to/opencode-panes/packages/openco
 export const OpenCodePanesPlugin = async (context) =>
   PanesPlugin(context, {
     apiBaseUrl: "http://127.0.0.1:5173",
-    autoOpen: false,
     requestTimeoutMs: 15000,
   });
 ```
 
 Keep service credentials outside the loader. The plugin reads `OPENCODE_PANES_CREATE_API_KEY` when `createApiKey` is omitted for Sync admission. Restart OpenCode after changing plugins or commands.
 
-The installed global entry defaults to `https://opencode-panes.simons.workers.dev`, `autoOpen: false`, and a 15-second timeout. It reads the optional Sync admission key at runtime from `<OpenCode config directory>/secrets/opencode-panes-create-key`. The config directory uses `OPENCODE_PANES_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`, or `XDG_CONFIG_HOME/opencode`, with `~/.config/opencode` as the fallback. Set `OPENCODE_PANES_CREATE_API_KEY_FILE` to override the key path. `OPENCODE_PANES_API_BASE_URL` and plugin options can override the global API default.
+The installed global entry defaults to `https://opencode-panes.simons.workers.dev` and a 15-second timeout. It reads the optional Sync admission key at runtime from `<OpenCode config directory>/secrets/opencode-panes-create-key`. The config directory uses `OPENCODE_PANES_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`, or `XDG_CONFIG_HOME/opencode`, with `~/.config/opencode` as the fallback. Set `OPENCODE_PANES_CREATE_API_KEY_FILE` to override the key path. `OPENCODE_PANES_API_BASE_URL` and plugin options can override the global API default.
 
 ## Configuration
 
-| Option             | Type    | Default                 | Purpose                                               |
-| ------------------ | ------- | ----------------------- | ----------------------------------------------------- |
-| `apiBaseUrl`       | string  | `http://127.0.0.1:5173` | Panes API origin. Non-loopback origins require HTTPS  |
-| `createApiKey`     | string  | unset                   | Optional Sync admission key                           |
-| `autoOpen`         | boolean | `false`                 | Open a validated viewer URL after separate permission |
-| `requestTimeoutMs` | integer | `15000`                 | Request timeout from 100 to 120000 milliseconds       |
+| Option             | Type    | Default                 | Purpose                                              |
+| ------------------ | ------- | ----------------------- | ---------------------------------------------------- |
+| `apiBaseUrl`       | string  | `http://127.0.0.1:5173` | Panes API origin. Non-loopback origins require HTTPS |
+| `createApiKey`     | string  | unset                   | Optional Sync admission key                          |
+| `requestTimeoutMs` | integer | `15000`                 | Request timeout from 100 to 120000 milliseconds      |
 
 Prefer `OPENCODE_PANES_CREATE_API_KEY` over a config value. An explicit `createApiKey` option takes precedence. The key is sent only to `POST /api/sync/artifacts` and is not stored in local artifact state or returned to the model.
 
 The current test service uses `https://opencode-panes.simons.workers.dev` and requires the separately provided first-Sync admission key for new cloud-Artifact creation.
 
-Every Sync requests `artifact_upload` permission for the exact API origin. `artifact_sync` accepts `openCreatorAfterSuccess`, which defaults to `false`; when `true`, it requests opening the validated Creator URL only after Sync succeeds and still requires the separate `artifact_open` permission. Sync returns the URL even when opening is denied or fails. Browser opening is disabled by default and uses a separate `artifact_open` permission. Sync credentials are stored atomically under `$XDG_STATE_HOME/opencode-panes`, or the platform state-directory fallback, and never appear in tool output. Local titles and kinds remain stable across revisions.
+Every Sync requests `artifact_upload` permission for the exact API origin. The first Sync creates the cloud Artifact through `artifact_upload`; later Sync calls reuse the protected Owner state. `artifact_sync` accepts `openCreatorAfterSuccess`, which defaults to `false`; when `true`, it requests opening the validated Creator URL only after Sync succeeds and still requires the separate `artifact_open` permission. Sync returns the URL even when opening is denied or fails. Browser opening is disabled by default and uses a separate `artifact_open` permission. Sync credentials are stored atomically under `$XDG_STATE_HOME/opencode-panes`, or the platform state-directory fallback, and never appear in tool output. Local titles and kinds remain stable across revisions.
 
 `artifact_prepare` creates a local Artifact under `<git-worktree>/artifacts/`, or under `<session-directory>/artifacts/` when the session is not in Git. It writes `artifact.json`, a writable `draft/`, and Draft metadata without contacting Cloudflare or changing Git state. Omit `artifactId` to create a safe-slugged Artifact, or provide one to copy its latest finalized revision into a new Draft. Existing slugs and Drafts require an explicit different slug, `draftAction: "resume"`, or `draftAction: "discard"`. Repeating the same request returns the existing preparation state.
 

@@ -16,7 +16,6 @@ const hooks = await plugin(
   {},
   {
     apiBaseUrl: "http://127.0.0.1:5173",
-    autoOpen: false,
     createApiKey: "smoke-check-only",
   },
 );
@@ -56,7 +55,6 @@ const globalHooks = await globalPlugin(
   {},
   {
     apiBaseUrl: "http://127.0.0.1:5173",
-    autoOpen: false,
     requestTimeoutMs: 15000,
     createApiKey: "smoke-check-only",
   },
@@ -87,7 +85,6 @@ try {
     {},
     {
       apiBaseUrl: "http://127.0.0.1:5173",
-      autoOpen: false,
       requestTimeoutMs: 15000,
       createApiKey: "smoke-check-only",
     },

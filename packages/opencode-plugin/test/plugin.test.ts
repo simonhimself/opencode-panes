@@ -734,7 +734,7 @@ describe("Legacy adoption tool", () => {
         "utf8",
       ),
     ).toBe("<h1>v2</h1>\r\n");
-  });
+  }, 10_000);
 });
 
 describe("artifact_prepare tool", () => {

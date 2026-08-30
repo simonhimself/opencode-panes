@@ -148,6 +148,73 @@ describe("sync and publish intent tools", () => {
     ).not.toContain("admission-key");
   });
 
+  it.each([
+    [
+      "another origin",
+      (state: Record<string, unknown>) => {
+        state.creatorUrl = "https://evil.example/creator/sync-valid";
+      },
+    ],
+    [
+      "same-origin extra path",
+      (state: Record<string, unknown>) => {
+        state.creatorUrl = `${apiOrigin}/creator/sync-valid/extra`;
+      },
+    ],
+    [
+      "query",
+      (state: Record<string, unknown>) => {
+        state.creatorUrl = `${apiOrigin}/creator/sync-valid?next=https://evil.example`;
+      },
+    ],
+    [
+      "fragment",
+      (state: Record<string, unknown>) => {
+        state.creatorUrl = `${apiOrigin}/creator/sync-valid#next`;
+      },
+    ],
+    [
+      "encoded path ambiguity",
+      (state: Record<string, unknown>) => {
+        state.creatorUrl = `${apiOrigin}/creator/${encodeURIComponent("sync-valid/extra")}`;
+      },
+    ],
+    [
+      "malicious inventory URL",
+      (state: Record<string, unknown>) => {
+        state.inventoryUrl = "https://evil.example/inventory";
+      },
+    ],
+  ])(
+    "rejects persisted Sync state with %s before reuse",
+    async (_name, tamper) => {
+      const context = toolContext();
+      const prepared = await prepareAndFinalize(context, "Tampered state", {
+        "index.html": Buffer.from("<h1>one</h1>"),
+      });
+      await executeSync({ artifactId: prepared.artifactId }, context);
+      const statePath = await onlyStateFile();
+      const state = JSON.parse(await readFile(statePath, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      tamper(state);
+      await writeFile(statePath, JSON.stringify(state));
+      const tamperedBytes = await readFile(statePath);
+      requests = [];
+      const ask = vi.fn<ToolContext["ask"]>(async () => undefined);
+
+      await expect(
+        executeSync({ artifactId: prepared.artifactId }, toolContext(ask)),
+      ).rejects.toThrow(
+        "Protected Sync state is invalid. Restore the protected Panes state before retrying.",
+      );
+      expect(requests).toEqual([]);
+      expect(ask).not.toHaveBeenCalled();
+      expect(await readFile(statePath)).toEqual(tamperedBytes);
+    },
+  );
+
   it("aborts a pending first Sync request at its configured timeout", async () => {
     const prepared = await prepareAndFinalize(toolContext(), "Sync timeout", {
       "index.html": Buffer.from("<h1>timeout</h1>"),
@@ -858,6 +925,40 @@ describe("sync and publish intent tools", () => {
     expect(
       requests.filter(({ path }) => path === "/api/sync/artifacts"),
     ).toHaveLength(0);
+  });
+
+  it("rejects a tampered identity checkpoint before state recovery", async () => {
+    const context = toolContext();
+    const prepared = await prepareAndFinalize(context, "Tampered checkpoint", {
+      "index.html": Buffer.from("<h1>one</h1>"),
+    });
+    await expect(
+      executeSync({ artifactId: prepared.artifactId }, context, {
+        failureInjector: (phase) => {
+          if (phase === "sync-after-ownership")
+            throw new Error("simulated crash");
+        },
+      }),
+    ).rejects.toThrow("simulated crash");
+
+    const checkpointPath = await onlyStateFile();
+    const checkpoint = JSON.parse(
+      await readFile(checkpointPath, "utf8"),
+    ) as Record<string, unknown>;
+    checkpoint.creatorUrl = `${apiOrigin}/creator/${encodeURIComponent("sync-valid/extra")}`;
+    await writeFile(checkpointPath, JSON.stringify(checkpoint));
+    const tamperedBytes = await readFile(checkpointPath);
+    requests = [];
+    const ask = vi.fn<ToolContext["ask"]>(async () => undefined);
+
+    await expect(
+      executeSync({ artifactId: prepared.artifactId }, toolContext(ask)),
+    ).rejects.toThrow(
+      "Protected Sync state is invalid. Restore the protected Panes state before retrying.",
+    );
+    expect(requests).toEqual([]);
+    expect(ask).not.toHaveBeenCalled();
+    expect(await readFile(checkpointPath)).toEqual(tamperedBytes);
   });
 
   it("uses a fresh session after a successful release", async () => {

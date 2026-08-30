@@ -66,6 +66,7 @@ import {
   legacyAdoptionProvenanceSchema,
   legacyAdoptionRedeemResponseSchema,
   syncReconnectResponseSchema,
+  workspaceTokenSchema,
   type ArtifactManifest,
   type ArtifactFile,
   type ArtifactType,
@@ -97,15 +98,12 @@ export interface PanesPluginOptions {
   apiBaseUrl?: string;
   /** Optional admission key for creating artifacts on a protected Panes API. */
   createApiKey?: string;
-  /** Open the viewer after a successful upload. Requires a separate permission. */
-  autoOpen?: boolean;
   /** Abort API requests after this many milliseconds. */
   requestTimeoutMs?: number;
 }
 
 interface ResolvedOptions {
   apiBaseUrl: URL;
-  autoOpen: boolean;
   createApiKey?: string;
   requestTimeoutMs: number;
   failureInjector?: (phase: string) => void;
@@ -134,7 +132,7 @@ interface SyncCheckpoint extends StoredSyncState {
   creatorToken: string;
 }
 
-type AutoOpenStatus = "disabled" | "opened" | "permission-denied" | "failed";
+type CreatorOpenStatus = "disabled" | "opened" | "permission-denied" | "failed";
 
 export const OpenCodePanesPlugin: Plugin = async (_input, pluginOptions) => {
   const options = resolveOptions(pluginOptions);
@@ -2250,7 +2248,7 @@ interface SyncResult {
   creatorLinkStatus: "available" | "unavailable";
   inventoryUrl: string;
   creatorExpiresAt: string;
-  openCreatorAfterSuccess: AutoOpenStatus;
+  openCreatorAfterSuccess: CreatorOpenStatus;
 }
 
 interface FinalizationJournal {
@@ -2494,7 +2492,11 @@ async function syncLocalArtifact(
     artifact.manifest.projectId,
     artifact.manifest.artifactId,
   );
+  if (state) validatePersistedSyncState(state, options.apiBaseUrl.origin);
   let checkpoint = await readSyncCheckpoint(checkpointPath);
+  if (checkpoint && checkpoint.phase !== "planned") {
+    validatePersistedSyncState(checkpoint, options.apiBaseUrl.origin);
+  }
   if (checkpoint?.sessionId) syncSession = checkpoint.sessionId;
   else if (state?.sessionId) syncSession = state.sessionId;
   if (checkpoint && !checkpoint.sessionId) {
@@ -2522,6 +2524,7 @@ async function syncLocalArtifact(
       }
       if (checkpoint.phase === "identity") {
         state = syncStateFromCheckpoint(checkpoint, syncSession);
+        validatePersistedSyncState(state, options.apiBaseUrl.origin);
         await writeSyncState(state);
       }
     }
@@ -2856,7 +2859,8 @@ async function syncLocalArtifact(
   const pendingVersions = artifact.manifest.revisions
     .map((candidate) => candidate.version)
     .filter((version) => !state.syncedRevisionVersions.includes(version));
-  const autoOpenStatus = await maybeOpenViewer(
+  validatePersistedSyncState(state, options.apiBaseUrl.origin);
+  const creatorOpenStatus = await maybeOpenViewer(
     state.creatorUrl,
     context,
     openCreatorAfterSuccess,
@@ -2871,7 +2875,7 @@ async function syncLocalArtifact(
     creatorLinkStatus: state.creatorLinkStatus ?? "available",
     inventoryUrl: state.inventoryUrl,
     creatorExpiresAt: state.creatorExpiresAt,
-    openCreatorAfterSuccess: autoOpenStatus,
+    openCreatorAfterSuccess: creatorOpenStatus,
   });
 }
 
@@ -5098,11 +5102,6 @@ function resolveOptions(
     );
   }
 
-  const autoOpenValue = options?.autoOpen ?? false;
-  if (typeof autoOpenValue !== "boolean") {
-    throw new Error("Panes plugin option autoOpen must be a boolean");
-  }
-
   const createApiKeyValue =
     options?.createApiKey ?? process.env.OPENCODE_PANES_CREATE_API_KEY;
   if (
@@ -5139,7 +5138,6 @@ function resolveOptions(
 
   return {
     apiBaseUrl,
-    autoOpen: autoOpenValue,
     ...(createApiKeyValue ? { createApiKey: createApiKeyValue } : {}),
     requestTimeoutMs: requestTimeoutMsValue,
     ...(failureInjector ? { failureInjector } : {}),
@@ -5167,8 +5165,9 @@ async function releaseLocalSyncLease(
       existing.manifest.projectId,
       existing.manifest.artifactId,
     );
+    if (state) validatePersistedSyncState(state, options.apiBaseUrl.origin);
   } catch {
-    state = undefined;
+    return;
   }
   let cloudArtifactId = state?.cloudArtifactId;
   let ownerCredential = state?.ownerCredential;
@@ -5182,6 +5181,9 @@ async function releaseLocalSyncLease(
         existing.manifest.artifactId,
       ),
     );
+    if (checkpoint && checkpoint.phase !== "planned") {
+      validatePersistedSyncState(checkpoint, options.apiBaseUrl.origin);
+    }
   } catch {
     return;
   }
@@ -5320,9 +5322,9 @@ function validationError(message = "Artifact input is invalid") {
 async function maybeOpenViewer(
   viewerUrl: string | undefined,
   context: ToolContext,
-  autoOpen: boolean,
-): Promise<AutoOpenStatus> {
-  if (!autoOpen) return "disabled";
+  shouldOpen: boolean,
+): Promise<CreatorOpenStatus> {
+  if (!shouldOpen) return "disabled";
   if (!viewerUrl) return "failed";
 
   let url: URL;
@@ -5457,6 +5459,26 @@ function reconnectToolResult(input: {
 }
 
 function validateCreatorUrl(value: unknown, apiOrigin: string, token: string) {
+  const parsedToken = workspaceTokenSchema.safeParse(token);
+  if (!parsedToken.success) throw malformedSuccessResponse();
+  return parseCreatorUrl(value, apiOrigin, parsedToken.data);
+}
+
+function validatePersistedSyncState(
+  state: Pick<StoredSyncState, "creatorUrl" | "inventoryUrl">,
+  apiOrigin: string,
+) {
+  try {
+    if (state.creatorUrl) parseCreatorUrl(state.creatorUrl, apiOrigin);
+    validateInventoryUrl(state.inventoryUrl, apiOrigin);
+  } catch {
+    throw new Error(
+      "Protected Sync state is invalid. Restore the protected Panes state before retrying.",
+    );
+  }
+}
+
+function parseCreatorUrl(value: unknown, apiOrigin: string, token?: string) {
   if (typeof value !== "string") throw malformedSuccessResponse();
   let url: URL;
   try {
@@ -5466,11 +5488,31 @@ function validateCreatorUrl(value: unknown, apiOrigin: string, token: string) {
   }
   if (
     url.origin !== apiOrigin ||
+    !isAllowedApiUrlProtocol(url) ||
     url.username ||
     url.password ||
     url.search ||
     url.hash ||
-    url.pathname !== `/creator/${encodeURIComponent(token)}`
+    !url.pathname.startsWith("/creator/")
+  ) {
+    throw malformedSuccessResponse();
+  }
+  const encodedToken = url.pathname.slice("/creator/".length);
+  if (!encodedToken || encodedToken.includes("/")) {
+    throw malformedSuccessResponse();
+  }
+  let decodedToken: string;
+  try {
+    decodedToken = decodeURIComponent(encodedToken);
+  } catch {
+    throw malformedSuccessResponse();
+  }
+  if (
+    decodedToken.includes("/") ||
+    decodedToken.includes("\\") ||
+    encodeURIComponent(decodedToken) !== encodedToken ||
+    !workspaceTokenSchema.safeParse(decodedToken).success ||
+    (token !== undefined && decodedToken !== token)
   ) {
     throw malformedSuccessResponse();
   }
@@ -5487,6 +5529,7 @@ function validateInventoryUrl(value: unknown, apiOrigin: string) {
   }
   if (
     url.origin !== apiOrigin ||
+    !isAllowedApiUrlProtocol(url) ||
     url.username ||
     url.password ||
     url.search ||
@@ -5496,6 +5539,13 @@ function validateInventoryUrl(value: unknown, apiOrigin: string) {
     throw malformedSuccessResponse();
   }
   return url.href;
+}
+
+function isAllowedApiUrlProtocol(url: URL) {
+  return (
+    url.protocol === "https:" ||
+    (url.protocol === "http:" && isLoopbackHost(url))
+  );
 }
 
 async function writeSyncState(state: StoredSyncState) {
