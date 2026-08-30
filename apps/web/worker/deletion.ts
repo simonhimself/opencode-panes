@@ -119,18 +119,49 @@ export async function deleteLegacyInventoryArtifact(
     "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'legacy_adoption_grants'",
   ).first<{ present: number }>();
   if (adoptionTable) {
-    await env.DB.batch([
+    const now = new Date().toISOString();
+    await env.DB.prepare(
+      `DELETE FROM legacy_adoption_grants
+        WHERE legacy_artifact_id = ? AND expires_at <= ?`,
+    )
+      .bind(artifactId, now)
+      .run();
+    const activeAdoption = await env.DB.prepare(
+      `SELECT 1 AS present FROM legacy_adoption_grants
+        WHERE legacy_artifact_id = ? AND consumed_at IS NOT NULL
+          AND revoked_at IS NULL AND expires_at > ?`,
+    )
+      .bind(artifactId, now)
+      .first<{ present: number }>();
+    if (activeAdoption) {
+      return errorResponse(
+        409,
+        "A local adoption is in progress; retry deletion after Sync or code expiry",
+      );
+    }
+    const results = await env.DB.batch([
       env.DB.prepare(
-        // A consumed, bound grant may be needed to finish its local-first
-        // Sync after the Legacy source disappears. Its expiry remains the
-        // bound on that in-progress handoff.
         `UPDATE legacy_adoption_grants
             SET revoked_at = ?
           WHERE legacy_artifact_id = ? AND consumed_at IS NULL
             AND revoked_at IS NULL`,
-      ).bind(new Date().toISOString(), artifactId),
-      env.DB.prepare("DELETE FROM artifacts WHERE id = ?").bind(artifactId),
+      ).bind(now, artifactId),
+      env.DB.prepare(
+        `DELETE FROM artifacts
+          WHERE id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM legacy_adoption_grants
+               WHERE legacy_artifact_id = ? AND consumed_at IS NOT NULL
+                 AND revoked_at IS NULL AND expires_at > ?
+            )`,
+      ).bind(artifactId, artifactId, now),
     ]);
+    if (results[1]?.meta.changes === 0) {
+      return errorResponse(
+        409,
+        "A local adoption is in progress; retry deletion after Sync or code expiry",
+      );
+    }
   } else {
     await env.DB.prepare("DELETE FROM artifacts WHERE id = ?")
       .bind(artifactId)

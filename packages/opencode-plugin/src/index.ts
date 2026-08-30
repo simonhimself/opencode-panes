@@ -17,6 +17,7 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -91,6 +92,8 @@ const IMPORT_JOURNAL_FILE_NAME = ".panes-import.json";
 const ARTIFACT_LOCK_FILE_NAME = ".panes-lock.json";
 const IMPORT_RECEIPT_TTL_MS = 5 * 60 * 1000;
 const ADOPTION_RESULT_TTL_MS = 5 * 60 * 1000;
+const MAX_ADOPTION_RESULTS = 16;
+const MALFORMED_LOCK_STALE_THRESHOLD_MS = 60 * 1000;
 const PREVIEW_FRAME_PATH = "__panes__/frame";
 const execFileAsync = promisify(execFile);
 const PROCESS_OWNER_ID = randomUUID();
@@ -824,20 +827,13 @@ async function adoptLegacyArtifact(
     );
 
   const codeDigest = sha256(adoptionCode.data);
-  const git = await inspectGit(context.directory);
-  const artifactRoot = join(
-    git ? context.worktree : context.directory,
-    "artifacts",
-  );
-  const operationKey = `${resolve(artifactRoot)}:${codeDigest}`;
+  const operationKey = `${options.apiBaseUrl.origin}:${codeDigest}`;
+  // Serialize the global checkpoint before taking the destination lock.
+  // Every adoption follows this order to avoid cross-project deadlocks.
   return withOperationLock(
     adoptionLocks,
     operationKey,
-    adoptionOperationLockPath(
-      options.apiBaseUrl.origin,
-      resolve(artifactRoot),
-      codeDigest,
-    ),
+    adoptionOperationLockPath(options.apiBaseUrl.origin, codeDigest),
     async () => {
       const project = await resolveLocalProject(context);
       await mkdir(project.artifactRoot, { recursive: true });
@@ -846,6 +842,7 @@ async function adoptLegacyArtifact(
         codeDigest,
       );
       let checkpoint = await readAdoptionCheckpoint(checkpointPath);
+      sweepAdoptionResults(adoptionResults);
       if (!checkpoint) {
         const cached = adoptionResults.get(operationKey);
         if (cached && cached.expiresAt > Date.now()) {
@@ -917,6 +914,7 @@ async function adoptLegacyArtifact(
                 checkpoint,
                 expiresAt: Date.now() + ADOPTION_RESULT_TTL_MS,
               });
+              sweepAdoptionResults(adoptionResults);
               await unlinkAdoptionCheckpoint(checkpointPath);
               return reopenExistingArtifact(
                 artifact,
@@ -1072,6 +1070,7 @@ async function adoptLegacyArtifact(
             checkpoint,
             expiresAt: Date.now() + ADOPTION_RESULT_TTL_MS,
           });
+          sweepAdoptionResults(adoptionResults);
           await unlinkAdoptionCheckpoint(checkpointPath);
           return finalized;
         });
@@ -4182,6 +4181,20 @@ interface ArtifactFileLock {
   release: () => Promise<void>;
 }
 
+interface MalformedArtifactLock {
+  malformed: true;
+  mtimeMs: number;
+}
+
+interface ArtifactLockData {
+  schemaVersion: 1;
+  pid: number;
+  ownerId: string;
+  createdAt: string;
+}
+
+type ReadArtifactLock = ArtifactLockData | MalformedArtifactLock;
+
 async function acquireExclusiveFileLock(
   path: string,
   description: string,
@@ -4206,19 +4219,19 @@ async function acquireExclusiveFileLock(
       }
       return {
         release: async () => {
-          let current: unknown;
-          try {
-            current = JSON.parse(await readFile(path, "utf8"));
-          } catch (error) {
-            if (isNodeError(error) && error.code === "ENOENT") return;
-            throw error;
-          }
+          const current = await readArtifactLock(path);
           if (isArtifactLock(current, lock)) await unlink(path);
         },
       };
     } catch (error) {
       if (!(isNodeError(error) && error.code === "EEXIST")) throw error;
       const current = await readArtifactLock(path);
+      if (current && "malformed" in current) {
+        if (Date.now() - current.mtimeMs < MALFORMED_LOCK_STALE_THRESHOLD_MS) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          continue;
+        }
+      }
       if (isArtifactLockLive(current)) {
         if (options.waitForLive) {
           await new Promise((resolve) => setTimeout(resolve, 25));
@@ -4243,17 +4256,25 @@ async function acquireExclusiveFileLock(
   }
 }
 
-async function readArtifactLock(path: string) {
-  let value: unknown;
+async function readArtifactLock(
+  path: string,
+): Promise<ReadArtifactLock | undefined> {
+  let metadata: Awaited<ReturnType<typeof stat>>;
   try {
-    value = JSON.parse(await readFile(path, "utf8"));
+    metadata = await stat(path);
   } catch (error) {
     if (isNodeError(error) && error.code === "ENOENT") return undefined;
-    throw new Error(`Artifact lock at ${path} is malformed.`);
+    throw error;
   }
-  if (!isArtifactLock(value))
-    throw new Error(`Artifact lock at ${path} is invalid.`);
-  return value;
+  try {
+    const value = JSON.parse(await readFile(path, "utf8"));
+    return isArtifactLock(value)
+      ? value
+      : { malformed: true, mtimeMs: metadata.mtimeMs };
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    return { malformed: true, mtimeMs: metadata.mtimeMs };
+  }
 }
 
 function isArtifactLock(
@@ -4286,17 +4307,8 @@ function isArtifactLock(
   );
 }
 
-function isArtifactLockLive(
-  lock:
-    | {
-        schemaVersion: 1;
-        pid: number;
-        ownerId: string;
-        createdAt: string;
-      }
-    | undefined,
-) {
-  if (!lock) return false;
+function isArtifactLockLive(lock: ReadArtifactLock | undefined) {
+  if (!lock || "malformed" in lock) return false;
   try {
     process.kill(lock.pid, 0);
     return true;
@@ -5827,6 +5839,28 @@ async function unlinkAdoptionCheckpoint(path: string): Promise<void> {
   }
 }
 
+function sweepAdoptionResults(
+  cache: Map<string, { checkpoint: AdoptionCheckpoint; expiresAt: number }>,
+): void {
+  const now = Date.now();
+  for (const [key, value] of cache) {
+    if (value.expiresAt <= now) cache.delete(key);
+  }
+  while (cache.size > MAX_ADOPTION_RESULTS) {
+    const oldest = [...cache.entries()].reduce(
+      (candidate, entry) =>
+        !candidate || entry[1].expiresAt < candidate[1].expiresAt
+          ? entry
+          : candidate,
+      undefined as
+        | [string, { checkpoint: AdoptionCheckpoint; expiresAt: number }]
+        | undefined,
+    );
+    if (!oldest) return;
+    cache.delete(oldest[0]);
+  }
+}
+
 function isAdoptionCheckpoint(value: unknown): value is AdoptionCheckpoint {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const checkpoint = value as Record<string, unknown>;
@@ -6134,17 +6168,13 @@ function adoptionCheckpointPath(apiOrigin: string, codeDigest: string) {
   );
 }
 
-function adoptionOperationLockPath(
-  apiOrigin: string,
-  projectKey: string,
-  codeDigest: string,
-) {
+function adoptionOperationLockPath(apiOrigin: string, codeDigest: string) {
   return join(
     stateRootDirectory(),
     "origins",
     sha256(apiOrigin),
     "adoptions",
-    `${sha256(projectKey)}-${codeDigest}.lock`,
+    `${codeDigest}.lock`,
   );
 }
 

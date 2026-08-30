@@ -463,6 +463,177 @@ describe("artifact tool", () => {
     ).toBe("<h1>concurrent</h1>\r\n");
   });
 
+  it("serializes the global adoption checkpoint across project roots", async () => {
+    const firstRepository = await gitRepository("git@example.com:first.git");
+    const secondRepository = await gitRepository("git@example.com:second.git");
+    let releaseFirstRedemption!: () => void;
+    let firstRedemptionStarted!: () => void;
+    const firstStarted = new Promise<void>(
+      (resolve) => (firstRedemptionStarted = resolve),
+    );
+    const release = new Promise<void>(
+      (resolve) => (releaseFirstRedemption = resolve),
+    );
+    let requestCount = 0;
+    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+      const request = JSON.parse(String(init?.body)) as {
+        apiOrigin: string;
+        localProjectId: string;
+        localArtifactId: string;
+        slug: string;
+      };
+      requestCount += 1;
+      if (requestCount === 1) {
+        firstRedemptionStarted();
+        await release;
+      }
+      return jsonResponse({
+        operation: "legacy-adopted",
+        apiOrigin: request.apiOrigin,
+        localProjectId: request.localProjectId,
+        localArtifactId: request.localArtifactId,
+        slug: request.slug,
+        title: "Cross-project adoption",
+        type: "html",
+        source: "<h1>cross-project</h1>",
+        provenance: {
+          grantId: "adoption-grant-cross-project",
+          localProjectId: request.localProjectId,
+          localArtifactId: request.localArtifactId,
+          localSlug: request.slug,
+          legacyArtifactId: "legacy-cross-project",
+          legacyRevisionId: "revision-cross-project",
+          legacyRevisionVersion: 1,
+          legacyTitle: "Cross-project adoption",
+          legacyType: "html",
+        },
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const plugin = await OpenCodePanesPlugin(
+      {} as Parameters<typeof OpenCodePanesPlugin>[0],
+      {},
+    );
+    const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
+    const args = {
+      artifactId: "legacy-cross-project",
+      adoptionCode: "panes-adopt-legacy-" + "9".repeat(32),
+      slug: "cross-project",
+    };
+    const first = definition.execute(
+      args,
+      toolContext({
+        directory: firstRepository,
+        worktree: firstRepository,
+      }).context,
+    );
+    await firstStarted;
+    const second = definition.execute(
+      args,
+      toolContext({
+        directory: secondRepository,
+        worktree: secondRepository,
+      }).context,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    releaseFirstRedemption();
+    const results = await Promise.allSettled([first, second]);
+    expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(
+      1,
+    );
+    expect(results.filter(({ status }) => status === "rejected")).toHaveLength(
+      1,
+    );
+    const rejection = results.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    );
+    expect(rejection?.reason).toMatchObject({
+      message: expect.stringContaining("already bound"),
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(
+      await stat(join(firstRepository, "artifacts", "cross-project", "v1")),
+    ).toMatchObject({ isDirectory: expect.any(Function) });
+    await expect(
+      stat(join(secondRepository, "artifacts", "cross-project")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("sweeps expired completed adoptions and evicts the oldest cache entry", async () => {
+    vi.useFakeTimers();
+    try {
+      const repository = await gitRepository();
+      const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+        const request = JSON.parse(String(init?.body)) as {
+          apiOrigin: string;
+          localProjectId: string;
+          localArtifactId: string;
+          slug: string;
+        };
+        return jsonResponse({
+          operation: "legacy-adopted",
+          apiOrigin: request.apiOrigin,
+          localProjectId: request.localProjectId,
+          localArtifactId: request.localArtifactId,
+          slug: request.slug,
+          title: request.slug,
+          type: "html",
+          source: `<h1>${request.slug}</h1>`,
+          provenance: {
+            grantId: `adoption-grant-${request.slug}`,
+            localProjectId: request.localProjectId,
+            localArtifactId: request.localArtifactId,
+            localSlug: request.slug,
+            legacyArtifactId: `legacy-${request.slug}`,
+            legacyRevisionId: `revision-${request.slug}`,
+            legacyRevisionVersion: 1,
+            legacyTitle: request.slug,
+            legacyType: "html",
+          },
+        });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const plugin = await OpenCodePanesPlugin(
+        {} as Parameters<typeof OpenCodePanesPlugin>[0],
+        {},
+      );
+      const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
+      const argsFor = (index: number) => ({
+        artifactId: `legacy-cache-${index}`,
+        adoptionCode: `panes-adopt-legacy-${index.toString(16).padStart(2, "0")}${"a".repeat(30)}`,
+        slug: `cache-${index}`,
+      });
+      for (let index = 0; index < 17; index += 1) {
+        await definition.execute(
+          argsFor(index),
+          toolContext({ directory: repository, worktree: repository }).context,
+        );
+      }
+      const callsAfterInitialAdoptions = fetchMock.mock.calls.length;
+      await expect(
+        definition.execute(
+          argsFor(0),
+          toolContext({ directory: repository, worktree: repository }).context,
+        ),
+      ).rejects.toThrow("does not match its checkpoint");
+      await definition.execute(
+        argsFor(1),
+        toolContext({ directory: repository, worktree: repository }).context,
+      );
+      expect(fetchMock).toHaveBeenCalledTimes(callsAfterInitialAdoptions);
+
+      vi.setSystemTime(Date.now() + 5 * 60 * 1000 + 1);
+      await expect(
+        definition.execute(
+          argsFor(1),
+          toolContext({ directory: repository, worktree: repository }).context,
+        ),
+      ).rejects.toThrow("does not match its checkpoint");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("maps every Legacy renderer to a finalized exact-byte local v1 preview", async () => {
     const repository = await gitRepository();
     const cases = [

@@ -1135,7 +1135,42 @@ describe("authenticated cloud inventory", () => {
       env,
       originalId,
     );
-    expect(response.status).toBe(204);
+    expect(response.status).toBe(409);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM artifacts WHERE id = ?")
+        .bind(originalId)
+        .first(),
+    ).not.toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT revoked_at FROM legacy_adoption_grants WHERE id = ?",
+      )
+        .bind("adoption-grant-unconsumed")
+        .first<{ revoked_at: string | null }>(),
+    ).toEqual({ revoked_at: null });
+    expect(
+      await env.DB.prepare(
+        "SELECT revoked_at FROM legacy_adoption_grants WHERE id = ?",
+      )
+        .bind("adoption-grant-consumed")
+        .first<{ revoked_at: string | null }>(),
+    ).toEqual({ revoked_at: null });
+
+    await env.DB.prepare("DELETE FROM legacy_adoption_grants WHERE id = ?")
+      .bind("adoption-grant-consumed")
+      .run();
+    const afterSync = await deleteLegacyInventoryArtifact(
+      new Request(`${ORIGIN}/api/inventory/legacy/artifacts/${originalId}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          confirmation: cloudDeletionConfirmation("Preserve me"),
+        }),
+      }),
+      env,
+      originalId,
+    );
+    expect(afterSync.status).toBe(204);
     expect(
       await env.DB.prepare("SELECT 1 FROM artifacts WHERE id = ?")
         .bind(originalId)
@@ -1154,7 +1189,7 @@ describe("authenticated cloud inventory", () => {
       )
         .bind("adoption-grant-consumed")
         .first<{ revoked_at: string | null }>(),
-    ).toEqual({ revoked_at: null });
+    ).toBeNull();
     expect(
       await env.DB.prepare(
         "SELECT local_slug FROM legacy_adoption_provenance WHERE cloud_artifact_id = ?",
@@ -1162,6 +1197,38 @@ describe("authenticated cloud inventory", () => {
         .bind("cloud-artifact-preserved")
         .first<{ local_slug: string }>(),
     ).toEqual({ local_slug: "preserved-artifact" });
+  });
+
+  it("deletes a Legacy artifact after an expired consumed adoption is cleaned up", async () => {
+    const expired = await seedAdoptionGrant("deletion-expired", {
+      consumed: true,
+      expiresAt: "2020-01-01T00:00:00.000Z",
+    });
+    const response = await deleteLegacyInventoryArtifact(
+      new Request(
+        `${ORIGIN}/api/inventory/legacy/artifacts/${expired.artifactId}`,
+        {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            confirmation: cloudDeletionConfirmation("Adoption fixture"),
+          }),
+        },
+      ),
+      env,
+      expired.artifactId,
+    );
+    expect(response.status).toBe(204);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM artifacts WHERE id = ?")
+        .bind(expired.artifactId)
+        .first(),
+    ).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT 1 FROM legacy_adoption_grants WHERE id = ?")
+        .bind(expired.grantId)
+        .first(),
+    ).toBeNull();
   });
 
   it("rejects recovery confirmation and deleting Artifacts without disclosing metadata", async () => {

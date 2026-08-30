@@ -4,6 +4,7 @@ import {
   readdir,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -192,6 +193,57 @@ describe("local artifact discovery and recovery", () => {
       "artifact_prepare",
       { artifactId },
       toolContext(),
+    );
+    expect(metadata(recovered).operation).toBe("prepared");
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("waits on fresh partial locks and reclaims only stale malformed locks", async () => {
+    const context = toolContext();
+    const prepared = await execute(
+      "artifact_prepare",
+      { title: "Malformed lock" },
+      context,
+    );
+    const artifactId = metadata(prepared).artifactId as string;
+    await writeFile(
+      join(metadata(prepared).draftPath as string, "index.html"),
+      "<h1>one</h1>",
+    );
+    await execute(
+      "artifact_finalize",
+      { artifactId, entryPath: "index.html", adapter: "browser" },
+      context,
+    );
+    const lockPath = join(
+      project,
+      "artifacts",
+      "malformed-lock",
+      ".panes-lock.json",
+    );
+
+    await writeFile(lockPath, "");
+    let settled = false;
+    const waiting = execute(
+      "artifact_prepare",
+      { artifactId },
+      context,
+    ).finally(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(settled).toBe(false);
+    await rm(lockPath);
+    await waiting;
+    expect(settled).toBe(true);
+
+    await writeFile(lockPath, "{");
+    const stale = new Date(Date.now() - 2 * 60 * 1000);
+    await utimes(lockPath, stale, stale);
+    const recovered = await execute(
+      "artifact_prepare",
+      { artifactId },
+      context,
     );
     expect(metadata(recovered).operation).toBe("prepared");
     await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
