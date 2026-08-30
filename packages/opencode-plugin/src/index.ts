@@ -4763,12 +4763,30 @@ function installMermaidDom(dom: ReturnType<typeof parseHTML>) {
     getComputedTextLength?: () => number;
   };
   if (!svgPrototype.getBBox) {
-    svgPrototype.getBBox = () => ({
-      height: 20,
-      width: 100,
-      x: 0,
-      y: 0,
-    });
+    svgPrototype.getBBox = function () {
+      const classNames = this.getAttribute("class")?.split(/\s+/u) ?? [];
+      const isLabel = this.localName === "text" || classNames.includes("label");
+      if (isLabel) {
+        // LinkeDOM has no text layout. This estimate gives Mermaid enough
+        // information to size nodes without pretending to match browser fonts.
+        const rows = Array.from(this.querySelectorAll("tspan.row"))
+          .map((row) => row.textContent?.trim() ?? "")
+          .filter(Boolean);
+        const lines = rows.length > 0 ? rows : [this.textContent?.trim() ?? ""];
+        return {
+          height: Math.max(20, lines.length * 20),
+          width: Math.max(8, ...lines.map((line) => line.length * 8)),
+          x: 0,
+          y: 0,
+        };
+      }
+      return {
+        height: 20,
+        width: 100,
+        x: 0,
+        y: 0,
+      };
+    };
   }
   if (!svgPrototype.getComputedTextLength) {
     svgPrototype.getComputedTextLength = function () {
@@ -4817,8 +4835,442 @@ function sanitizeMermaidSvg(
   if (root.localName !== "svg" || document.querySelector("parsererror")) {
     throw new Error("Mermaid renderer did not produce one valid SVG root");
   }
+  preserveMermaidPresentation(root);
+  enforceMermaidSvgSafety(root);
+  expandMermaidSvgViewBox(root);
+  enforceMermaidSvgSafety(root);
   root.setAttribute("data-renderer", "mermaid");
   return root.toString();
+}
+
+const SAFE_MERMAID_PRESENTATION_ATTRIBUTES = new Set([
+  "color",
+  "fill",
+  "fill-opacity",
+  "font-family",
+  "font-size",
+  "font-style",
+  "font-weight",
+  "opacity",
+  "stroke",
+  "stroke-dasharray",
+  "stroke-linecap",
+  "stroke-linejoin",
+  "stroke-opacity",
+  "stroke-width",
+  "text-anchor",
+]);
+
+const FORBIDDEN_MERMAID_SVG_TAGS = new Set([
+  "animate",
+  "animatecolor",
+  "animatemotion",
+  "animatetransform",
+  "audio",
+  "discard",
+  "embed",
+  "foreignobject",
+  "iframe",
+  "mpath",
+  "object",
+  "script",
+  "set",
+  "style",
+  "video",
+]);
+
+function preserveMermaidPresentation(root: Element) {
+  for (const element of [root, ...Array.from(root.querySelectorAll("*"))]) {
+    const style = element.getAttribute("style");
+    if (!style) continue;
+    for (const declaration of style.split(";")) {
+      const separator = declaration.indexOf(":");
+      if (separator < 1) continue;
+      const property = declaration.slice(0, separator).trim().toLowerCase();
+      const value = declaration
+        .slice(separator + 1)
+        .replace(/\s*!important\s*$/iu, "")
+        .trim();
+      if (
+        SAFE_MERMAID_PRESENTATION_ATTRIBUTES.has(property) &&
+        isSafeMermaidPresentationValue(value)
+      ) {
+        element.setAttribute(property, value);
+      }
+    }
+  }
+
+  for (const shape of root.querySelectorAll(
+    ".node rect, .node circle, .node ellipse, .node polygon",
+  )) {
+    if (!shape.hasAttribute("fill")) shape.setAttribute("fill", "#f4eedc");
+    if (!shape.hasAttribute("stroke")) shape.setAttribute("stroke", "#171717");
+  }
+  for (const text of root.querySelectorAll("text")) {
+    if (!text.hasAttribute("fill")) text.setAttribute("fill", "#171717");
+  }
+  for (const text of root.querySelectorAll(".node .label text")) {
+    if (!text.hasAttribute("text-anchor")) {
+      text.setAttribute("text-anchor", "middle");
+    }
+  }
+  for (const path of root.querySelectorAll(
+    ".edgePath path, path.flowchart-link",
+  )) {
+    if (!path.hasAttribute("fill")) path.setAttribute("fill", "none");
+    if (!path.hasAttribute("stroke")) path.setAttribute("stroke", "#171717");
+  }
+  for (const marker of root.querySelectorAll("marker path")) {
+    if (!marker.hasAttribute("fill")) marker.setAttribute("fill", "#171717");
+    if (!marker.hasAttribute("stroke")) {
+      marker.setAttribute("stroke", "#171717");
+    }
+  }
+}
+
+function isSafeMermaidPresentationValue(value: string) {
+  return (
+    value.length > 0 &&
+    value.length <= 256 &&
+    /^[#(),.%\w\s+-]+$/u.test(value) &&
+    !/(?:data|expression|javascript|url)\s*\(/iu.test(value)
+  );
+}
+
+function enforceMermaidSvgSafety(root: Element) {
+  // DOMPurify does not fully support LinkeDOM. Keep it as defense in depth,
+  // then enforce the executable-content and external-reference boundary here.
+  for (const element of Array.from(root.querySelectorAll("*"))) {
+    if (FORBIDDEN_MERMAID_SVG_TAGS.has(element.localName.toLowerCase())) {
+      element.remove();
+    }
+  }
+
+  for (const element of [root, ...Array.from(root.querySelectorAll("*"))]) {
+    for (const attribute of Array.from(element.attributes)) {
+      const name = attribute.name.toLowerCase();
+      const value = attribute.value.trim();
+      if (name.startsWith("on") || name === "style" || name === "src") {
+        element.removeAttribute(attribute.name);
+        continue;
+      }
+      if (
+        (name === "href" || name === "xlink:href") &&
+        !value.startsWith("#")
+      ) {
+        element.removeAttribute(attribute.name);
+        continue;
+      }
+      if (
+        /(?:javascript:|data:|@import)/iu.test(value) ||
+        (/url\s*\(/iu.test(value) &&
+          !/^url\(\s*['"]?#[\w:.-]+['"]?\s*\)$/iu.test(value))
+      ) {
+        element.removeAttribute(attribute.name);
+      }
+    }
+  }
+}
+
+type SvgBounds = {
+  maxX: number;
+  maxY: number;
+  minX: number;
+  minY: number;
+};
+
+type SvgMatrix = [
+  a: number,
+  b: number,
+  c: number,
+  d: number,
+  e: number,
+  f: number,
+];
+
+const SVG_IDENTITY_MATRIX: SvgMatrix = [1, 0, 0, 1, 0, 0];
+const MERMAID_VIEWPORT_PADDING = 24;
+
+function expandMermaidSvgViewBox(root: Element) {
+  const existing = parseSvgViewBox(root.getAttribute("viewBox"));
+  // Mermaid's viewBox remains authoritative when it is correct. LinkeDOM can
+  // produce a tiny fallback viewBox, so expand it around only the primitive
+  // geometry we can measure reliably. Paths are deliberately excluded.
+  const measured = measureSvgElement(root, SVG_IDENTITY_MATRIX);
+  if (!measured) return;
+
+  const padded: SvgBounds = {
+    minX: measured.minX - MERMAID_VIEWPORT_PADDING,
+    minY: measured.minY - MERMAID_VIEWPORT_PADDING,
+    maxX: measured.maxX + MERMAID_VIEWPORT_PADDING,
+    maxY: measured.maxY + MERMAID_VIEWPORT_PADDING,
+  };
+  const expanded = existing ? unionSvgBounds(existing, padded) : padded;
+  const width = expanded.maxX - expanded.minX;
+  const height = expanded.maxY - expanded.minY;
+  if (![expanded.minX, expanded.minY, width, height].every(Number.isFinite)) {
+    return;
+  }
+  if (width <= 0 || height <= 0) return;
+
+  root.setAttribute(
+    "viewBox",
+    `${expanded.minX} ${expanded.minY} ${width} ${height}`,
+  );
+}
+
+function measureSvgElement(
+  element: Element,
+  parentMatrix: SvgMatrix,
+): SvgBounds | undefined {
+  if (["defs", "marker", "metadata", "title"].includes(element.localName)) {
+    return undefined;
+  }
+
+  const matrix = multiplySvgMatrices(
+    parentMatrix,
+    parseSvgTransform(element.getAttribute("transform")),
+  );
+  let bounds = measureSvgGeometry(element, matrix);
+  for (const child of Array.from(element.children)) {
+    const childBounds = measureSvgElement(child, matrix);
+    if (childBounds) {
+      bounds = bounds ? unionSvgBounds(bounds, childBounds) : childBounds;
+    }
+  }
+  return bounds;
+}
+
+function measureSvgGeometry(
+  element: Element,
+  matrix: SvgMatrix,
+): SvgBounds | undefined {
+  switch (element.localName) {
+    case "rect": {
+      const x = svgNumberAttribute(element, "x", 0);
+      const y = svgNumberAttribute(element, "y", 0);
+      const width = svgNumberAttribute(element, "width");
+      const height = svgNumberAttribute(element, "height");
+      if (
+        x === undefined ||
+        y === undefined ||
+        width === undefined ||
+        height === undefined
+      ) {
+        return undefined;
+      }
+      return svgBoundsFromPoints(
+        [
+          [x, y],
+          [x + width, y],
+          [x, y + height],
+          [x + width, y + height],
+        ],
+        matrix,
+      );
+    }
+    case "circle": {
+      const cx = svgNumberAttribute(element, "cx", 0);
+      const cy = svgNumberAttribute(element, "cy", 0);
+      const radius = svgNumberAttribute(element, "r");
+      if (cx === undefined || cy === undefined || radius === undefined) {
+        return undefined;
+      }
+      return svgBoundsFromPoints(
+        [
+          [cx - radius, cy - radius],
+          [cx + radius, cy + radius],
+        ],
+        matrix,
+      );
+    }
+    case "ellipse": {
+      const cx = svgNumberAttribute(element, "cx", 0);
+      const cy = svgNumberAttribute(element, "cy", 0);
+      const rx = svgNumberAttribute(element, "rx");
+      const ry = svgNumberAttribute(element, "ry");
+      if (
+        cx === undefined ||
+        cy === undefined ||
+        rx === undefined ||
+        ry === undefined
+      ) {
+        return undefined;
+      }
+      return svgBoundsFromPoints(
+        [
+          [cx - rx, cy - ry],
+          [cx + rx, cy + ry],
+        ],
+        matrix,
+      );
+    }
+    case "line": {
+      const x1 = svgNumberAttribute(element, "x1", 0);
+      const y1 = svgNumberAttribute(element, "y1", 0);
+      const x2 = svgNumberAttribute(element, "x2", 0);
+      const y2 = svgNumberAttribute(element, "y2", 0);
+      if (
+        x1 === undefined ||
+        y1 === undefined ||
+        x2 === undefined ||
+        y2 === undefined
+      ) {
+        return undefined;
+      }
+      return svgBoundsFromPoints(
+        [
+          [x1, y1],
+          [x2, y2],
+        ],
+        matrix,
+      );
+    }
+    case "polygon":
+    case "polyline":
+      return svgBoundsFromPoints(
+        svgCoordinatePairs(element.getAttribute("points")),
+        matrix,
+      );
+    case "text": {
+      const x = svgNumberAttribute(element, "x", 0);
+      const y = svgNumberAttribute(element, "y", 0);
+      if (x === undefined || y === undefined) return undefined;
+      const width = Math.max(8, (element.textContent ?? "").length * 8);
+      const anchor = element.getAttribute("text-anchor");
+      const left =
+        anchor === "end" ? x - width : anchor === "middle" ? x - width / 2 : x;
+      return svgBoundsFromPoints(
+        [
+          [left, y - 10],
+          [left + width, y + 10],
+        ],
+        matrix,
+      );
+    }
+    default:
+      return undefined;
+  }
+}
+
+function svgNumberAttribute(element: Element, name: string, fallback?: number) {
+  const raw = element.getAttribute(name);
+  if (raw === null || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function svgCoordinatePairs(source: string | null): [number, number][] {
+  if (!source) return [];
+  const values = source
+    .match(/[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/giu)
+    ?.map(Number)
+    .filter(Number.isFinite);
+  if (!values) return [];
+
+  const points: [number, number][] = [];
+  for (let index = 0; index + 1 < values.length; index += 2) {
+    points.push([values[index]!, values[index + 1]!]);
+  }
+  return points;
+}
+
+function parseSvgViewBox(source: string | null): SvgBounds | undefined {
+  const values = source?.trim().split(/\s+/u).map(Number);
+  if (!values || values.length !== 4 || !values.every(Number.isFinite)) {
+    return undefined;
+  }
+  const [x, y, width, height] = values;
+  if (
+    x === undefined ||
+    y === undefined ||
+    width === undefined ||
+    height === undefined ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return undefined;
+  }
+  return { minX: x, minY: y, maxX: x + width, maxY: y + height };
+}
+
+function parseSvgTransform(source: string | null): SvgMatrix {
+  if (!source) return SVG_IDENTITY_MATRIX;
+  let matrix: SvgMatrix = [...SVG_IDENTITY_MATRIX];
+  for (const match of source.matchAll(/([a-z]+)\(([^)]*)\)/giu)) {
+    const operation = match[1]?.toLowerCase();
+    const values = match[2]
+      ?.match(/[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/giu)
+      ?.map(Number);
+    if (!operation || !values?.every(Number.isFinite)) continue;
+
+    let next: SvgMatrix | undefined;
+    if (operation === "matrix" && values.length === 6) {
+      next = values as SvgMatrix;
+    } else if (operation === "translate" && values.length >= 1) {
+      next = [1, 0, 0, 1, values[0]!, values[1] ?? 0];
+    } else if (operation === "scale" && values.length >= 1) {
+      next = [values[0]!, 0, 0, values[1] ?? values[0]!, 0, 0];
+    } else if (operation === "rotate" && values.length >= 1) {
+      const radians = (values[0]! * Math.PI) / 180;
+      const rotation: SvgMatrix = [
+        Math.cos(radians),
+        Math.sin(radians),
+        -Math.sin(radians),
+        Math.cos(radians),
+        0,
+        0,
+      ];
+      const cx = values[1] ?? 0;
+      const cy = values[2] ?? 0;
+      next = multiplySvgMatrices(
+        multiplySvgMatrices([1, 0, 0, 1, cx, cy], rotation),
+        [1, 0, 0, 1, -cx, -cy],
+      );
+    }
+    if (next) matrix = multiplySvgMatrices(matrix, next);
+  }
+  return matrix;
+}
+
+function multiplySvgMatrices(left: SvgMatrix, right: SvgMatrix): SvgMatrix {
+  return [
+    left[0] * right[0] + left[2] * right[1],
+    left[1] * right[0] + left[3] * right[1],
+    left[0] * right[2] + left[2] * right[3],
+    left[1] * right[2] + left[3] * right[3],
+    left[0] * right[4] + left[2] * right[5] + left[4],
+    left[1] * right[4] + left[3] * right[5] + left[5],
+  ];
+}
+
+function svgBoundsFromPoints(
+  points: readonly [number, number][],
+  matrix: SvgMatrix,
+): SvgBounds | undefined {
+  if (points.length === 0) return undefined;
+  const transformed = points.map(([x, y]) => ({
+    x: matrix[0] * x + matrix[2] * y + matrix[4],
+    y: matrix[1] * x + matrix[3] * y + matrix[5],
+  }));
+  const xs = transformed.map(({ x }) => x);
+  const ys = transformed.map(({ y }) => y);
+  if (![...xs, ...ys].every(Number.isFinite)) return undefined;
+  return {
+    minX: Math.min(...xs),
+    minY: Math.min(...ys),
+    maxX: Math.max(...xs),
+    maxY: Math.max(...ys),
+  };
+}
+
+function unionSvgBounds(left: SvgBounds, right: SvgBounds): SvgBounds {
+  return {
+    minX: Math.min(left.minX, right.minX),
+    minY: Math.min(left.minY, right.minY),
+    maxX: Math.max(left.maxX, right.maxX),
+    maxY: Math.max(left.maxY, right.maxY),
+  };
 }
 
 function escapeHtml(value: string) {

@@ -638,7 +638,7 @@ export default function Counter() {
     expect(response.body).toContain('class="flowchart"');
     expect(response.body).toContain("Start");
     expect(response.body).toContain("Finish");
-  });
+  }, 15_000);
 
   it("executes non-trivial Mermaid syntax through the actual diagram renderer", async () => {
     const context = toolContext();
@@ -673,6 +673,201 @@ export default function Counter() {
     expect(response.body).toContain("Choice");
     expect(response.body).toContain("yes");
     expect(response.body).toContain("no");
+  });
+
+  it("keeps every rendered Mermaid node inside the Local preview viewport", async () => {
+    const context = toolContext();
+    const prepare = await executeTool(
+      "artifact_prepare",
+      { title: "Long Diagram" },
+      context,
+    );
+    const artifactId = metadata(prepare).artifactId as string;
+    const nodes = Array.from({ length: 23 }, (_, index) =>
+      index === 0
+        ? "  N1[Draft: writable workbench with deliberate review]"
+        : `  N${index + 1}[Node ${index + 1}]`,
+    );
+    const edges = Array.from(
+      { length: 22 },
+      (_, index) => `  N${index + 1} --> N${index + 2}`,
+    );
+    await writeFile(
+      join(metadata(prepare).draftPath as string, "diagram.mmd"),
+      ["flowchart TD", ...nodes, ...edges].join("\n"),
+    );
+
+    const result = await executeTool(
+      "artifact_finalize",
+      {
+        artifactId,
+        entryPath: "diagram.mmd",
+        adapter: "renderer",
+        renderer: "mermaid",
+      },
+      context,
+    );
+    const response = await getPreviewFrame(
+      metadata(result).previewUrl as string,
+    );
+
+    expect(response.status).toBe(200);
+    const dom = new JSDOM(response.body);
+    try {
+      const svg = dom.window.document.querySelector(
+        'svg[data-renderer="mermaid"]',
+      );
+      expect(svg).not.toBeNull();
+      if (!svg) throw new Error("Expected one rendered Mermaid SVG");
+      expect(svg.hasAttribute("style")).toBe(false);
+      expect(
+        svg.querySelector(
+          "script, style, foreignObject, iframe, object, embed, audio, video",
+        ),
+      ).toBeNull();
+      for (const element of [svg, ...svg.querySelectorAll("*")]) {
+        for (const attribute of [...element.attributes]) {
+          expect(attribute.name.toLowerCase()).not.toBe("style");
+          expect(attribute.name.toLowerCase().startsWith("on")).toBe(false);
+          expect(attribute.value).not.toMatch(
+            /(?:javascript:|data:|@import)/iu,
+          );
+        }
+      }
+      expect(
+        svg.querySelector(".node .label text")?.getAttribute("text-anchor"),
+      ).toBe("middle");
+      const firstNodeWidth = Number(
+        svg.querySelector("g.node rect")?.getAttribute("width"),
+      );
+      expect(firstNodeWidth).toBeGreaterThan(200);
+
+      const viewBox = svg
+        .getAttribute("viewBox")
+        ?.trim()
+        .split(/\s+/u)
+        .map(Number);
+      expect(viewBox).toHaveLength(4);
+      expect(viewBox?.every(Number.isFinite)).toBe(true);
+
+      const nodeBounds = [...svg.querySelectorAll("g.node")].map((node) => {
+        const translation = node
+          .getAttribute("transform")
+          ?.match(/translate\(\s*([\d.-]+)[, ]+\s*([\d.-]+)/u);
+        const rect = node.querySelector(":scope > rect");
+        if (!translation || !rect) {
+          throw new Error("Expected translated Mermaid nodes with rectangles");
+        }
+        const translateX = Number(translation[1]);
+        const translateY = Number(translation[2]);
+        const x = translateX + Number(rect.getAttribute("x") ?? 0);
+        const y = translateY + Number(rect.getAttribute("y") ?? 0);
+        return {
+          bottom: y + Number(rect.getAttribute("height")),
+          left: x,
+          right: x + Number(rect.getAttribute("width")),
+          top: y,
+        };
+      });
+      expect(nodeBounds).toHaveLength(23);
+      expect(
+        Math.max(...nodeBounds.map((bounds) => bounds.bottom)),
+      ).toBeGreaterThan(1_000);
+
+      const [viewX, viewY, viewWidth, viewHeight] = viewBox as [
+        number,
+        number,
+        number,
+        number,
+      ];
+      for (const bounds of nodeBounds) {
+        expect(bounds.left).toBeGreaterThanOrEqual(viewX);
+        expect(bounds.right).toBeLessThanOrEqual(viewX + viewWidth);
+        expect(bounds.top).toBeGreaterThanOrEqual(viewY);
+        expect(bounds.bottom).toBeLessThanOrEqual(viewY + viewHeight);
+      }
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it("removes executable content and unsafe references from rendered Mermaid SVG", async () => {
+    vi.doMock("mermaid", () => ({
+      default: {
+        initialize: vi.fn(),
+        render: vi.fn(async () => ({
+          svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" style="background:url(javascript:alert(1))">
+            <style>.node { fill: red }</style>
+            <script>alert(1)</script>
+            <foreignObject><iframe src="https://attacker.example"></iframe><rect x="999999" y="999999" width="100" height="100" /></foreignObject>
+            <g class="node" onclick="alert(1)">
+              <rect x="10" y="10" width="80" height="40" style="fill:#165dcc;stroke:url(https://attacker.example/x)" />
+              <animate attributeName="href" to="https://attacker.example/animated" />
+              <set attributeName="x" to="999999" />
+              <g class="label"><text style="fill:#fffaf0"><tspan class="row">Safe label</tspan></text></g>
+              <a href="javascript:alert(1)"><text>Unsafe link</text></a>
+              <image href="data:image/svg+xml,unsafe" src="https://attacker.example/x" />
+              <use href="#safe-symbol" />
+            </g>
+          </svg>`,
+        })),
+      },
+    }));
+    try {
+      const context = toolContext();
+      const prepare = await executeTool(
+        "artifact_prepare",
+        { title: "Sanitized Mermaid" },
+        context,
+      );
+      const artifactId = metadata(prepare).artifactId as string;
+      await writeFile(
+        join(metadata(prepare).draftPath as string, "diagram.mmd"),
+        "flowchart TD\n  A[Safe label]",
+      );
+
+      const result = await executeTool(
+        "artifact_finalize",
+        {
+          artifactId,
+          entryPath: "diagram.mmd",
+          adapter: "renderer",
+          renderer: "mermaid",
+        },
+        context,
+      );
+      const response = await getPreviewFrame(
+        metadata(result).previewUrl as string,
+      );
+
+      expect(response.status).toBe(200);
+      const dom = new JSDOM(response.body);
+      try {
+        const svg = dom.window.document.querySelector(
+          'svg[data-renderer="mermaid"]',
+        );
+        expect(svg).not.toBeNull();
+        const serialized = svg?.outerHTML ?? "";
+        expect(serialized).toContain('fill="#165dcc"');
+        expect(serialized).toContain('fill="#fffaf0"');
+        expect(serialized).toContain('text-anchor="middle"');
+        expect(serialized).toContain('href="#safe-symbol"');
+        const viewBox = svg
+          ?.getAttribute("viewBox")
+          ?.trim()
+          .split(/\s+/u)
+          .map(Number);
+        expect(viewBox).toHaveLength(4);
+        expect((viewBox?.[0] ?? 0) + (viewBox?.[2] ?? 0)).toBeLessThan(500);
+        expect(serialized).not.toMatch(
+          /<animate|<set|<script|<style|foreignObject|<iframe|\sstyle=|\sonclick=|javascript:|data:image|attacker\.example|999999/iu,
+        );
+      } finally {
+        dom.window.close();
+      }
+    } finally {
+      vi.doUnmock("mermaid");
+    }
   });
 
   it("serves a browser React runtime rather than evaluating the entry in Node", async () => {

@@ -4,12 +4,14 @@
 
 **Blocked by:** 22: Update local-first documentation and supersede the old plan
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] Formatting passes without modifying unrelated files.
-- [ ] Type checking passes across every workspace.
-- [ ] All plugin, Worker, viewer, migration, and contract tests pass together.
-- [ ] Production web and standalone plugin builds pass.
-- [ ] The installed-plugin smoke check passes without repository runtime imports or dependencies.
-- [ ] The Worker deployment dry run succeeds with D1, private R2, and Access configuration.
-- [ ] Git status and the final diff contain only intended feature and documentation changes, with no credentials, local state, generated deployment output, or ignored metadata.
+- [x] Formatting passes without modifying unrelated files.
+- [x] Type checking passes across every workspace.
+- [x] All plugin, Worker, viewer, migration, and contract tests pass together.
+- [x] Production web and standalone plugin builds pass.
+- [x] The installed-plugin smoke check passes without repository runtime imports or dependencies.
+- [x] The Worker deployment dry run succeeds with D1, private R2, and Access configuration.
+- [x] Git status and the final diff contain only intended feature and documentation changes, with no credentials, local state, generated deployment output, or ignored metadata.
+
+Acceptance evidence: on August 30, 2026, `npm run format`, all workspace type checks, 259 tests, production web and plugin builds, all installed-plugin smoke modes, and `npm run deploy:dry-run` passed. The Cloudflare account API independently confirmed one self-hosted Access application for only `/inventory` and `/api/inventory*`, with one Allow policy for the configured owner email; its audience matches Worker configuration and its issuer matches the account's Access organization domain. Final status, diff, and credential-pattern checks found only intended tracked changes and deliberate test fixtures; generated deployment output remains ignored.

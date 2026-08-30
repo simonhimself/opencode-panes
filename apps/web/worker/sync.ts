@@ -905,7 +905,6 @@ async function adoptionProvenanceMatchesRequest(
       row &&
       row.consumed_at &&
       !row.revoked_at &&
-      row.expires_at > new Date().toISOString() &&
       provenance.localProjectId === localProjectId &&
       provenance.localArtifactId === localArtifactId &&
       provenance.localSlug === localSlug &&

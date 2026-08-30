@@ -494,12 +494,14 @@ function CreatorTextRenderer({
       : renderToStaticMarkup(
           <MarkdownArtifactRenderer enableGfm source={source} />,
         );
+  const head =
+    "<style>:root{color-scheme:light}body{margin:0;padding:2rem;background:#f1f0ea;color:#1f211f;font:16px/1.5 system-ui,sans-serif}pre{white-space:pre-wrap}article{max-width:780px;margin:0 auto}img,svg{max-width:100%;height:auto}</style>";
   return (
     <SandboxedArtifactFrame
       allowScripts={false}
       srcDoc={createIsolatedDocument(
         `<main data-panes-renderer="${renderer}">${body}</main>`,
-        { allowScripts: false, approvedOrigins },
+        { allowScripts: false, approvedOrigins, head },
       )}
       title={`${renderer} artifact preview`}
     />

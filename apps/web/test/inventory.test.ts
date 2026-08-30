@@ -472,7 +472,7 @@ describe("authenticated cloud inventory", () => {
     expect(await changedSlug.text()).toContain("Adoption request is invalid");
   });
 
-  it("rejects expired or revoked consumed grants and converges exact concurrent redemption", async () => {
+  it("accepts exact consumed provenance after expiry and converges concurrent redemption", async () => {
     const expired = await seedAdoptionGrant("consumed-expired", {
       consumed: true,
       expiresAt: "2020-01-01T00:00:00.000Z",
@@ -518,7 +518,19 @@ describe("authenticated cloud inventory", () => {
         PANES_CREATE_API_KEY: "sync-key",
       },
     );
-    expect(expiredSync.status).toBe(409);
+    expect(expiredSync.status).toBe(201);
+    expect(
+      await env.DB.prepare(
+        "SELECT local_project_id, local_artifact_id, local_slug, legacy_artifact_id FROM legacy_adoption_provenance WHERE grant_id = ?",
+      )
+        .bind(expired.grantId)
+        .first(),
+    ).toEqual({
+      local_project_id: expired.binding.localProjectId,
+      local_artifact_id: expired.binding.localArtifactId,
+      local_slug: expired.binding.slug,
+      legacy_artifact_id: expired.artifactId,
+    });
 
     const cleanupIssue = await api(
       `/api/inventory/legacy/artifacts/${expired.artifactId}/adoption-code`,
@@ -1309,7 +1321,10 @@ describe("authenticated cloud inventory", () => {
   });
 
   it("rejects missing or invalid configuration before querying inventory", async () => {
-    const unauthorized = await api("/api/inventory");
+    const unauthorized = await api("/api/inventory", undefined, {
+      DB: env.DB,
+      PRIVATE_ARTIFACTS: env.PRIVATE_ARTIFACTS,
+    });
     expect(unauthorized.status).toBe(503);
     expect(await unauthorized.text()).not.toContain("project");
 

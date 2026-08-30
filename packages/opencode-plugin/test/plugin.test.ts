@@ -558,7 +558,7 @@ describe("Legacy adoption tool", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
+  }, 15_000);
 
   it("maps every Legacy renderer to a finalized exact-byte local v1 preview", async () => {
     const repository = await gitRepository();

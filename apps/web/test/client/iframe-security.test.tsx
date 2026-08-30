@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CreatorWorkspaceResponse } from "@opencode-panes/contracts";
+import mermaid from "mermaid";
 import { act } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createRoot, type Root } from "react-dom/client";
@@ -23,7 +24,9 @@ import { createHtmlSrcDoc } from "../../src/renderers/html";
 vi.mock("mermaid", () => ({
   default: {
     initialize: vi.fn(),
-    render: vi.fn(async () => ({ svg: "<svg><path /></svg>" })),
+    render: vi.fn(async () => ({
+      svg: '<svg style="max-width:100px"><style>.node{fill:#000}.node .label text{text-anchor:middle}</style><g class="node" style="color:#fffaf0"><rect style="fill:#165dcc;stroke:#171717;stroke-width:2px"/><g class="label"><text y="-10.1" style="fill:#fffaf0"><tspan class="text-outer-tspan row" x="0"><tspan>Readable</tspan><tspan> node</tspan></tspan></text></g></g><script>alert(1)</script></svg>',
+    })),
   },
 }));
 
@@ -231,6 +234,53 @@ describe("sandboxed artifact iframe", () => {
     expect(srcDoc).not.toContain("allow-same-origin");
   });
 
+  it("gives Creator Markdown a readable isolated canvas", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("# Readable preview")),
+    );
+
+    await renderCreatorWorkspace(
+      "markdown",
+      "text/markdown",
+      "# Readable preview",
+    );
+
+    const srcDoc =
+      container.querySelector("iframe")?.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain("color-scheme:light");
+    expect(srcDoc).toContain("background:#f1f0ea");
+    expect(srcDoc).toContain("color:#1f211f");
+  });
+
+  it("preserves safe Mermaid presentation colors on a readable canvas", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("graph TD; A-->B;")),
+    );
+
+    await renderCreatorWorkspace("mermaid", "text/plain", "graph TD; A-->B;");
+
+    const srcDoc =
+      container.querySelector("iframe")?.getAttribute("srcdoc") ?? "";
+    expect(srcDoc).toContain("data-panes-mermaid-canvas");
+    expect(srcDoc).toContain('fill="#165dcc"');
+    expect(srcDoc).toContain('fill="#fffaf0"');
+    expect(srcDoc).toContain('text-anchor="middle"');
+    expect(srcDoc).toContain("Readable node");
+    expect(srcDoc).toContain("background:#f1f0ea");
+    expect(srcDoc).toContain("box-sizing:border-box;width:100vw");
+    expect(srcDoc).not.toContain("max-width:100px");
+    expect(srcDoc).not.toContain(".node{fill:#000}");
+    expect(srcDoc).not.toContain("<script>alert(1)</script>");
+    expect(mermaid.initialize).toHaveBeenCalledWith(
+      expect.objectContaining({
+        flowchart: { htmlLabels: false },
+        htmlLabels: false,
+      }),
+    );
+  });
+
   it.each([
     ["mermaid", "graph TD; A-->B;"],
     ["react", "export default function App() { return null; }"],
@@ -254,7 +304,7 @@ describe("sandboxed artifact iframe", () => {
 });
 
 async function renderCreatorWorkspace(
-  renderer: "code" | "mermaid" | "react",
+  renderer: "code" | "markdown" | "mermaid" | "react",
   mediaType: string,
   source: string,
 ): Promise<void> {
