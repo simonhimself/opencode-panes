@@ -977,6 +977,12 @@ describe("local-first publication lifecycle", () => {
     expect(nested.headers.get("Content-Security-Policy")).toContain(
       "connect-src https:",
     );
+    expect(nested.headers.get("Content-Security-Policy")).not.toContain(
+      "navigate-to",
+    );
+    expect(nested.headers.get("Content-Security-Policy")).not.toContain(
+      "referrer-policy",
+    );
     expect(nested.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect(
       (await api(`/api/publications/${token}/files/assets/data.bin`)).status,

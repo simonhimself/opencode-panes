@@ -4614,17 +4614,26 @@ function createArtifactFrameDocument(
   approvedOrigins: readonly string[] = [],
 ) {
   const origin = new URL(baseUrl).origin;
-  const csp = createFrameCsp(origin, approvedOrigins);
+  // The iframe's HTTP response carries the CSP sandbox. Meta-delivered CSP
+  // cannot enforce that document directive, so leave it to the response
+  // header while retaining the outer iframe sandbox attribute below.
+  const csp = createFrameCsp(origin, approvedOrigins, {
+    includeSandbox: false,
+  });
   const guard = createArtifactEgressGuardScript();
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeHtmlAttribute(csp)}"><meta http-equiv="x-dns-prefetch-control" content="off"><base href="${escapeHtmlAttribute(baseUrl)}"><script>${escapeInlineScript(guard)}</script>${head}</head><body>${body}</body></html>`;
 }
 
 function createShellCsp(origin: string) {
-  return `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; frame-src ${origin}; child-src ${origin}; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; referrer-policy no-referrer`;
+  return `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; frame-src ${origin}; child-src ${origin}; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
 }
 
-function createFrameCsp(origin: string, approvedOrigins: readonly string[]) {
-  return createPreviewCsp(origin, approvedOrigins);
+function createFrameCsp(
+  origin: string,
+  approvedOrigins: readonly string[],
+  options?: { includeSandbox?: boolean },
+) {
+  return createPreviewCsp(origin, approvedOrigins, options);
 }
 
 async function rendererWrapper(

@@ -132,6 +132,9 @@ describe("artifact_finalize tool", () => {
     const shell = await getText(metadata(result).previewUrl as string);
 
     expect(shell.status).toBe(200);
+    expect(shell.referrerPolicy).toBe("no-referrer");
+    expect(shell.contentSecurityPolicy).not.toContain("referrer-policy");
+    expect(shell.contentSecurityPolicy).not.toContain("navigate-to");
     expect(shell.body).not.toContain("<script");
     expect(shell.body).not.toContain("document.body.dataset.executed");
     expect(shell.body).toContain('sandbox="allow-scripts"');
@@ -144,9 +147,13 @@ describe("artifact_finalize tool", () => {
       frameUrl(shell.body, metadata(result).previewUrl as string),
     );
     expect(frame.body).toContain("document.body.dataset.executed");
+    expect(frame.referrerPolicy).toBe("no-referrer");
     expect(frame.contentSecurityPolicy).toContain("connect-src https:");
     expect(frame.contentSecurityPolicy).toContain("sandbox allow-scripts");
+    expect(frame.contentSecurityPolicy).not.toContain("referrer-policy");
+    expect(frame.contentSecurityPolicy).not.toContain("navigate-to");
     expect(frame.contentSecurityPolicy).not.toContain("allow-same-origin");
+    expect(frame.body).not.toContain("sandbox allow-scripts");
   });
 
   it("confines direct HTML execution to the finalized artifact frame", async () => {
@@ -478,7 +485,9 @@ export default function Counter() {
     }
     expect(frame.contentSecurityPolicy).not.toContain("ws:");
     expect(frame.contentSecurityPolicy).not.toContain("wss:");
-    expect(frame.contentSecurityPolicy).toContain("navigate-to 'none'");
+    expect(frame.contentSecurityPolicy).not.toContain("navigate-to");
+    expect(frame.contentSecurityPolicy).not.toContain("referrer-policy");
+    expect(frame.body).not.toContain("sandbox allow-scripts");
     expect(frame.body).toContain('"WebSocket"');
     expect(frame.body).not.toContain('lock(globalThis, "fetch"');
 
@@ -1324,6 +1333,7 @@ function getText(url: string) {
     status: number;
     contentType: string;
     contentSecurityPolicy: string;
+    referrerPolicy: string;
     accessControlAllowOrigin: string;
     body: string;
   }>((resolve, reject) => {
@@ -1337,6 +1347,7 @@ function getText(url: string) {
           contentSecurityPolicy: String(
             response.headers["content-security-policy"] ?? "",
           ),
+          referrerPolicy: String(response.headers["referrer-policy"] ?? ""),
           accessControlAllowOrigin: String(
             response.headers["access-control-allow-origin"] ?? "",
           ),

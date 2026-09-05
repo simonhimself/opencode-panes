@@ -4,6 +4,7 @@ import type { CreatorWorkspaceResponse } from "@opencode-panes/contracts";
 import mermaid from "mermaid";
 import {
   createArtifactNetworkPolicy,
+  createPreviewCsp,
   isAllowedArtifactNetworkRequest,
 } from "@opencode-panes/renderers/preview-security";
 import { act } from "react";
@@ -119,6 +120,22 @@ describe("sandboxed artifact iframe", () => {
     );
   });
 
+  it("keeps header-only CSP controls out of meta-delivered policies", () => {
+    const headerPolicy = createPreviewCsp("https://panes.example", []);
+    const metaPolicy = createPreviewCsp("https://panes.example", [], {
+      includeSandbox: false,
+    });
+
+    expect(headerPolicy).toContain("sandbox allow-scripts");
+    expect(metaPolicy).not.toContain("sandbox allow-scripts");
+    for (const policy of [headerPolicy, metaPolicy]) {
+      expect(policy).not.toMatch(/(?:^|; )navigate-to\b/);
+      expect(policy).not.toMatch(/(?:^|; )referrer-policy\b/);
+      expect(policy).toContain("form-action 'none'");
+      expect(policy).toContain("object-src 'none'");
+    }
+  });
+
   it("places the CSP before HTML artifact content", () => {
     const marker = '<script src="https://attacker.example/x.js"></script>';
     const srcDoc = createHtmlSrcDoc(marker, "message-nonce");
@@ -132,6 +149,7 @@ describe("sandboxed artifact iframe", () => {
     expect(createArtifactCsp(true)).toContain("frame-src 'none'");
     expect(createArtifactCsp(true)).toContain("object-src 'none'");
     expect(createArtifactCsp(true)).not.toContain("navigate-to");
+    expect(createArtifactCsp(true)).not.toContain("referrer-policy");
     expect(createArtifactCsp(false)).toContain("script-src 'none'");
     expect(createArtifactCsp(false)).toContain("img-src data: blob: https:");
   });

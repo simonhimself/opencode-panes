@@ -61,7 +61,7 @@ export function isAllowedArtifactNetworkRequest(value, origins) {
   }
 }
 
-export function createPreviewCsp(origin, origins) {
+export function createPreviewCsp(origin, origins, options = {}) {
   const policy = createArtifactNetworkPolicy(origins);
   const scriptSrc = [origin, ...policy.scriptSrc].join(" ");
   const styleSrc = [origin, ...policy.styleSrc].join(" ");
@@ -71,7 +71,25 @@ export function createPreviewCsp(origin, origins) {
   const connectSrc = policy.connectSrc.length
     ? policy.connectSrc.join(" ")
     : "'none'";
-  return `sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' ${scriptSrc}; style-src 'unsafe-inline' ${styleSrc}; img-src ${imageSrc}; font-src ${fontSrc}; connect-src ${connectSrc}; frame-src 'none'; child-src 'none'; worker-src 'none'; object-src 'none'; base-uri ${origin}; form-action 'none'; manifest-src 'none'; media-src ${mediaSrc}; navigate-to 'none'`;
+  const sandbox =
+    options.includeSandbox === false ? [] : ["sandbox allow-scripts"];
+  return [
+    ...sandbox,
+    "default-src 'none'",
+    `script-src 'unsafe-inline' 'wasm-unsafe-eval' ${scriptSrc}`,
+    `style-src 'unsafe-inline' ${styleSrc}`,
+    `img-src ${imageSrc}`,
+    `font-src ${fontSrc}`,
+    `connect-src ${connectSrc}`,
+    "frame-src 'none'",
+    "child-src 'none'",
+    "worker-src 'none'",
+    "object-src 'none'",
+    `base-uri ${origin}`,
+    "form-action 'none'",
+    "manifest-src 'none'",
+    `media-src ${mediaSrc}`,
+  ].join("; ");
 }
 
 export function normalizePreviewContentType(mediaType) {

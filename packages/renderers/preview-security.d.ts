@@ -18,8 +18,12 @@ export declare function isAllowedArtifactNetworkRequest(
   value: string,
   origins: readonly string[],
 ): boolean;
+export interface PreviewCspOptions {
+  includeSandbox?: boolean;
+}
 export declare function createPreviewCsp(
   origin: string,
   origins: readonly string[],
+  options?: PreviewCspOptions,
 ): string;
 export declare function normalizePreviewContentType(mediaType: string): string;
