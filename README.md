@@ -128,6 +128,31 @@ Quit and restart OpenCode after installing the plugin or changing its environmen
 This repository does not provide a shared hosted account or default to someone
 else's deployment.
 
+Alternatively, configure plugin options with a protected secret-file reference.
+Install outside the auto-discovered `plugins/` directory so auto-discovery does
+not override the explicit options:
+
+```sh
+OPENCODE_PANES_PLUGIN_DIR="$HOME/.config/opencode/panes" npm run install:plugin
+```
+
+Add an entry to your existing OpenCode `plugin` array, using your actual absolute
+bundle path and an existing protected upload-key file:
+
+```json
+[
+  "file:///absolute/path/to/opencode/panes/opencode-panes.js",
+  {
+    "apiBaseUrl": "https://your-panes-deployment.example",
+    "uploadKey": "{file:~/.config/opencode/secrets/panes-upload-key}"
+  }
+]
+```
+
+Use one installation method, not two copies of the plugin. On upgrades, use the
+same installation directory. The file reference is resolved by OpenCode; the
+plugin itself does not discover secret files. Restart OpenCode after configuring.
+
 The plugin exposes two tools:
 
 - `artifact_upload`: upload a selected local file or browser-ready folder privately.
