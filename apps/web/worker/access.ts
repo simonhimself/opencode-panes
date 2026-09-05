@@ -53,8 +53,8 @@ export async function verifyAccessRequest(
 }
 
 export function readAccessConfig(env: Env): AccessConfig | undefined {
-  const issuerInput = (env.PANES_ACCESS_ISSUER ?? env.TEAM_DOMAIN)?.trim();
-  const audience = (env.PANES_ACCESS_AUDIENCE ?? env.POLICY_AUD)?.trim();
+  const issuerInput = env.PANES_ACCESS_ISSUER?.trim();
+  const audience = env.PANES_ACCESS_AUDIENCE?.trim();
   const allowedEmail = normalizeEmail(env.PANES_ACCESS_ALLOWED_EMAIL);
   if (!issuerInput || !audience || !allowedEmail) return undefined;
 

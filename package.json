@@ -1,6 +1,6 @@
 {
   "name": "opencode-panes",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -24,6 +24,7 @@
     "format": "prettier --check .",
     "format:write": "prettier --write .",
     "smoke:plugin": "node scripts/smoke-plugin.mjs",
+    "test:acceptance": "node scripts/acceptance-library.mjs",
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },

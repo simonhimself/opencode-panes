@@ -17,15 +17,13 @@ export default defineConfig(async () => {
         miniflare: {
           bindings: {
             TEST_MIGRATIONS: migrations,
-            // Test-only deterministic material. Production uses the required
-            // Worker secret declared in wrangler.jsonc.
-            PUBLICATION_ENCRYPTION_KEY_V1:
-              "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            PANES_UPLOAD_KEY: "test-upload-key-not-for-production",
           },
         },
       }),
     ],
     test: {
+      include: ["test/*.test.ts"],
       setupFiles: ["./test/apply-migrations.ts"],
     },
   };

@@ -14,7 +14,7 @@ OpenCode Panes is an npm workspace containing a React artifact viewer, a Cloudfl
 
 ## Workspace
 
-- `apps/web`: Viewer, renderers, Worker API, D1 migrations, and tests.
+- `apps/web`: Owner library, public viewer, Worker API, D1 migrations, and tests.
 - `packages/contracts`: Shared schemas, limits, and API types.
 - `packages/opencode-plugin`: OpenCode plugin, build configuration, and command template.
 - `scripts`: Repository-level verification and maintenance scripts.
@@ -43,9 +43,12 @@ npm run deploy:dry-run
 
 - Update shared contracts before changing both the plugin and Worker API.
 - Add D1 schema changes as new migrations. Never rewrite an applied migration.
-- Keep creator capabilities and public share capabilities separate.
-- Public views must expose only the immutable revision selected for publication.
-- Maintain sandbox boundaries when changing artifact renderers.
+- Keep owner login, machine upload credentials, and read-only previews separate.
+- Public views must expose only the immutable cloud version selected for sharing.
+- Maintain sandbox boundaries when serving browser-ready artifact files.
+- Do not reintroduce managed local Drafts, local version history, Creator links,
+  or legacy migration workflows. Ordinary local files are the source; upload
+  creates a private cloud snapshot, and only the dashboard can share it.
 - Add or update tests for behavior changes and regressions.
 - Update `README.md` and `PROJECT_PLAN.md` when documented behavior or scope changes.
 

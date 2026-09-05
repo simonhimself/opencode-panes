@@ -1,1225 +1,670 @@
 import type {
-  Artifact,
-  CreatorWorkspaceResponse,
-  Revision,
+  ArtifactLibrary,
+  ArtifactShare,
+  ArtifactVersion,
+  PublicArtifact,
 } from "@opencode-panes/contracts";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App, SourceCode } from "../../src/app";
-import { CreatorWorkspace } from "../../src/creator-workspace";
-import { parseViewerRoute } from "../../src/viewer";
+import { App } from "../../src/app";
 
-const ARTIFACT: Artifact = {
-  createdAt: "2026-08-17T10:00:00.000Z",
-  currentRevisionId: "revision-2",
-  id: "artifact-1",
-  title: "Release notes",
-  type: "markdown",
-  updatedAt: "2026-08-17T10:01:00.000Z",
+const version = (number: number): ArtifactVersion => ({
+  id: `version-${number}`,
+  number,
+  createdAt: "2026-08-28T10:00:00.000Z",
+  entryPath: "index.html",
+  fileCount: 3,
+  bytes: 500,
+  previewUrl: `/api/previews/readonly-${number}/files/index.html`,
+});
+const active: ArtifactShare = {
+  url: "https://panes.example/s/stable-link",
+  versionId: "version-1",
+  expiresAt: null,
+  status: "active",
 };
-
-const REVISIONS: Revision[] = [
-  {
-    artifactId: ARTIFACT.id,
-    createdAt: "2026-08-17T10:01:00.000Z",
-    id: "revision-2",
-    source: "# Current",
-    version: 2,
-  },
-  {
-    artifactId: ARTIFACT.id,
-    createdAt: "2026-08-17T10:00:00.000Z",
-    id: "revision-1",
-    source: "# Historical",
-    version: 1,
-  },
-];
+const fixture = (): ArtifactLibrary => ({
+  projects: [
+    { id: "project-one", name: "Field Notes" },
+    { id: "project-two", name: "Little Experiments" },
+  ],
+  artifacts: [
+    {
+      id: "artifact-one",
+      projectId: "project-one",
+      title: "An illustrated field guide",
+      updatedAt: "2026-08-29T10:00:00.000Z",
+      versions: [version(1), version(2)],
+      share: null,
+    },
+    {
+      id: "artifact-two",
+      projectId: "project-two",
+      title: "A moving study",
+      updatedAt: "2026-08-28T10:00:00.000Z",
+      versions: [version(1)],
+      share: { ...active },
+    },
+    {
+      id: "artifact-three",
+      projectId: "project-one",
+      title: "The first sketch",
+      updatedAt: "2026-08-27T10:00:00.000Z",
+      versions: [version(1)],
+      share: {
+        ...active,
+        expiresAt: "2020-08-27T10:00:00.000Z",
+        status: "expired",
+      },
+    },
+  ],
+});
 
 let container: HTMLDivElement;
 let root: Root;
+let library: ArtifactLibrary;
+let fetcher: ReturnType<typeof vi.fn>;
+
+function json(value: unknown, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 beforeEach(() => {
   (
     globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
   ).IS_REACT_ACT_ENVIRONMENT = true;
+  window.history.replaceState(null, "", "/inventory");
+  library = fixture();
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
-  sessionStorage.clear();
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: undefined,
+  });
+  fetcher = vi.fn(async (input: string, init?: RequestInit) => {
+    if (input === "/api/library") return json(library);
+    if (input.startsWith("/api/shares/"))
+      return json({
+        title: library.artifacts[0]!.title,
+        version: version(2),
+        expiresAt: null,
+      } satisfies PublicArtifact);
+    const artifact = library.artifacts.find((item) =>
+      input.includes(`/artifacts/${item.id}`),
+    );
+    if (!artifact) return json({}, 404);
+    if (init?.method === "PUT") {
+      const body = JSON.parse(String(init.body)) as {
+        versionId: string;
+        expiresInDays: number | null;
+      };
+      artifact.share = {
+        ...active,
+        versionId: body.versionId,
+        expiresAt:
+          body.expiresInDays === null ? null : "2099-08-29T10:00:00.000Z",
+      };
+      return json(artifact.share);
+    }
+    if (init?.method === "DELETE") {
+      if (input.endsWith("/share")) artifact.share = null;
+      else
+        library.artifacts = library.artifacts.filter(
+          (item) => item.id !== artifact.id,
+        );
+      return new Response(null, { status: 204 });
+    }
+    return json(artifact);
+  });
+  vi.stubGlobal("fetch", fetcher);
 });
 
 afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
-describe("artifact workspace", () => {
-  it("keeps local-first publication routes separate from legacy shared routes", () => {
-    expect(parseViewerRoute("/shared/legacy-token")).toEqual({
-      kind: "shared",
-      token: "legacy-token",
-    });
-    expect(parseViewerRoute("/published/local-first-token")).toEqual({
-      kind: "published",
-      token: "local-first-token",
-    });
-    expect(parseViewerRoute("/inventory")).toEqual({ kind: "inventory" });
+async function mount(path = "/inventory") {
+  window.history.replaceState(null, "", path);
+  await act(async () => {
+    root.render(<App />);
   });
-
-  it("renders a grouped inventory and copies a recoverable URL", async () => {
-    const writeText = vi.fn(async () => undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(
-            JSON.stringify({
-              projects: [
-                {
-                  projectId: "project-demo",
-                  artifacts: [
-                    {
-                      artifactId: "artifact-demo",
-                      slug: "demo",
-                      title: "Demo artifact",
-                      kind: null,
-                      lifecycleState: "active",
-                      revisionCount: 2,
-                      storageBytes: 2048,
-                      lastSyncedAt: "2026-08-29T12:00:00.000Z",
-                      creatorLink: {
-                        status: "active",
-                        expiresAt: "2026-09-28T12:00:00.000Z",
-                      },
-                      publication: {
-                        status: "active",
-                        revisionVersion: 2,
-                        expiresAt: "2026-09-05T12:00:00.000Z",
-                        publicUrl:
-                          "https://panes.example/published/public-token",
-                      },
-                      revisions: [
-                        {
-                          version: 2,
-                          createdAt: "2026-08-29T12:00:00.000Z",
-                        },
-                        {
-                          version: 1,
-                          createdAt: "2026-08-28T12:00:00.000Z",
-                        },
-                      ],
-                      warnings: [
-                        "The active public URL could not be recovered.",
-                      ],
-                    },
-                  ],
-                },
-              ],
-            }),
-          ),
-      ),
-    );
-
-    await act(async () => {
-      root.render(<App route={{ kind: "inventory" }} />);
-      await settle();
-    });
-
-    expect(container.textContent).toContain("project-demo");
-    expect(container.textContent).toContain("Demo artifact");
-    expect(container.textContent).toContain(
-      "The active public URL could not be recovered.",
-    );
-    const copy = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Copy public URL",
-    );
-    await act(async () => {
-      copy?.click();
-      await settle();
-    });
-    expect(writeText).toHaveBeenCalledWith(
-      "https://panes.example/published/public-token",
-    );
-    expect(container.textContent).toContain("public URL copied");
-    expect(container.textContent).not.toContain("owner_token_hash");
-    expect(container.textContent).not.toContain("read-only");
-  });
-
-  it("puts current Artifacts before collapsed Legacy history and Manage controls", async () => {
-    const payload = {
-      projects: [
-        {
-          projectId: "project-current",
-          artifacts: [
-            {
-              artifactId: "artifact-current",
-              slug: "current",
-              title: "Current artifact",
-              kind: null,
-              lifecycleState: "active",
-              revisionCount: 1,
-              storageBytes: 10,
-              lastSyncedAt: "2026-08-29T12:00:00.000Z",
-              creatorLink: {
-                status: "active",
-                expiresAt: "2026-09-28T12:00:00.000Z",
-              },
-              publication: {
-                status: "none",
-                revisionVersion: null,
-                expiresAt: null,
-              },
-              revisions: [
-                { version: 1, createdAt: "2026-08-29T12:00:00.000Z" },
-              ],
-              warnings: [],
-            },
-          ],
-        },
-      ],
-      legacyArtifacts: [
-        {
-          artifactId: "legacy-history",
-          title: "Archived artifact",
-          type: "html",
-          revisionCount: 3,
-          storageBytes: 128,
-          createdAt: "2026-08-01T10:00:00.000Z",
-          updatedAt: "2026-08-03T10:00:00.000Z",
-          privateExpiresAt: "2026-08-31T10:00:00.000Z",
-          status: "active",
-          publicationStatus: "none",
-          publicationExpiresAt: null,
-        },
-      ],
-    };
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(JSON.stringify(payload))),
-    );
-
-    await act(async () => {
-      root.render(<App route={{ kind: "inventory" }} />);
-      await settle();
-    });
-
-    const project = container.querySelector(".inventory-project");
-    const legacyHistory = container.querySelector<HTMLDetailsElement>(
-      ".inventory-legacy-history",
-    );
-    expect(project?.textContent).toContain("project-current");
-    expect(legacyHistory).not.toBeNull();
-    expect(project?.compareDocumentPosition(legacyHistory as Node) ?? 0).toBe(
-      Node.DOCUMENT_POSITION_FOLLOWING,
-    );
-    expect(legacyHistory?.open).toBe(false);
-    expect(legacyHistory?.querySelector("summary")?.textContent).toContain(
-      "1 artifact",
-    );
-    expect(legacyHistory?.querySelector("summary")?.textContent).toContain(
-      "read-only",
-    );
-
-    const currentCard = container.querySelector(
-      '[data-artifact-id="artifact-current"]',
-    );
-    expect(currentCard).not.toBeNull();
-    const manage =
-      currentCard?.querySelector<HTMLDetailsElement>(".inventory-manage");
-    expect(manage?.open).toBe(false);
-    expect(manage?.querySelector("button")?.textContent).toContain(
-      "Rotate Creator link",
-    );
-    expect(currentCard?.textContent).toContain("Extend publication");
-    expect(currentCard?.textContent).toContain("Republish");
-  });
-
-  it("renders Legacy inventory as read-only with deletion confirmation only", async () => {
-    const payload = {
-      projects: [],
-      legacyArtifacts: [
-        {
-          artifactId: "legacy-artifact",
-          title: "Archived artifact",
-          type: "html",
-          revisionCount: 3,
-          storageBytes: 128,
-          createdAt: "2026-08-01T10:00:00.000Z",
-          updatedAt: "2026-08-03T10:00:00.000Z",
-          privateExpiresAt: "2026-08-31T10:00:00.000Z",
-          status: "active",
-          publicationStatus: "none",
-          publicationExpiresAt: null,
-        },
-      ],
-    };
-    const fetcher = vi.fn(async () => new Response(JSON.stringify(payload)));
-    vi.stubGlobal("fetch", fetcher);
-
-    await act(async () => {
-      root.render(<App route={{ kind: "inventory" }} />);
-      await settle();
-    });
-
-    const legacyHistory = container.querySelector<HTMLDetailsElement>(
-      ".inventory-legacy-history",
-    );
-    expect(legacyHistory?.open).toBe(false);
-    await act(async () => {
-      legacyHistory?.querySelector("summary")?.click();
-      await settle();
-    });
-    const manage =
-      legacyHistory?.querySelector<HTMLDetailsElement>(".inventory-manage");
-    expect(manage?.open).toBe(false);
-    await act(async () => {
-      manage?.querySelector("summary")?.click();
-      await settle();
-    });
-
-    expect(container.textContent).toContain("Read-only cloud history");
-    expect(container.textContent).toContain("Archived artifact");
-    expect(container.textContent).toContain("128 B");
-    expect(container.textContent).toContain("Updated");
-    expect(container.textContent).toContain(
-      "cannot be edited, published, or extended",
-    );
-    expect(
-      [...container.querySelectorAll("button")].find(
-        (button) => button.textContent === "Delete Legacy artifact",
-      )?.disabled,
-    ).toBe(true);
-    expect(container.textContent).not.toContain("Rotate Creator link");
-    expect(container.textContent).not.toContain("Republish");
-    expect(container.textContent).not.toContain("Extend publication");
-  });
-
-  it("issues Legacy adoption codes through the Access-protected inventory action", async () => {
-    const writeText = vi.fn(async () => undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
-    const payload = {
-      projects: [],
-      legacyArtifacts: [
-        {
-          artifactId: "legacy-adoption-client",
-          title: "Client adoption fixture",
-          type: "html",
-          revisionCount: 2,
-          storageBytes: 128,
-          createdAt: "2026-08-01T10:00:00.000Z",
-          updatedAt: "2026-08-03T10:00:00.000Z",
-          privateExpiresAt: "2026-09-01T10:00:00.000Z",
-          status: "active",
-          publicationStatus: "none",
-          publicationExpiresAt: null,
-        },
-      ],
-    };
-    let postCount = 0;
-    let releaseFirstIssue!: () => void;
-    const firstIssueReleased = new Promise<void>(
-      (resolve) => (releaseFirstIssue = resolve),
-    );
-    const fetcher = vi.fn(
-      async (_input: RequestInfo | URL, init?: RequestInit) => {
-        if (init?.method !== "POST")
-          return new Response(JSON.stringify(payload));
-        postCount += 1;
-        if (postCount === 1) {
-          await firstIssueReleased;
-          return new Response(
-            JSON.stringify({
-              operation: "adoption-code-issued",
-              artifactId: "legacy-adoption-client",
-              code: "panes-adopt-legacy-11111111111111111111111111111111",
-              expiresAt: "2026-08-31T10:00:00.000Z",
-              source: {
-                title: "Client adoption fixture",
-                type: "html",
-                revisionVersion: 2,
-              },
-            }),
-          );
-        }
-        if (postCount === 2) {
-          return new Response(
-            JSON.stringify({
-              operation: "adoption-code-issued",
-              artifactId: "legacy-adoption-client",
-              code: "panes-adopt-legacy-22222222222222222222222222222222",
-              expiresAt: "2026-08-31T11:00:00.000Z",
-              source: {
-                title: "Client adoption fixture",
-                type: "html",
-                revisionVersion: 2,
-              },
-            }),
-          );
-        }
-        return new Response(
-          JSON.stringify({
-            error: { code: "SERVICE_UNAVAILABLE", message: "Issue failed" },
-          }),
-          { status: 503 },
-        );
-      },
-    );
-    vi.stubGlobal("fetch", fetcher);
-
-    await act(async () => {
-      root.render(<App route={{ kind: "inventory" }} />);
-      await settle();
-    });
-    const legacyHistory = container.querySelector<HTMLDetailsElement>(
-      ".inventory-legacy-history",
-    );
-    await act(async () => {
-      legacyHistory?.querySelector("summary")?.click();
-      await settle();
-      legacyHistory
-        ?.querySelector<HTMLElement>(".inventory-manage summary")
-        ?.click();
-      await settle();
-    });
-    const issue = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Export / adopt locally",
-    );
-    expect(issue).not.toBeUndefined();
-    await act(async () => {
-      issue?.click();
-      await settle();
-    });
-    expect(issue?.textContent).toBe("Issuing…");
-    releaseFirstIssue();
-    await act(async () => {
-      await settle();
-    });
-    expect(container.textContent).toContain("Copy this one-time code now");
-    expect(container.textContent).toContain("v2");
-    expect(container.textContent).toContain("Expires Aug 31, 2026");
-    expect(container.textContent).toContain(
-      "panes-adopt-legacy-11111111111111111111111111111111",
-    );
-    expect(container.textContent).not.toContain("ownerCredential");
-    expect(container.textContent).not.toContain("source bytes");
-    expect(container.textContent).not.toContain("Owner credential");
-    const copy = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Copy code",
-    );
-    await act(async () => {
-      copy?.click();
-      await settle();
-    });
-    expect(writeText).toHaveBeenCalledWith(
-      "panes-adopt-legacy-11111111111111111111111111111111",
-    );
-
-    await act(async () => {
-      issue?.click();
-      await settle();
-    });
-    expect(container.textContent).not.toContain(
-      "panes-adopt-legacy-11111111111111111111111111111111",
-    );
-    expect(container.textContent).toContain(
-      "panes-adopt-legacy-22222222222222222222222222222222",
-    );
-    await act(async () => {
-      issue?.click();
-      await settle();
-    });
-    expect(container.textContent).toContain("Issue failed");
-    expect(fetcher).toHaveBeenNthCalledWith(
-      2,
-      "/api/inventory/legacy/artifacts/legacy-adoption-client/adoption-code",
-      expect.objectContaining({
-        method: "POST",
-        body: "{}",
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-    expect(postCount).toBe(3);
-    expect(String(fetcher.mock.calls[1]?.[0])).not.toContain("source");
-  });
-
-  it("requires the exact reconnect confirmation and keeps the issued code ephemeral", async () => {
-    const writeText = vi.fn(async () => undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
-    const payload = {
-      projects: [
-        {
-          projectId: "project-demo",
-          artifacts: [
-            {
-              artifactId: "artifact-demo",
-              slug: "demo",
-              title: "Demo artifact",
-              kind: null,
-              lifecycleState: "active",
-              revisionCount: 1,
-              storageBytes: 10,
-              lastSyncedAt: "2026-08-29T12:00:00.000Z",
-              creatorLink: {
-                status: "active",
-                expiresAt: "2026-09-28T12:00:00.000Z",
-              },
-              publication: {
-                status: "none",
-                revisionVersion: null,
-                expiresAt: null,
-              },
-              revisions: [
-                { version: 1, createdAt: "2026-08-29T12:00:00.000Z" },
-              ],
-              warnings: [],
-            },
-          ],
-        },
-      ],
-    };
-    const requests: Array<{ method: string; body?: string }> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-        requests.push({
-          method: init?.method ?? "GET",
-          ...(typeof init?.body === "string" ? { body: init.body } : {}),
-        });
-        if (init?.method === "POST") {
-          return new Response(
-            JSON.stringify({
-              cloudArtifactId: "artifact-demo",
-              reconnectCode: "panes-reconnect-0123456789abcdef0123456789abcdef",
-              expiresAt: "2026-08-29T12:10:00.000Z",
-            }),
-          );
-        }
-        return new Response(JSON.stringify(payload));
-      }),
-    );
-
-    await act(async () => {
-      root.render(<App route={{ kind: "inventory" }} />);
-      await settle();
-    });
-    const manage =
-      container.querySelector<HTMLDetailsElement>(".inventory-manage");
-    await act(async () => {
-      manage?.querySelector("summary")?.click();
-      await settle();
-    });
-    const input = container.querySelector<HTMLInputElement>(
-      "#reconnect-artifact-demo",
-    );
-    const issue = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Issue reconnect code",
-    );
-    expect(issue?.disabled).toBe(true);
-    await act(async () => {
-      const setter = Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype,
-        "value",
-      )?.set;
-      setter?.call(input, "RECOVER OWNER CREDENTIAL");
-      input?.dispatchEvent(new Event("input", { bubbles: true }));
-      await settle();
-    });
-    expect(issue?.disabled).toBe(true);
-    await act(async () => {
-      const setter = Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype,
-        "value",
-      )?.set;
-      setter?.call(
-        input,
-        "RECOVER OWNER CREDENTIAL FOR ARTIFACT artifact-demo: REDEMPTION REPLACES THE CURRENT OWNER CREDENTIAL (Demo artifact)",
-      );
-      input?.dispatchEvent(new Event("input", { bubbles: true }));
-      await settle();
-    });
-    expect(issue?.disabled).toBe(false);
-    await act(async () => {
-      issue?.click();
-      await settle();
-    });
-    expect(container.textContent).toContain("Copy this code now");
-    expect(container.textContent).toContain(
-      "panes-reconnect-0123456789abcdef0123456789abcdef",
-    );
-    const copy = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Copy reconnect code",
-    );
-    await act(async () => {
-      copy?.click();
-      await settle();
-    });
-    expect(writeText).toHaveBeenCalledWith(
-      "panes-reconnect-0123456789abcdef0123456789abcdef",
-    );
-    expect(requests.filter(({ method }) => method === "POST")).toHaveLength(1);
-    expect(requests[1]?.body).toContain("REDEMPTION REPLACES");
-  });
-
-  it("shows a rotated Creator URL only after rotation and explains deletion consequences", async () => {
-    const writeText = vi.fn(async () => undefined);
-    Object.defineProperty(navigator, "clipboard", {
-      configurable: true,
-      value: { writeText },
-    });
-    const payload = {
-      projects: [
-        {
-          projectId: "project-demo",
-          artifacts: [
-            {
-              artifactId: "artifact-demo",
-              slug: "demo",
-              title: "Demo artifact",
-              kind: null,
-              lifecycleState: "active",
-              revisionCount: 1,
-              storageBytes: 10,
-              lastSyncedAt: "2026-08-29T12:00:00.000Z",
-              creatorLink: {
-                status: "active",
-                expiresAt: "2026-09-28T12:00:00.000Z",
-              },
-              publication: {
-                status: "none",
-                revisionVersion: null,
-                expiresAt: null,
-              },
-              revisions: [
-                { version: 1, createdAt: "2026-08-29T12:00:00.000Z" },
-              ],
-              warnings: [],
-            },
-          ],
-        },
-      ],
-    };
-    const requests: Array<{ method: string; url: string }> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = String(input);
-        requests.push({ method: init?.method ?? "GET", url });
-        if (url.endsWith("/creator/rotate")) {
-          return new Response(
-            JSON.stringify({
-              cloudArtifactId: "artifact-demo",
-              creatorUrl: "https://panes.example/creator/rotated-secret",
-              creatorExpiresAt: "2026-09-28T12:00:00.000Z",
-            }),
-          );
-        }
-        return new Response(JSON.stringify(payload));
-      }),
-    );
-
-    await act(async () => {
-      root.render(<App route={{ kind: "inventory" }} />);
-      await settle();
-    });
-    const manage =
-      container.querySelector<HTMLDetailsElement>(".inventory-manage");
-    await act(async () => {
-      manage?.querySelector("summary")?.click();
-      await settle();
-    });
-    expect(container.textContent).toContain(
-      "permanently remove Creator/public links, cloud metadata, and stored bytes",
-    );
-    expect(container.textContent).toContain(
-      "Canonical local files remain unchanged",
-    );
-    expect(container.textContent).not.toContain("rotated-secret");
-
-    const rotate = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Rotate Creator link",
-    );
-    await act(async () => {
-      rotate?.click();
-      await settle();
-    });
-    expect(container.textContent).toContain("rotated-secret");
-    expect(container.textContent).toContain("Expires Sep 28, 2026");
-    expect(container.textContent).toContain("(30 days)");
-    const copy = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Copy Creator URL",
-    );
-    expect(copy).not.toBeUndefined();
-    await act(async () => {
-      copy?.click();
-      await settle();
-    });
-    expect(writeText).toHaveBeenCalledWith(
-      "https://panes.example/creator/rotated-secret",
-    );
-    expect(requests.filter(({ method }) => method === "POST")).toHaveLength(1);
-  });
-
-  it("requires exact deletion confirmation and refreshes after an inventory action", async () => {
-    const requests: Array<{ method: string; url: string; body?: string }> = [];
-    const payload = {
-      projects: [
-        {
-          projectId: "project-demo",
-          artifacts: [
-            {
-              artifactId: "artifact-demo",
-              slug: "demo",
-              title: "Demo artifact",
-              kind: null,
-              lifecycleState: "active",
-              revisionCount: 1,
-              storageBytes: 10,
-              lastSyncedAt: "2026-08-29T12:00:00.000Z",
-              creatorLink: {
-                status: "active",
-                expiresAt: "2026-09-28T12:00:00.000Z",
-              },
-              publication: {
-                status: "active",
-                revisionVersion: 1,
-                expiresAt: "2026-09-05T12:00:00.000Z",
-                publicUrl: null,
-              },
-              revisions: [
-                { version: 1, createdAt: "2026-08-29T12:00:00.000Z" },
-              ],
-              warnings: [],
-            },
-          ],
-        },
-      ],
-    };
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = String(input);
-        requests.push({
-          method: init?.method ?? "GET",
-          url,
-          ...(init?.body ? { body: String(init.body) } : {}),
-        });
-        if (init?.method === "DELETE")
-          return new Response(null, { status: 204 });
-        return new Response(JSON.stringify(payload));
-      }),
-    );
-
-    await act(async () => {
-      root.render(<App route={{ kind: "inventory" }} />);
-      await settle();
-    });
-
-    const manage =
-      container.querySelector<HTMLDetailsElement>(".inventory-manage");
-    await act(async () => {
-      manage?.querySelector("summary")?.click();
-      await settle();
-    });
-    const deleteButton = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Delete cloud copy",
-    );
-    expect(deleteButton?.disabled).toBe(true);
-    const input = container.querySelector<HTMLInputElement>(
-      "#delete-artifact-demo",
-    );
-    expect(input).not.toBeNull();
-    await act(async () => {
-      const setter = Object.getOwnPropertyDescriptor(
-        HTMLInputElement.prototype,
-        "value",
-      )?.set;
-      setter?.call(input, "DELETE CLOUD COPY OF Demo artifact");
-      input?.dispatchEvent(new Event("input", { bubbles: true }));
-      await settle();
-    });
-    expect(deleteButton?.disabled).toBe(false);
-
-    await act(async () => {
-      deleteButton?.click();
-      await settle();
-    });
-    expect(requests.filter(({ method }) => method === "DELETE")).toHaveLength(
-      1,
-    );
-    expect(requests.filter(({ method }) => method === "GET")).toHaveLength(2);
-    expect(requests.find(({ method }) => method === "DELETE")?.body).toBe(
-      JSON.stringify({ confirmation: "DELETE CLOUD COPY OF Demo artifact" }),
-    );
-  });
-
-  it.each([
-    [401, "Inventory access denied", "approved Access identity"],
-    [503, "Inventory unavailable", "could not be loaded"],
-  ] as const)(
-    "renders inventory failure state %s",
-    async (status, eyebrow, title) => {
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(
-          async () =>
-            new Response(
-              JSON.stringify({
-                error: { code: "UNAUTHORIZED", message: "generic" },
-              }),
-              {
-                status,
-              },
-            ),
-        ),
-      );
-      await act(async () => {
-        root.render(<App route={{ kind: "inventory" }} />);
-        await settle();
-      });
-      expect(container.textContent).toContain(eyebrow);
-      expect(container.textContent).toContain(title);
-      expect(container.textContent).not.toContain("generic");
-    },
-  );
-
-  it("renders an empty inventory without lifecycle controls", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(JSON.stringify({ projects: [] }))),
-    );
-    await act(async () => {
-      root.render(<App route={{ kind: "inventory" }} />);
-      await settle();
-    });
-    expect(container.textContent).toContain("Your cloud shelf is clear.");
-    expect(container.textContent).not.toContain("Publish");
-    expect(container.textContent).not.toContain("Delete");
-  });
-
-  it("keeps advanced Creator share controls behind Manage share", () => {
-    const workspace: CreatorWorkspaceResponse = {
-      cloudArtifactId: "artifact-demo",
-      cloudProjectId: "project-demo",
-      slug: "demo",
-      title: "Demo artifact",
-      creatorExpiresAt: "2026-09-28T12:00:00.000Z",
-      revisions: [
-        {
-          id: "revision-demo",
-          version: 1,
-          preview: { adapter: "browser", entryPath: "index.html" },
-          approvedOrigins: [],
-          files: [
-            {
-              kind: "file",
-              path: "index.html",
-              sha256: "a".repeat(64),
-              byteSize: 10,
-              mediaType: "text/html",
-            },
-          ],
-          createdAt: "2026-08-29T12:00:00.000Z",
-        },
-      ],
-      publication: {
-        id: "publication-demo",
-        artifactId: "artifact-demo",
-        revisionVersion: 1,
-        durationDays: 7,
-        status: "active",
-        createdAt: "2026-08-29T12:00:00.000Z",
-        expiresAt: "2026-09-05T12:00:00.000Z",
-        publicUrl: "https://panes.example/published/secret-token",
-      },
-      publicationHistory: [],
-    };
-    const markup = renderToStaticMarkup(
-      <CreatorWorkspace token="creator-token" workspace={workspace} />,
-    );
-    expect(markup).not.toContain("authenticated cloud inventory");
-    expect(markup).toContain("Manage share");
-    expect(markup).toContain("Extend by 7 days");
-    expect(markup).toContain("Republish v1");
-    expect(markup).not.toContain(
-      "https://panes.example/published/secret-token",
-    );
-    expect(markup).not.toContain("Copy public URL");
-  });
-  it("preserves raw source as text in code mode", () => {
-    const source = '<script>alert("raw")</script>\n# heading';
-    const markup = renderToStaticMarkup(
-      <SourceCode source={source} type="markdown" />,
-    );
-
-    expect(markup).toContain(
-      "&lt;script&gt;alert(&quot;raw&quot;)&lt;/script&gt;",
-    );
-    expect(markup).not.toContain("<script>");
-    expect(markup).toContain("# heading");
-  });
-
-  it("keeps the public workspace read-only and labels user-generated content", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(
-            JSON.stringify({
-              artifact: {
-                id: ARTIFACT.id,
-                title: ARTIFACT.title,
-                type: ARTIFACT.type,
-              },
-              publishedAt: "2026-08-17T10:02:00.000Z",
-              revision: REVISIONS[0],
-              legacy: { readOnly: true },
-            }),
-          ),
-      ),
-    );
-
-    await act(async () => {
-      root.render(<App route={{ kind: "shared", token: "public-token" }} />);
-      await settle();
-    });
-
-    expect(container.textContent).toContain("User-generated content.");
-    expect(container.textContent).toContain("LEGACY · READ-ONLY");
-    expect(container.textContent).toContain("Copy link");
-    expect(container.textContent).not.toContain("Publish v");
-    expect(container.textContent).not.toContain("Unpublish");
-  });
-
-  it("shows private Legacy metadata and omits publication controls", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url.endsWith("/revisions")) {
-          return new Response(
-            JSON.stringify({ artifactId: ARTIFACT.id, revisions: REVISIONS }),
-          );
-        }
-        return new Response(
-          JSON.stringify({
-            artifact: ARTIFACT,
-            revision: REVISIONS[0],
-            viewerUrl: "https://panes.example/artifacts/artifact-1",
-            legacy: {
-              readOnly: true,
-              migratedAt: "2026-08-17T10:00:00.000Z",
-              privateExpiresAt: "2026-09-16T10:00:00.000Z",
-            },
-          }),
-        );
-      }),
-    );
-
-    await act(async () => {
-      root.render(
-        <App
-          route={{ artifactId: ARTIFACT.id, kind: "artifact" }}
-          workspaceAccess={{ status: "ready", token: "workspace-token" }}
-        />,
-      );
-      await settle();
-    });
-
-    expect(container.textContent).toContain("LEGACY · READ-ONLY");
-    expect(container.textContent).toContain("EXPIRES");
-    expect(container.textContent).not.toContain("Publish v");
-    expect(container.textContent).not.toContain("Unpublish");
-  });
-
-  it("selects synced Creator revisions and inspects nested text and binary files", async () => {
-    const creatorResponse = {
-      cloudArtifactId: "cloud-artifact-1",
-      cloudProjectId: "cloud-project-1",
-      creatorExpiresAt: "2026-09-28T10:00:00.000Z",
-      revisions: [
-        {
-          approvedOrigins: [],
-          createdAt: "2026-08-18T10:00:00.000Z",
-          files: [
-            {
-              byteSize: 4,
-              kind: "file" as const,
-              mediaType: "application/octet-stream",
-              path: "assets/data.bin",
-              sha256: "a".repeat(64),
-            },
-            {
-              byteSize: 18,
-              kind: "file" as const,
-              mediaType: "text/html",
-              path: "index.html",
-              sha256: "b".repeat(64),
-            },
-          ],
-          id: "cloud-revision-2",
-          preview: { adapter: "browser" as const, entryPath: "index.html" },
-          version: 2,
-        },
-        {
-          approvedOrigins: [],
-          createdAt: "2026-08-17T10:00:00.000Z",
-          files: [
-            {
-              byteSize: 31,
-              kind: "file" as const,
-              mediaType: "text/markdown",
-              path: "docs/README.md",
-              sha256: "c".repeat(64),
-            },
-          ],
-          id: "cloud-revision-1",
-          preview: {
-            adapter: "renderer" as const,
-            renderer: "markdown" as const,
-            entryPath: "docs/README.md",
-          },
-          version: 1,
-        },
-      ],
-      slug: "creator-test",
-      title: "Creator test",
-    };
-    const fileRequests: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url.endsWith("/api/creator/creator-token")) {
-          return new Response(JSON.stringify(creatorResponse));
-        }
-        fileRequests.push(url);
-        if (url.includes("docs/README.md")) {
-          return new Response("# <safe>");
-        }
-        if (url.includes("assets/data.bin")) {
-          return new Response(Uint8Array.from([0, 255, 1, 254]));
-        }
-        return new Response("<h1>v2</h1>");
-      }),
-    );
-
-    await act(async () => {
-      root.render(<App route={{ kind: "creator", token: "creator-token" }} />);
-      await settle();
-    });
-    const select = container.querySelector("select");
-    expect(select?.textContent).toContain("v2");
-    expect(select?.textContent).toContain("v1");
-    const durationSelect = container.querySelectorAll("select")[1];
-    expect(
-      [...((durationSelect?.options ?? []) as HTMLOptionsCollection)].map(
-        (option) => option.value,
-      ),
-    ).toEqual(["1", "7", "30"]);
-    expect(durationSelect?.value).toBe("7");
-    expect(
-      container.querySelector('iframe[sandbox="allow-scripts"]'),
-    ).not.toBeNull();
-    expect(container.innerHTML).not.toContain("object_key");
-
-    await act(async () => {
-      if (!select) return;
-      select.value = "1";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-      await settle();
-    });
-    const filesButton = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Files",
-    );
-    await act(async () => {
-      filesButton?.click();
-      await settle();
-    });
-    expect(container.textContent).toContain("docs/README.md");
-    expect(container.textContent).toContain("# <safe>");
-    expect(fileRequests.some((url) => url.includes("docs/README.md"))).toBe(
-      true,
-    );
-
-    await act(async () => {
-      if (!select) return;
-      select.value = "2";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-      await settle();
-    });
-    const binaryButton = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Files",
-    );
-    expect(binaryButton).toBeDefined();
-    const binaryFile = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "assets/data.bin",
-    );
-    await act(async () => {
-      binaryFile?.click();
-      await settle();
-    });
-    expect(container.textContent).toContain(
-      "This binary file is not decoded as text.",
-    );
-    expect(container.textContent).toContain("Download data.bin");
-    expect(fileRequests.some((url) => url.includes("assets/data.bin"))).toBe(
-      false,
-    );
-  });
-
-  it("renders a public publication without private actions or eager binary fetches", async () => {
-    const fileRequests: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL) => {
-        const url = String(input);
-        if (url.endsWith("/api/publications/public-token")) {
-          return new Response(
-            JSON.stringify({
-              artifact: { slug: "public-demo", title: "Public demo" },
-              expiresAt: "2026-09-05T12:00:00.000Z",
-              revision: {
-                approvedOrigins: [],
-                createdAt: "2026-08-29T12:00:00.000Z",
-                files: [
-                  {
-                    byteSize: 18,
-                    kind: "file",
-                    mediaType: "text/html",
-                    path: "index.html",
-                  },
-                  {
-                    byteSize: 4,
-                    kind: "file",
-                    mediaType: "application/octet-stream",
-                    path: "assets/data.bin",
-                  },
-                ],
-                preview: { adapter: "browser", entryPath: "index.html" },
-                version: 3,
-              },
-              status: "active",
-            }),
-          );
-        }
-        fileRequests.push(url);
-        return new Response("<h1>Public</h1>");
-      }),
-    );
-
-    await act(async () => {
-      root.render(<App route={{ kind: "published", token: "public-token" }} />);
-      await settle();
-    });
-
-    expect(container.textContent).toContain("Public demo");
-    expect(container.textContent).toContain("Available until");
-    expect(container.textContent).not.toContain("Revision");
-    expect(container.textContent).not.toContain("Publish");
-    expect(container.textContent).not.toContain("Unpublish");
-    expect(container.textContent).not.toContain("Creator");
-    expect(container.querySelectorAll("select")).toHaveLength(0);
-
-    const filesButton = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "Files",
-    );
-    await act(async () => {
-      filesButton?.click();
-      await settle();
-    });
-    const binaryButton = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent === "assets/data.bin",
-    );
-    await act(async () => {
-      binaryButton?.click();
-      await settle();
-    });
-    expect(container.textContent).toContain("Download data.bin");
-    expect(fileRequests.some((url) => url.includes("assets/data.bin"))).toBe(
-      false,
-    );
-  });
-
-  it.each([
-    [404, "Publication not found", "This publication does not exist."],
-    [410, "Publication inactive", "This publication is no longer active."],
-  ] as const)(
-    "keeps public publication status %s in the status view",
-    async (status, eyebrow, title) => {
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(
-          async () =>
-            new Response(
-              JSON.stringify({
-                error: {
-                  code: "NOT_FOUND",
-                  message: "Publication unavailable",
-                },
-              }),
-              { status },
-            ),
-        ),
-      );
-
-      await act(async () => {
-        root.render(
-          <App route={{ kind: "published", token: "public-token" }} />,
-        );
-        await settle();
-      });
-
-      expect(container.textContent).toContain(eyebrow);
-      expect(container.textContent).toContain(title);
-      expect(container.textContent).not.toContain("public-token");
-    },
-  );
-
-  it.each([
-    [404, "Creator link not found", "This creator workspace does not exist."],
-    [410, "Creator link expired", "This creator workspace has expired."],
-  ] as const)(
-    "maps Creator API %s to the existing status view",
-    async (status, eyebrow, title) => {
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(
-          async () =>
-            new Response(
-              JSON.stringify({
-                error: { code: "NOT_FOUND", message: "Creator link failed" },
-              }),
-              { status },
-            ),
-        ),
-      );
-
-      await act(async () => {
-        root.render(
-          <App route={{ kind: "creator", token: "creator-token" }} />,
-        );
-        await settle();
-      });
-
-      expect(container.textContent).toContain(eyebrow);
-      expect(container.textContent).toContain(title);
-    },
-  );
-});
-
-async function settle(): Promise<void> {
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
+
+function button(label: string): HTMLButtonElement {
+  const found = [...container.querySelectorAll("button")].find(
+    (item) => item.textContent?.trim() === label,
+  );
+  expect(found, `Button "${label}" exists`).toBeDefined();
+  return found!;
+}
+
+async function click(element: HTMLElement) {
+  await act(async () => element.click());
+}
+
+async function change(selector: string, value: string) {
+  const element = container.querySelector(selector)!;
+  expect(element).not.toBeNull();
+  await act(async () => {
+    const prototype =
+      element instanceof HTMLSelectElement
+        ? HTMLSelectElement.prototype
+        : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype, "value")!.set!.call(
+      element,
+      value,
+    );
+    element.dispatchEvent(
+      new Event(element instanceof HTMLSelectElement ? "change" : "input", {
+        bubbles: true,
+      }),
+    );
+  });
+}
+
+const cards = () => [...container.querySelectorAll(".artifact-card")];
+const mutations = () =>
+  fetcher.mock.calls.filter(
+    ([, init]) => init?.method === "PUT" || init?.method === "DELETE",
+  );
+
+describe("artifact library", () => {
+  it("distinguishes the latest private upload from the older shared version", async () => {
+    library.artifacts[0]!.share = { ...active };
+    await mount();
+    expect(cards()[0]?.textContent).toContain("Latest v2 / Shared v1");
+  });
+
+  it("leaves same-page fragment links to the browser", async () => {
+    await mount();
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    container.querySelector('a[href="#main"]')!.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+  });
+  it("redirects root to the library and displays real projects, titles, and statuses", async () => {
+    await mount("/");
+    expect(window.location.pathname).toBe("/inventory");
+    expect(cards()).toHaveLength(3);
+    expect(container.textContent).toContain("Field Notes");
+    expect(container.textContent).toContain("Little Experiments");
+    expect(cards()[0]?.textContent).toContain("An illustrated field guide");
+    expect(cards()[0]?.textContent).toContain("Private");
+    expect(cards()[1]?.textContent).toContain("Shared");
+    expect(cards()[1]?.textContent).toContain("No expiry");
+    expect(cards()[2]?.textContent).toContain("Expired");
+    expect(container.textContent).not.toMatch(/Creator|Owner|recovery|storage/);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/library",
+      expect.objectContaining({
+        credentials: "same-origin",
+        cache: "no-store",
+      }),
+    );
+  });
+
+  it("uses isolated lazy thumbnails that can render browser-built JavaScript", async () => {
+    await mount();
+    const frames = [...container.querySelectorAll("iframe")];
+    expect(frames).toHaveLength(3);
+    for (const frame of frames) {
+      expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+      expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
+      expect(frame.getAttribute("loading")).toBe("lazy");
+      expect(frame.tabIndex).toBe(-1);
+      expect(frame.getAttribute("aria-hidden")).toBe("true");
+    }
+    expect(frames[0]?.getAttribute("src")).toBe(version(2).previewUrl);
+  });
+
+  it("filters by project and status, searches friendly names, and navigates cards", async () => {
+    await mount();
+    await click(
+      container.querySelector<HTMLAnchorElement>(
+        'a[href="/inventory?project=project-one"]',
+      )!,
+    );
+    expect(window.location.search).toBe("?project=project-one");
+    expect(cards()).toHaveLength(2);
+    await click(button("Expired"));
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0]?.textContent).toContain("The first sketch");
+    await click(button("Private"));
+    expect(cards()[0]?.textContent).toContain("An illustrated field guide");
+    await change('input[type="search"]', "no such work");
+    expect(cards()).toHaveLength(0);
+    expect(container.textContent).toContain("Nothing in this view yet");
+    await click(button("Clear search and filters"));
+    await click(
+      container.querySelector<HTMLAnchorElement>(
+        'a[aria-label="Panes library"]',
+      )!,
+    );
+    await change('input[type="search"]', "LITTLE EXPERIMENTS");
+    expect(cards()).toHaveLength(1);
+    await click(cards()[0] as HTMLElement);
+    expect(window.location.pathname).toBe("/inventory/artifacts/artifact-two");
+    expect(container.querySelector("h1")?.textContent).toBe("A moving study");
+    expect(
+      container.querySelector('[aria-label="Breadcrumb"]')?.textContent,
+    ).toContain("Little Experiments");
+    expect(container.querySelector('[aria-label="Sharing"]')).not.toBeNull();
+  });
+
+  it("refreshes explicitly and on window focus without resetting search", async () => {
+    await mount();
+    await change('input[type="search"]', "illustrated");
+    const count = fetcher.mock.calls.length;
+    await act(async () => window.dispatchEvent(new Event("focus")));
+    expect(fetcher.mock.calls.length).toBe(count + 1);
+    expect(
+      container.querySelector<HTMLInputElement>('input[type="search"]')?.value,
+    ).toBe("illustrated");
+    await click(button("Refresh"));
+    expect(fetcher.mock.calls.length).toBe(count + 2);
+  });
+
+  it("responds to browser history navigation", async () => {
+    await mount();
+    await click(cards()[0] as HTMLElement);
+    await act(async () => {
+      window.history.replaceState(null, "", "/inventory?project=project-two");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0]?.textContent).toContain("A moving study");
+  });
+
+  it("explains how to add the first artifact without invented content", async () => {
+    library = { projects: [], artifacts: [] };
+    await mount();
+    expect(container.textContent).toContain("Your next idea belongs here");
+    expect(container.textContent).toContain(
+      "Ask OpenCode to upload a file or folder",
+    );
+    expect(cards()).toHaveLength(0);
+  });
+
+  it("announces loading and handles authentication and retry", async () => {
+    let resolve!: (value: Response) => void;
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((done) => {
+          resolve = done;
+        }),
+    );
+    await mount();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "Loading your library",
+    );
+    await act(async () => resolve(json({}, 401)));
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "sign in again",
+    );
+    await click(button("Refresh"));
+    expect(cards()).toHaveLength(3);
+  });
+});
+
+describe("artifact detail and sharing", () => {
+  it("keeps new versions fetched while a share request is pending", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    await click(button("Publish"));
+    let finish!: (response: Response) => void;
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await click(button("Confirm publish"));
+    library.artifacts[0]!.versions.push(version(3));
+    await act(async () => window.dispatchEvent(new Event("focus")));
+    library.artifacts[0]!.share = { ...active, versionId: "version-2" };
+    await act(async () => finish(json(library.artifacts[0]!.share)));
+    expect(
+      container.querySelector('select[aria-label="Version"]')?.textContent,
+    ).toContain("Version 3 (latest)");
+    expect(container.querySelector("iframe")?.getAttribute("src")).toBe(
+      version(3).previewUrl,
+    );
+    expect(container.textContent).toContain("Sharing version 2");
+  });
+
+  it("does not redirect a new page when an old deletion finishes", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    await click(button("Delete artifact"));
+    let finish!: (response: Response) => void;
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await click(button("Delete cloud copy"));
+    await act(async () => {
+      window.history.replaceState(
+        null,
+        "",
+        "/inventory/artifacts/artifact-two",
+      );
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    library.artifacts = library.artifacts.filter(
+      (item) => item.id !== "artifact-one",
+    );
+    await act(async () => finish(new Response(null, { status: 204 })));
+    expect(window.location.pathname).toBe("/inventory/artifacts/artifact-two");
+  });
+  it("sorts versions newest-first and uses only the supplied isolated preview URL", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    const select = [...container.querySelectorAll("select")].find(
+      (element) => element.getAttribute("aria-label") === "Version",
+    )!;
+    expect([...select.options].map((item) => item.value)).toEqual([
+      "version-2",
+      "version-1",
+    ]);
+    expect(select.value).toBe("version-2");
+    const frame = container.querySelector("iframe")!;
+    expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
+    expect(frame.getAttribute("src")).toBe(version(2).previewUrl);
+    expect(frame.getAttribute("srcdoc")).toBeNull();
+    await change('select[aria-label="Version"]', "version-1");
+    expect(container.querySelector("iframe")?.getAttribute("src")).toBe(
+      version(1).previewUrl,
+    );
+  });
+
+  it("publishes with no expiry only after confirming the exact version and accessible files", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    const expirySelect = [...container.querySelectorAll("select")].find(
+      (element) => element.id === "expiry",
+    )!;
+    expect(expirySelect.value).toBe("none");
+    expect([...expirySelect.options].map((item) => item.value)).toEqual([
+      "none",
+      "1",
+      "7",
+      "30",
+    ]);
+    await click(button("Publish"));
+    expect(mutations()).toHaveLength(0);
+    const dialog = container.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("Publish version 2?");
+    expect(dialog.textContent).toContain(
+      "All 3 uploaded files in this version will be accessible",
+    );
+    expect(dialog.textContent).toContain("no expiry");
+    expect(document.activeElement?.textContent).toBe("Cancel");
+    await click(button("Confirm publish"));
+    expect(mutations()).toHaveLength(1);
+    expect(mutations()[0]).toEqual([
+      "/api/library/artifacts/artifact-one/share",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ versionId: "version-2", expiresInDays: null }),
+        credentials: "same-origin",
+      }),
+    ]);
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.querySelector<HTMLInputElement>("#share-url")?.value).toBe(
+      active.url,
+    );
+    expect(container.textContent).toContain(
+      "Published. Your link is ready to share.",
+    );
+    expect(button("Update shared version")).toBeDefined();
+    await click(
+      container.querySelector<HTMLAnchorElement>(
+        '.breadcrumb a[href="/inventory"]',
+      )!,
+    );
+    expect(cards()[0]?.querySelector(".badge")?.textContent).toBe("Shared");
+  });
+
+  it("keeps the confirmed version fixed when a newer upload arrives on focus", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    await click(button("Publish"));
+    library.artifacts[0]!.versions.push(version(3));
+    await act(async () => window.dispatchEvent(new Event("focus")));
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+      "Publish version 2?",
+    );
+    await click(button("Confirm publish"));
+    expect(JSON.parse(mutations()[0]?.[1].body).versionId).toBe("version-2");
+  });
+
+  it("traps keyboard focus inside a sharing confirmation", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    await click(button("Publish"));
+    await act(async () =>
+      button("Cancel").dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Tab",
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    );
+    expect(document.activeElement).toBe(button("Confirm publish"));
+    await act(async () =>
+      button("Confirm publish").dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Tab",
+          bubbles: true,
+          cancelable: true,
+        }),
+      ),
+    );
+    expect(document.activeElement).toBe(button("Cancel"));
+  });
+
+  it("updates the chosen version at the stable link, including a finite expiry", async () => {
+    library.artifacts[0]!.share = { ...active };
+    await mount("/inventory/artifacts/artifact-one");
+    await change("#expiry", "7");
+    await click(button("Update shared version"));
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+      "Your active link stays the same",
+    );
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+      "7 days after confirmation",
+    );
+    await click(button("Confirm update"));
+    expect(JSON.parse(mutations()[0]?.[1].body)).toEqual({
+      versionId: "version-2",
+      expiresInDays: 7,
+    });
+    expect(container.querySelector<HTMLInputElement>("#share-url")?.value).toBe(
+      active.url,
+    );
+    expect(container.textContent).toContain("Sharing version 2");
+    expect(container.textContent).toContain("Your link stays the same");
+    expect(
+      container.querySelector<HTMLAnchorElement>(".link-actions a")?.rel,
+    ).toBe("noopener noreferrer");
+  });
+
+  it("cancels sharing with Escape and restores keyboard focus", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    button("Publish").focus();
+    await click(button("Publish"));
+    await act(async () =>
+      container
+        .querySelector('[role="dialog"]')!
+        .dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        ),
+    );
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(button("Publish"));
+    expect(mutations()).toHaveLength(0);
+  });
+
+  it("copies the active public URL", async () => {
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    await mount("/inventory/artifacts/artifact-two");
+    await click(button("Copy link"));
+    expect(writeText).toHaveBeenCalledWith(active.url);
+    expect(container.textContent).toContain("Link copied.");
+  });
+
+  it.each(["unavailable", "denied"])(
+    "provides a selected manual-copy fallback when clipboard is %s",
+    async (kind) => {
+      if (kind === "denied")
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: {
+            writeText: vi.fn(async () => {
+              throw new Error("Denied");
+            }),
+          },
+        });
+      await mount("/inventory/artifacts/artifact-two");
+      await click(button("Copy link"));
+      const input = container.querySelector<HTMLInputElement>("#share-url")!;
+      expect(document.activeElement).toBe(input);
+      expect(input.selectionStart).toBe(0);
+      expect(input.selectionEnd).toBe(active.url.length);
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+        "Could not copy automatically",
+      );
+      expect(container.textContent).not.toContain("Link copied.");
+    },
+  );
+
+  it("requires separate unpublish confirmation and removes the old link", async () => {
+    await mount("/inventory/artifacts/artifact-two");
+    await click(button("Unpublish"));
+    expect(mutations()).toHaveLength(0);
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+      "Publishing again creates a new link",
+    );
+    await click(button("Cancel"));
+    expect(mutations()).toHaveLength(0);
+    await click(button("Unpublish"));
+    await click(button("Confirm unpublish"));
+    expect(mutations()[0]).toEqual([
+      "/api/library/artifacts/artifact-two/share",
+      expect.objectContaining({ method: "DELETE" }),
+    ]);
+    expect(container.querySelector("#share-url")).toBeNull();
+    expect(container.textContent).toContain("The old link no longer works");
+    expect(button("Publish")).toBeDefined();
+  });
+
+  it("confirms cloud-only deletion separately and returns to the refreshed library", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    await click(button("Delete artifact"));
+    expect(mutations()).toHaveLength(0);
+    const dialog = container.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("permanently deleted from the cloud");
+    expect(dialog.textContent).toContain(
+      "Your local files will not be changed",
+    );
+    await click(button("Delete cloud copy"));
+    expect(mutations()[0]).toEqual([
+      "/api/library/artifacts/artifact-one",
+      expect.objectContaining({ method: "DELETE" }),
+    ]);
+    expect(window.location.pathname).toBe("/inventory");
+    expect(cards()).toHaveLength(2);
+    expect(
+      cards().some((item) =>
+        item.textContent?.includes("An illustrated field guide"),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps a failed action in the confirmation without reporting success", async () => {
+    await mount("/inventory/artifacts/artifact-one");
+    await click(button("Publish"));
+    fetcher.mockImplementationOnce(async () => json({}, 503));
+    await click(button("Confirm publish"));
+    expect(
+      container.querySelector('[role="dialog"] [role="alert"]')?.textContent,
+    ).toContain("try again");
+    expect(container.querySelector("#share-url")).toBeNull();
+    expect(button("Confirm publish").disabled).toBe(false);
+  });
+
+  it("does not expose an expired share as an active link", async () => {
+    await mount("/inventory/artifacts/artifact-three");
+    expect(container.querySelector("#share-url")).toBeNull();
+    expect(container.textContent).toContain("This link is no longer available");
+    expect(button("Publish")).toBeDefined();
+  });
+
+  it("handles missing detail without a broken iframe", async () => {
+    await mount("/inventory/artifacts/missing");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "no longer in your library",
+    );
+    expect(container.querySelector("iframe")).toBeNull();
+  });
+});
+
+describe("public viewer", () => {
+  it("fetches PublicArtifact without management cookies and renders a read-only isolated preview", async () => {
+    await mount("/s/public-token");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/shares/public-token",
+      expect.objectContaining({ credentials: "omit", cache: "no-store" }),
+    );
+    expect(container.querySelector("h1")?.textContent).toBe(
+      "An illustrated field guide",
+    );
+    expect(container.textContent).toContain("Read-only");
+    expect(container.querySelector("iframe")?.getAttribute("sandbox")).toBe(
+      "allow-scripts",
+    );
+    expect(container.querySelector("iframe")?.getAttribute("src")).toBe(
+      version(2).previewUrl,
+    );
+    expect(
+      container.querySelector("iframe")?.getAttribute("referrerpolicy"),
+    ).toBe("no-referrer");
+    expect(container.textContent).not.toMatch(
+      /Publish|Unpublish|Delete|Creator|Owner/,
+    );
+    expect(container.querySelector("select")).toBeNull();
+  });
+
+  it.each([403, 404, 410, 503])(
+    "handles public error %s without exposing a preview or token",
+    async (code) => {
+      fetcher.mockImplementation(async () => json({}, code));
+      await mount("/s/secret-public-token");
+      expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+        code === 503 ? "could not be loaded" : "This link is unavailable",
+      );
+      expect(container.querySelector("iframe")).toBeNull();
+      expect(container.textContent).not.toContain("secret-public-token");
+    },
+  );
+
+  it("removes the preview if a refreshed public link has been revoked", async () => {
+    await mount("/s/public-token");
+    expect(container.querySelector("iframe")).not.toBeNull();
+    fetcher.mockImplementation(async () => json({}, 410));
+    await act(async () => window.dispatchEvent(new Event("focus")));
+    expect(container.querySelector("iframe")).toBeNull();
+    expect(container.textContent).toContain("This link is unavailable");
+  });
+});

@@ -1,0 +1,111 @@
+:root {
+  color-scheme: light;
+  font-family: "Avenir Next", Avenir, sans-serif;
+  color: #243f35;
+  background: #f2f7f3;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 24px 5%;
+  border-bottom: 1px solid #d4e1d8;
+}
+header strong {
+  font-size: 20px;
+  letter-spacing: -1px;
+}
+header > span {
+  margin-left: auto;
+  font-size: 12px;
+}
+main {
+  padding: 48px 8%;
+  max-width: 1200px;
+  margin: auto;
+}
+.eyebrow,
+article > span {
+  font-size: 10px;
+  letter-spacing: 2px;
+  font-weight: 700;
+}
+h1 {
+  font-family: Georgia, serif;
+  font-weight: 400;
+  font-size: clamp(36px, 6vw, 72px);
+  line-height: 1.04;
+  margin: 20px 0;
+  letter-spacing: -2px;
+}
+.intro {
+  max-width: 380px;
+  font-size: 15px;
+  line-height: 1.6;
+}
+button {
+  margin: 14px 0 36px;
+  padding: 13px 20px;
+  border: 0;
+  border-radius: 24px;
+  background: #244e3d;
+  color: white;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+}
+button span {
+  padding-left: 20px;
+}
+button:focus-visible {
+  outline: 3px solid #6486df;
+  outline-offset: 3px;
+}
+section {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 18px;
+}
+article {
+  padding: 24px;
+  min-height: 200px;
+  border-radius: 3px;
+  background: #e4ecc5;
+}
+article:nth-child(3n + 2) {
+  background: #dce8f0;
+}
+article:nth-child(3n) {
+  background: #f4e2cd;
+}
+h2 {
+  font-family: Georgia, serif;
+  font-weight: 400;
+  font-size: 25px;
+  line-height: 1.1;
+}
+article p {
+  font-size: 12px;
+  line-height: 1.5;
+}
+#status {
+  font-size: 13px;
+  min-height: 20px;
+}
+@media (max-width: 520px) {
+  main {
+    padding: 28px 6%;
+  }
+  section {
+    grid-template-columns: 1fr;
+  }
+  header > span {
+    display: none;
+  }
+}

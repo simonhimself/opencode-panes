@@ -1,699 +1,583 @@
 import {
-  WORKSPACE_TOKEN_FRAGMENT_KEY,
-  artifactIdSchema,
-  artifactResponseSchema,
-  ownerTokenSchema,
-  type ApiErrorCode,
-  type Artifact,
-  type ErrorIssue,
-  type Revision,
+  filePathSchema,
+  shareRequestSchema,
+  uploadRequestSchema,
+  type ArtifactLibrary,
+  type ArtifactShare,
+  type ArtifactVersion,
+  type LibraryArtifact,
+  type PublicArtifact,
+  type UploadRequest,
+  type UploadResult,
+  type UploadSession,
 } from "@opencode-panes/contracts";
-import { cleanupTemporarySyncUploads, routeSyncRequest } from "./sync";
 import { verifyAccessRequest } from "./access";
 import {
-  deleteInventoryArtifact,
-  deleteLegacyInventoryArtifact,
-} from "./deletion";
-import {
-  inventoryResponse,
-  loadInventory,
-  mutateInventoryPublicationRequest,
-  issueInventoryReconnectCode,
-  rotateInventoryCreator,
-} from "./inventory";
-import { getLegacyArtifact } from "./legacy";
-import { issueLegacyAdoptionCode, redeemLegacyAdoption } from "./adoption";
+  authorizeUpload,
+  devOwner,
+  encodePath,
+  fileHeaders,
+  HttpError,
+  previewToken,
+  previewVersion,
+  readBytes,
+  readJson,
+  requireSameOrigin,
+  sha256,
+} from "./security";
 
-const JSON_HEADERS = {
-  "Cache-Control": "no-store",
-  "Content-Type": "application/json; charset=utf-8",
-  "Referrer-Policy": "no-referrer",
-  "X-Content-Type-Options": "nosniff",
-} as const;
-
-interface ArtifactRow {
-  id: string;
-  owner_token_hash: string;
-  workspace_token_hash: string;
-  title: string;
-  type: Artifact["type"];
-  current_revision_id: string;
-  created_at: string;
-  updated_at: string;
-}
-
-interface RevisionRow {
+interface UploadRow {
   id: string;
   artifact_id: string;
-  version: number;
-  source: string;
+  manifest: string;
+  deleted_at: string | null;
+}
+interface VersionRow extends UploadRow {
+  number: number;
   created_at: string;
 }
-
-interface PublicShareRow extends RevisionRow {
-  title: string;
-  type: Artifact["type"];
-  published_at: string;
-  public_expires_at: string | null;
-  revoked_at: string | null;
-}
-
-interface TimingSafeSubtleCrypto extends SubtleCrypto {
-  timingSafeEqual(
-    left: ArrayBuffer | ArrayBufferView,
-    right: ArrayBuffer | ArrayBufferView,
-  ): boolean;
+interface ShareRow {
+  token: string;
+  version_id: string;
+  expires_at: string | null;
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const crossOriginError = rejectCrossOriginRequest(request);
-    if (crossOriginError) return crossOriginError;
-
-    if (request.method === "OPTIONS")
-      return withCorsHeaders(request, preflightResponse(request));
-
+    let response: Response;
     try {
-      const response = await routeRequest(request, env);
-      return withCorsHeaders(request, response);
+      response = await route(request, env);
     } catch (error) {
-      logUnexpectedError(request, error);
-      return withCorsHeaders(
-        request,
-        errorResponse(500, "INTERNAL_ERROR", "An internal error occurred"),
+      // Never log the request URL or raw exceptions: both can contain capabilities.
+      response = Response.json(
+        {
+          error:
+            error instanceof HttpError
+              ? error.message
+              : "Internal server error",
+        },
+        { status: error instanceof HttpError ? error.status : 500 },
       );
     }
+    const headers = new Headers(response.headers);
+    headers.set("Cache-Control", "no-store");
+    headers.set("Referrer-Policy", "no-referrer");
+    headers.set("X-Content-Type-Options", "nosniff");
+    return new Response(response.body, { status: response.status, headers });
   },
-  async scheduled(
-    controller: ScheduledController,
-    env: Env,
-    _ctx: ExecutionContext,
-  ): Promise<void> {
-    await cleanupTemporarySyncUploads(env, new Date(controller.scheduledTime));
+  async scheduled(_event: ScheduledController, env: Env): Promise<void> {
+    // Tombstones are retained to deny stale uploads and retry interrupted cleanup.
+    const deleted = await env.DB.prepare(
+      "SELECT id FROM library_artifacts WHERE deleted_at IS NOT NULL",
+    ).all<{ id: string }>();
+    for (const artifact of deleted.results)
+      await purgeObjects(env, artifact.id);
   },
 } satisfies ExportedHandler<Env>;
 
-async function routeRequest(request: Request, env: Env): Promise<Response> {
-  const { pathname } = new URL(request.url);
+async function route(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const method = request.method;
+  if (path === "/" && (method === "GET" || method === "HEAD"))
+    return Response.redirect(`${url.origin}/inventory`, 302);
 
-  if (pathname.startsWith("/api/inventory")) {
-    const access = await verifyAccessRequest(request, env);
-    if (!access.ok) {
-      return errorResponse(
-        access.status,
-        access.status === 503 ? "SERVICE_UNAVAILABLE" : "UNAUTHORIZED",
-        access.status === 503
-          ? "Inventory authentication is unavailable"
-          : "Inventory authentication is required",
+  if (path === "/api/uploads" || path.startsWith("/api/uploads/")) {
+    authorizeUpload(request, env);
+    if (path === "/api/uploads" && method === "POST")
+      return startUpload(request, env);
+    const file = /^\/api\/uploads\/([a-f0-9-]{36})\/files\/(.+)$/u.exec(path);
+    if (file && method === "PUT")
+      return putFile(request, env, file[1]!, decodeFilePath(file[2]!));
+    const commit = /^\/api\/uploads\/([a-f0-9-]{36})\/commit$/u.exec(path);
+    if (commit && method === "POST") {
+      await readBytes(request, 0);
+      return commitUpload(env, commit[1]!, url.origin);
+    }
+    throw new HttpError(404, "Not found");
+  }
+
+  if (
+    path === "/inventory" ||
+    path.startsWith("/inventory/") ||
+    path === "/api/library" ||
+    path.startsWith("/api/library/")
+  ) {
+    if (!devOwner(request, env)) {
+      const access = await verifyAccessRequest(request, env);
+      if (!access.ok)
+        throw new HttpError(
+          access.status,
+          access.status === 503
+            ? "Owner authentication unavailable"
+            : "Unauthorized",
+        );
+    }
+    if (method !== "GET" && method !== "HEAD") requireSameOrigin(request);
+    if (
+      path.startsWith("/inventory") &&
+      (method === "GET" || method === "HEAD")
+    )
+      return assets(request, env);
+    if (path === "/api/library" && method === "GET")
+      return Response.json(await library(env, url.origin));
+    const artifact =
+      /^\/api\/library\/artifacts\/([a-f0-9-]{36})(\/share)?$/u.exec(path);
+    if (artifact) {
+      const id = artifact[1]!;
+      if (!artifact[2] && method === "DELETE") {
+        await readBytes(request, 0);
+        // Deny reads and new commits atomically before touching object storage.
+        await env.DB.batch([
+          env.DB.prepare(
+            "UPDATE library_artifacts SET deleted_at = COALESCE(deleted_at, ?) WHERE id = ?",
+          ).bind(new Date().toISOString(), id),
+          env.DB.prepare(
+            "DELETE FROM library_shares WHERE artifact_id = ?",
+          ).bind(id),
+        ]);
+        await purgeObjects(env, id);
+        return new Response(null, { status: 204 });
+      }
+      if (!artifact[2] && method === "GET") {
+        const found = (await library(env, url.origin, id)).artifacts[0];
+        if (!found) throw new HttpError(404, "Not found");
+        return Response.json(found);
+      }
+      if (artifact[2] && method === "PUT")
+        return shareArtifact(request, env, id);
+      if (artifact[2] && method === "DELETE") {
+        await readBytes(request, 0);
+        await env.DB.prepare("DELETE FROM library_shares WHERE artifact_id = ?")
+          .bind(id)
+          .run();
+        return new Response(null, { status: 204 });
+      }
+    }
+    throw new HttpError(404, "Not found");
+  }
+
+  const share =
+    /^\/api\/shares\/([a-f0-9]{64})(?:\/versions\/([a-f0-9-]{36})\/files\/(.+))?$/u.exec(
+      path,
+    );
+  if (share && (method === "GET" || method === "HEAD")) {
+    const selected = await publicVersion(env, share[1]!);
+    if (share[2]) {
+      if (share[2] !== selected.id) throw new HttpError(404, "Not found");
+      return serveFile(
+        env,
+        selected,
+        decodeFilePath(share[3]!),
+        `${url.origin}/api/shares/${share[1]}/versions/${selected.id}/files/`,
+        method === "HEAD",
       );
     }
+    const manifest = uploadRequestSchema.parse(JSON.parse(selected.manifest));
+    const body: PublicArtifact = {
+      title: manifest.title,
+      version: versionInfo(
+        selected,
+        `${url.origin}/api/shares/${share[1]}/versions/${selected.id}/files/${encodePath(manifest.entryPath)}`,
+      ),
+      expiresAt: selected.expires_at,
+    };
+    return Response.json(body);
   }
-
-  const syncResponse = await routeSyncRequest(request, env);
-  if (syncResponse) return syncResponse;
-
-  if (pathname === "/api/inventory") {
-    if (request.method !== "GET") return methodNotAllowed(["GET"]);
-    return inventoryResponse(await loadInventory(request, env));
-  }
-
-  const adoptionIssue = pathname.match(
-    /^\/api\/inventory\/legacy\/artifacts\/([^/]+)\/adoption-code$/u,
-  );
-  if (adoptionIssue) {
-    if (request.method !== "POST") return methodNotAllowed(["POST"]);
-    const artifactId = parseArtifactId(adoptionIssue[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return issueLegacyAdoptionCode(env, artifactId);
-  }
-
-  const adoptionRedeem = pathname.match(/^\/api\/adopt\/legacy\/([^/]+)$/u);
-  if (adoptionRedeem) {
-    if (request.method !== "POST") return methodNotAllowed(["POST"]);
-    const artifactId = parseArtifactId(adoptionRedeem[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return redeemLegacyAdoption(request, env, artifactId);
-  }
-
-  const inventoryCreatorRotation = pathname.match(
-    /^\/api\/inventory\/artifacts\/([^/]+)\/creator\/rotate$/u,
-  );
-  if (inventoryCreatorRotation) {
-    if (request.method !== "POST") return methodNotAllowed(["POST"]);
-    const artifactId = parseArtifactId(inventoryCreatorRotation[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return rotateInventoryCreator(request, env, artifactId);
-  }
-
-  const inventoryReconnect = pathname.match(
-    /^\/api\/inventory\/artifacts\/([^/]+)\/reconnect-code$/u,
-  );
-  if (inventoryReconnect) {
-    if (request.method !== "POST") return methodNotAllowed(["POST"]);
-    const artifactId = parseArtifactId(inventoryReconnect[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return issueInventoryReconnectCode(request, env, artifactId);
-  }
-
-  const inventoryPublication = pathname.match(
-    /^\/api\/inventory\/artifacts\/([^/]+)\/publication\/(extend|unpublish|republish)$/u,
-  );
-  if (inventoryPublication) {
-    if (request.method !== "POST") return methodNotAllowed(["POST"]);
-    const artifactId = parseArtifactId(inventoryPublication[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return mutateInventoryPublicationRequest(
-      request,
+  const preview = /^\/api\/previews\/([^/]+)\/files\/(.+)$/u.exec(path);
+  if (preview && (method === "GET" || method === "HEAD")) {
+    const version = await getVersion(env, previewVersion(preview[1]!, env));
+    return serveFile(
       env,
-      artifactId,
-      inventoryPublication[2] as "extend" | "unpublish" | "republish",
+      version,
+      decodeFilePath(preview[2]!),
+      `${url.origin}/api/previews/${preview[1]}/files/`,
+      method === "HEAD",
     );
   }
-
-  const inventoryDeletion = pathname.match(
-    /^\/api\/inventory\/artifacts\/([^/]+)$/u,
-  );
-  if (inventoryDeletion) {
-    if (request.method !== "DELETE") return methodNotAllowed(["DELETE"]);
-    const artifactId = parseArtifactId(inventoryDeletion[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return deleteInventoryArtifact(request, env, artifactId);
-  }
-
-  const legacyInventoryDeletion = pathname.match(
-    /^\/api\/inventory\/legacy\/artifacts\/([^/]+)$/u,
-  );
-  if (legacyInventoryDeletion) {
-    if (request.method !== "DELETE") return methodNotAllowed(["DELETE"]);
-    const artifactId = parseArtifactId(legacyInventoryDeletion[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return deleteLegacyInventoryArtifact(request, env, artifactId);
-  }
-
-  if (pathname === "/api/artifacts") {
-    if (request.method === "POST") return legacyMutationResponse();
-    return methodNotAllowed(["POST"]);
-  }
-
-  const publicMatch = pathname.match(/^\/api\/public\/([^/]+)$/);
-  if (publicMatch) {
-    if (request.method !== "GET") return methodNotAllowed(["GET"]);
-    const token = decodePathSegment(publicMatch[1]);
-    if (!token || !ownerTokenSchema.safeParse(token).success) {
-      return errorResponse(404, "NOT_FOUND", "Share not found");
-    }
-    return getPublicShare(token, env.DB);
-  }
-
-  const revisionsMatch = pathname.match(
-    /^\/api\/artifacts\/([^/]+)\/revisions$/,
-  );
-  if (revisionsMatch) {
-    if (request.method === "POST") return legacyMutationResponse();
-    const artifactId = parseArtifactId(revisionsMatch[1]);
-    if (artifactId instanceof Response) return artifactId;
-    if (request.method === "GET")
-      return listRevisions(request, env.DB, artifactId);
-    return methodNotAllowed(["GET", "POST"]);
-  }
-
-  const publishMatch = pathname.match(/^\/api\/artifacts\/([^/]+)\/publish$/);
-  if (publishMatch) {
-    if (request.method === "POST") return legacyMutationResponse();
-    return methodNotAllowed(["POST"]);
-  }
-
-  const unpublishMatch = pathname.match(
-    /^\/api\/artifacts\/([^/]+)\/unpublish$/,
-  );
-  if (unpublishMatch) {
-    if (request.method === "POST") return legacyMutationResponse();
-    return methodNotAllowed(["POST"]);
-  }
-
-  const artifactMatch = pathname.match(/^\/api\/artifacts\/([^/]+)$/);
-  if (artifactMatch) {
-    if (request.method !== "GET") return methodNotAllowed(["GET"]);
-    const artifactId = parseArtifactId(artifactMatch[1]);
-    if (artifactId instanceof Response) return artifactId;
-    return getArtifact(request, env.DB, artifactId);
-  }
-
-  return errorResponse(404, "NOT_FOUND", "Route not found");
+  if (/^\/s\/[^/]+$/u.test(path) && (method === "GET" || method === "HEAD"))
+    return assets(request, env);
+  // No legacy API or creator route falls through to the SPA.
+  throw new HttpError(404, "Not found");
 }
 
-async function getArtifact(
-  request: Request,
-  db: D1Database,
-  artifactId: string,
-): Promise<Response> {
-  const artifact = await authenticateArtifact(request, db, artifactId, false);
-  if (artifact instanceof Response) return artifact;
-
-  const revision = await db
-    .prepare(
-      `SELECT id, artifact_id, version, source, created_at
-       FROM revisions
-       WHERE id = ? AND artifact_id = ?`,
-    )
-    .bind(artifact.current_revision_id, artifactId)
-    .first<RevisionRow>();
-
-  if (!revision) throw new Error("Current revision was not found");
-  const legacy = await getLegacyArtifact(db, artifactId);
-
-  return jsonResponse(
-    artifactResponseSchema.parse({
-      artifact: toArtifact(artifact),
-      revision: toRevision(revision),
-      viewerUrl: viewerUrl(request, artifactId),
-      ...(legacy
-        ? {
-            legacy: {
-              readOnly: true,
-              migratedAt: legacy.migrated_at,
-              privateExpiresAt: legacy.private_expires_at,
-            },
-          }
-        : {}),
-    }),
-  );
+async function assets(request: Request, env: Env): Promise<Response> {
+  if (!env.ASSETS) throw new HttpError(503, "Viewer assets unavailable");
+  return env.ASSETS.fetch(request);
 }
 
-async function listRevisions(
-  request: Request,
-  db: D1Database,
-  artifactId: string,
-): Promise<Response> {
-  const artifact = await authenticateArtifact(request, db, artifactId, false);
-  if (artifact instanceof Response) return artifact;
-
-  const result = await db
-    .prepare(
-      `SELECT id, artifact_id, version, source, created_at
-       FROM revisions
-       WHERE artifact_id = ?
-       ORDER BY version DESC`,
-    )
-    .bind(artifactId)
-    .all<RevisionRow>();
-
-  // Legacy source-bearing responses remain bounded by the retained adoption cap.
-  // even when every source byte needs JSON escaping, so a lazy source route is
-  // unnecessary for the MVP and the existing client contract remains intact.
-  return jsonResponse({
-    artifactId,
-    revisions: result.results.map(toRevision),
-  });
-}
-
-async function getPublicShare(
-  token: string,
-  db: D1Database,
-): Promise<Response> {
-  const tokenHash = await hashToken(token);
-  const row = await db
-    .prepare(
-      `SELECT
-         a.title,
-         a.type,
-         r.id,
-         r.artifact_id,
-         r.version,
-          r.source,
-          r.created_at,
-          s.created_at AS published_at,
-          ls.public_expires_at,
-          s.revoked_at
-        FROM shares s
-        JOIN artifacts a ON a.id = s.artifact_id
-        JOIN revisions r ON r.id = s.revision_id AND r.artifact_id = s.artifact_id
-        LEFT JOIN legacy_shares ls ON ls.token_hash = s.token_hash
-        WHERE s.token_hash = ?`,
-    )
-    .bind(tokenHash)
-    .first<PublicShareRow>();
-
-  if (!row) return errorResponse(404, "NOT_FOUND", "Share not found");
-  if (row.revoked_at !== null)
-    return legacyGoneResponse("This legacy share has been revoked");
-  if (
-    row.public_expires_at !== null &&
-    row.public_expires_at <= new Date().toISOString()
-  )
-    return legacyGoneResponse("This legacy share has expired");
-
-  return jsonResponse({
-    artifact: {
-      id: row.artifact_id,
-      title: row.title,
-      type: row.type,
-    },
-    revision: toRevision(row),
-    publishedAt: row.published_at,
-    ...(row.public_expires_at !== null ? { legacy: { readOnly: true } } : {}),
-  });
-}
-
-async function authenticateArtifact(
-  request: Request,
-  db: D1Database,
-  artifactId: string,
-  ownerOnly: boolean,
-): Promise<ArtifactRow | Response> {
-  const authorization = request.headers.get("Authorization");
-  const match = authorization?.match(/^Bearer ([^\s]+)$/);
-  const token = match?.[1];
-  if (!token || !ownerTokenSchema.safeParse(token).success) {
-    return errorResponse(
-      401,
-      "UNAUTHORIZED",
-      ownerOnly
-        ? "A bearer owner token is required"
-        : "A bearer owner or workspace token is required",
-      undefined,
-      {
-        "WWW-Authenticate": "Bearer",
-      },
-    );
-  }
-
-  const artifact = await db
-    .prepare(
-      `SELECT id, owner_token_hash, workspace_token_hash, title, type, current_revision_id, created_at, updated_at
-       FROM artifacts
-       WHERE id = ?`,
-    )
-    .bind(artifactId)
-    .first<ArtifactRow>();
-
-  if (!artifact) return errorResponse(404, "NOT_FOUND", "Artifact not found");
-
-  const providedHash = await hashToken(token);
-  const isOwner = constantTimeHashEqual(
-    providedHash,
-    artifact.owner_token_hash,
-  );
-  const isWorkspace = constantTimeHashEqual(
-    providedHash,
-    artifact.workspace_token_hash,
-  );
-  if (!isOwner && (ownerOnly || !isWorkspace)) {
-    return errorResponse(
-      403,
-      "FORBIDDEN",
-      ownerOnly
-        ? "The owner token is invalid"
-        : "The owner or workspace token is invalid",
-    );
-  }
-
-  const legacyArtifact = await getLegacyArtifact(db, artifactId);
-  if (
-    legacyArtifact &&
-    legacyArtifact.private_expires_at <= new Date().toISOString()
-  ) {
-    return legacyGoneResponse("This legacy artifact has expired");
-  }
-
-  return artifact;
-}
-
-function parseArtifactId(segment: string | undefined): string | Response {
-  const value = decodePathSegment(segment);
-  const parsed = artifactIdSchema.safeParse(value);
-  if (parsed.success) return parsed.data;
-  return errorResponse(400, "VALIDATION_ERROR", "Artifact ID is invalid", [
-    { path: ["artifactId"], message: "Artifact ID is invalid" },
-  ]);
-}
-
-function decodePathSegment(segment: string | undefined): string | undefined {
-  if (!segment) return undefined;
+function decodeFilePath(encoded: string): string {
+  let path: string;
   try {
-    return decodeURIComponent(segment);
+    path = decodeURIComponent(encoded);
   } catch {
-    return undefined;
+    throw new HttpError(400, "Invalid path");
   }
+  if (!filePathSchema.safeParse(path).success)
+    throw new HttpError(400, "Invalid path");
+  return path;
 }
 
-async function hashToken(token: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(token),
+async function getUpload(env: Env, id: string): Promise<UploadRow> {
+  const row = await env.DB.prepare(
+    `SELECT u.*, a.deleted_at FROM library_uploads u
+    JOIN library_artifacts a ON a.id = u.artifact_id WHERE u.id = ?`,
+  )
+    .bind(id)
+    .first<UploadRow>();
+  if (!row) throw new HttpError(404, "Not found");
+  if (row.deleted_at) throw new HttpError(410, "Artifact deleted");
+  return row;
+}
+
+async function startUpload(request: Request, env: Env): Promise<Response> {
+  const parsed = uploadRequestSchema.safeParse(
+    await readJson(request, 1024 * 1024),
   );
-  return bytesToHex(new Uint8Array(digest));
-}
-
-function constantTimeHashEqual(left: string, right: string): boolean {
-  const leftBytes = hexToBytes(left);
-  const rightBytes = hexToBytes(right);
-  if (!leftBytes || !rightBytes) return false;
-  return (crypto.subtle as TimingSafeSubtleCrypto).timingSafeEqual(
-    leftBytes,
-    rightBytes,
+  if (!parsed.success) throw new HttpError(400, "Invalid upload manifest");
+  const manifest = parsed.data;
+  // Stable ordering treats equivalent JSON requests as identical retries.
+  manifest.files.sort((a, b) =>
+    a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
   );
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
-    "",
-  );
-}
-
-function hexToBytes(value: string): Uint8Array | undefined {
-  if (!/^[0-9a-f]{64}$/.test(value)) return undefined;
-  return Uint8Array.from(value.match(/.{2}/g) ?? [], (byte) =>
-    Number.parseInt(byte, 16),
-  );
-}
-
-function toArtifact(row: ArtifactRow): Artifact {
-  return {
-    id: row.id,
-    title: row.title,
-    type: row.type,
-    currentRevisionId: row.current_revision_id,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
-}
-
-function toRevision(row: RevisionRow): Revision {
-  return {
-    id: row.id,
-    artifactId: row.artifact_id,
-    version: row.version,
-    source: row.source,
-    createdAt: row.created_at,
-  };
-}
-
-function viewerUrl(
-  request: Request,
-  artifactId: string,
-  workspaceToken?: string,
-): string {
-  const url = new URL(
-    `/artifacts/${encodeURIComponent(artifactId)}`,
-    request.url,
-  );
-  if (workspaceToken) {
-    url.hash = new URLSearchParams({
-      [WORKSPACE_TOKEN_FRAGMENT_KEY]: workspaceToken,
-    }).toString();
+  const serialized = JSON.stringify(manifest);
+  const existing = await env.DB.prepare(
+    "SELECT id, manifest FROM library_uploads WHERE idempotency_key = ?",
+  )
+    .bind(manifest.idempotencyKey)
+    .first<{ id: string; manifest: string }>();
+  if (!existing) {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO library_projects (id, name) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
+      ).bind(manifest.project.id, manifest.project.name),
+      env.DB.prepare(
+        "INSERT INTO library_artifacts (id, project_id, artifact_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+      ).bind(crypto.randomUUID(), manifest.project.id, manifest.artifactKey),
+      env.DB.prepare(
+        `INSERT INTO library_uploads (id, artifact_id, idempotency_key, manifest, created_at)
+        SELECT ?, id, ?, ?, ? FROM library_artifacts WHERE project_id = ? AND artifact_key = ? AND deleted_at IS NULL
+        ON CONFLICT(idempotency_key) DO NOTHING`,
+      ).bind(
+        crypto.randomUUID(),
+        manifest.idempotencyKey,
+        serialized,
+        new Date().toISOString(),
+        manifest.project.id,
+        manifest.artifactKey,
+      ),
+    ]);
   }
-  return url.toString();
-}
-
-function rejectCrossOriginRequest(request: Request): Response | undefined {
-  const origin = request.headers.get("Origin");
-  if (!origin || origin === new URL(request.url).origin) return undefined;
-  return errorResponse(
-    403,
-    "FORBIDDEN",
-    "Cross-origin requests are not allowed",
-  );
-}
-
-function preflightResponse(request: Request): Response {
-  const origin = request.headers.get("Origin");
-  if (!origin) return methodNotAllowed(["GET", "POST"]);
-
-  return new Response(null, {
-    status: 204,
-    headers: {
-      "Access-Control-Allow-Headers": "Authorization, Content-Type",
-      "Access-Control-Allow-Methods": "DELETE, GET, POST, OPTIONS",
-      "Access-Control-Allow-Origin": origin,
-      "Access-Control-Max-Age": "600",
-      Vary: "Origin",
-    },
-  });
-}
-
-export function logUnexpectedError(request: Request, error: unknown): void {
-  console.error(
-    JSON.stringify({
-      event: "worker.request.unexpected_error",
-      errorName: error instanceof Error ? error.name : "UnknownError",
-      method: request.method,
-      route: routeTemplate(new URL(request.url).pathname),
-    }),
-  );
-}
-
-function routeTemplate(pathname: string): string {
-  if (pathname === "/api/artifacts") return "/api/artifacts";
-  if (pathname === "/api/sync/artifacts") return "/api/sync/artifacts";
-  if (/^\/api\/creator\/[^/]+$/.test(pathname)) return "/api/creator/:token";
-  if (/^\/api\/sync\/artifacts\/[^/]+\/creator\/rotate$/u.test(pathname)) {
-    return "/api/sync/artifacts/:artifactId/creator/rotate";
-  }
-  if (/^\/api\/sync\/artifacts\/[^/]+\/lease\/release$/u.test(pathname)) {
-    return "/api/sync/artifacts/:artifactId/lease/release";
-  }
-  if (
-    /^\/api\/sync\/artifacts\/[^/]+\/revisions\/\d+\/files\/.+$/u.test(pathname)
-  ) {
-    return "/api/sync/artifacts/:artifactId/revisions/:version/files/:path";
-  }
-  if (/^\/api\/publications\/[^/]+\/files\/.+$/u.test(pathname)) {
-    return "/api/publications/:token/files/:path";
-  }
-  if (/^\/api\/creator\/[^/]+\/revisions\/\d+\/files\/.+$/u.test(pathname)) {
-    return "/api/creator/:token/revisions/:version/files/:path";
-  }
-  if (
-    /^\/api\/creator\/[^/]+\/revisions\/\d+\/download\.zip$/u.test(pathname)
-  ) {
-    return "/api/creator/:token/revisions/:version/download.zip";
-  }
-  if (/^\/api\/publications\/[^/]+\/download\.zip$/u.test(pathname)) {
-    return "/api/publications/:token/download.zip";
-  }
-  if (
-    /^\/api\/sync\/artifacts\/[^/]+\/revisions\/\d+\/commit$/u.test(pathname)
-  ) {
-    return "/api/sync/artifacts/:artifactId/revisions/:version/commit";
-  }
-  if (/^\/api\/public\/[^/]+$/.test(pathname)) return "/api/public/:token";
-  if (/^\/api\/publications\/[^/]+$/.test(pathname)) {
-    return "/api/publications/:token";
-  }
-  if (
-    /^\/api\/creator\/[^/]+\/(?:publication\/)?(?:share|publish|republish|extend|unpublish)$/u.test(
-      pathname,
-    )
-  ) {
-    return "/api/creator/:token/publication-action";
-  }
-  if (/^\/api\/artifacts\/[^/]+\/revisions$/.test(pathname)) {
-    return "/api/artifacts/:artifactId/revisions";
-  }
-  if (/^\/api\/artifacts\/[^/]+\/publish$/.test(pathname)) {
-    return "/api/artifacts/:artifactId/publish";
-  }
-  if (/^\/api\/artifacts\/[^/]+\/unpublish$/.test(pathname)) {
-    return "/api/artifacts/:artifactId/unpublish";
-  }
-  if (/^\/api\/artifacts\/[^/]+$/.test(pathname)) {
-    return "/api/artifacts/:artifactId";
-  }
-  if (/^\/api\/inventory\/artifacts\/[^/]+\/reconnect-code$/u.test(pathname)) {
-    return "/api/inventory/artifacts/:artifactId/reconnect-code";
-  }
-  if (/^\/api\/inventory\/legacy\/artifacts\/[^/]+$/u.test(pathname)) {
-    return "/api/inventory/legacy/artifacts/:artifactId";
-  }
-  if (
-    /^\/api\/inventory\/legacy\/artifacts\/[^/]+\/adoption-code$/u.test(
-      pathname,
-    )
-  ) {
-    return "/api/inventory/legacy/artifacts/:artifactId/adoption-code";
-  }
-  if (/^\/api\/adopt\/legacy\/[^/]+$/u.test(pathname)) {
-    return "/api/adopt/legacy/:artifactId";
-  }
-  if (pathname === "/api/inventory") return "/api/inventory";
-  return "unmatched";
-}
-
-function withCorsHeaders(request: Request, response: Response): Response {
-  const origin = request.headers.get("Origin");
-  const headers = new Headers(response.headers);
-  headers.set("Cache-Control", "no-store");
-  headers.set("Referrer-Policy", "no-referrer");
-  if (origin) {
-    headers.set("Access-Control-Allow-Origin", origin);
-    headers.append("Vary", "Origin");
-  }
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
-}
-
-function methodNotAllowed(methods: string[]): Response {
-  return errorResponse(
-    405,
-    "VALIDATION_ERROR",
-    "Method not allowed",
-    undefined,
-    {
-      Allow: methods.join(", "),
-    },
-  );
-}
-
-function errorResponse(
-  status: number,
-  code: ApiErrorCode,
-  message: string,
-  issues?: ErrorIssue[],
-  extraHeaders?: HeadersInit,
-): Response {
-  const error = issues ? { code, message, issues } : { code, message };
-  return jsonResponse({ error }, status, extraHeaders);
-}
-
-const LEGACY_MUTATION_MESSAGE =
-  "Legacy mutation is no longer supported. Create or adopt a project-local Artifact and Sync it.";
-
-function legacyMutationResponse(): Response {
-  return errorResponse(
-    410,
-    "LOCAL_FIRST_REQUIRED",
-    LEGACY_MUTATION_MESSAGE,
-    undefined,
-    {
-      "Cache-Control": "no-store",
-      "Referrer-Policy": "no-referrer",
-      "X-Content-Type-Options": "nosniff",
-    },
-  );
-}
-
-function legacyGoneResponse(message: string): Response {
-  return errorResponse(410, "GONE", message, undefined, {
-    "Cache-Control": "no-store",
-    "Referrer-Policy": "no-referrer",
-    "X-Content-Type-Options": "nosniff",
-  });
-}
-
-function jsonResponse(
-  value: unknown,
-  status = 200,
-  extraHeaders?: HeadersInit,
-): Response {
-  const headers = new Headers(JSON_HEADERS);
-  if (extraHeaders) {
-    new Headers(extraHeaders).forEach((headerValue, name) =>
-      headers.set(name, headerValue),
+  const session = await env.DB.prepare(
+    "SELECT id, manifest FROM library_uploads WHERE idempotency_key = ?",
+  )
+    .bind(manifest.idempotencyKey)
+    .first<{ id: string; manifest: string }>();
+  if (!session) throw new HttpError(409, "Upload could not be started");
+  const upload = await getUpload(env, session.id);
+  if (session.manifest !== serialized)
+    throw new HttpError(
+      409,
+      "Idempotency key already used with a different manifest",
     );
+  const complete = !!(await env.DB.prepare(
+    "SELECT id FROM library_versions WHERE id = ?",
+  )
+    .bind(upload.id)
+    .first());
+  const result: UploadSession = {
+    uploadId: upload.id,
+    artifactId: upload.artifact_id,
+    complete,
+    dashboardUrl: dashboard(new URL(request.url).origin, upload.artifact_id),
+  };
+  return Response.json(result);
+}
+
+function objectKey(upload: UploadRow, path: string): string {
+  return `library/${upload.artifact_id}/${upload.id}/${path}`;
+}
+
+async function putFile(
+  request: Request,
+  env: Env,
+  id: string,
+  path: string,
+): Promise<Response> {
+  const upload = await getUpload(env, id);
+  const manifest: UploadRequest = JSON.parse(upload.manifest);
+  const file = manifest.files.find((item) => item.path === path);
+  if (!file) throw new HttpError(404, "File not in manifest");
+  const bytes = await readBytes(request, file.size);
+  if (bytes.byteLength !== file.size || sha256(bytes) !== file.sha256)
+    throw new HttpError(400, "File integrity mismatch");
+  const key = objectKey(upload, path);
+  // Every write, including in-flight retries racing commit, is create-only.
+  // A committed object can never be overwritten with new or partial bytes.
+  const stored = await env.PRIVATE_ARTIFACTS.put(key, bytes, {
+    onlyIf: new Headers({ "If-None-Match": "*" }),
+    sha256: file.sha256,
+  });
+  if (!stored) {
+    const current = await env.PRIVATE_ARTIFACTS.head(key);
+    if (
+      !current ||
+      current.size !== file.size ||
+      !current.checksums.sha256 ||
+      Buffer.from(current.checksums.sha256).toString("hex") !== file.sha256
+    )
+      throw new HttpError(409, "Stored file integrity mismatch");
   }
-  return new Response(JSON.stringify(value), { status, headers });
+  try {
+    await getUpload(env, id);
+  } catch (error) {
+    // Close the write/delete race; the scheduled tombstone sweep covers crashes.
+    if (error instanceof HttpError && error.status === 410)
+      await env.PRIVATE_ARTIFACTS.delete(key);
+    throw error;
+  }
+  return new Response(null, { status: 204 });
+}
+
+async function commitUpload(
+  env: Env,
+  id: string,
+  origin: string,
+): Promise<Response> {
+  const upload = await getUpload(env, id);
+  const manifest: UploadRequest = JSON.parse(upload.manifest);
+  const existing = await env.DB.prepare(
+    "SELECT number FROM library_versions WHERE id = ?",
+  )
+    .bind(id)
+    .first<{ number: number }>();
+  if (!existing) {
+    for (const file of manifest.files) {
+      const object = await env.PRIVATE_ARTIFACTS.get(
+        objectKey(upload, file.path),
+      );
+      if (!object || object.size !== file.size) {
+        await object?.body.cancel();
+        throw new HttpError(409, "Upload is incomplete or corrupt");
+      }
+      if (sha256(new Uint8Array(await object.arrayBuffer())) !== file.sha256)
+        throw new HttpError(409, "Upload is incomplete or corrupt");
+    }
+    // The allocation and insertion are one SQL statement. Concurrent commits
+    // either create one version or observe it, never allocate duplicate numbers.
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO library_versions (id, artifact_id, number, created_at)
+        SELECT ?, a.id, COALESCE((SELECT MAX(number) FROM library_versions WHERE artifact_id = a.id), 0) + 1, ?
+        FROM library_artifacts a WHERE a.id = ? AND a.deleted_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM library_versions WHERE id = ?)
+        ON CONFLICT(id) DO NOTHING`,
+      ).bind(id, new Date().toISOString(), upload.artifact_id, id),
+      env.DB.prepare(
+        `UPDATE library_projects SET name = ? WHERE id = ? AND EXISTS (
+        SELECT 1 FROM library_versions v JOIN library_artifacts a ON a.id = v.artifact_id
+        WHERE v.id = ? AND a.deleted_at IS NULL AND v.number = (SELECT MAX(number) FROM library_versions WHERE artifact_id = a.id))`,
+      ).bind(manifest.project.name, manifest.project.id, id),
+    ]);
+  }
+  const version = await getVersion(env, id);
+  const result: UploadResult = {
+    artifactId: upload.artifact_id,
+    version: version.number,
+    dashboardUrl: dashboard(origin, upload.artifact_id),
+  };
+  return Response.json(result);
+}
+
+async function getVersion(env: Env, id: string): Promise<VersionRow> {
+  const row = await env.DB.prepare(
+    `SELECT v.*, u.manifest, a.deleted_at FROM library_versions v
+    JOIN library_uploads u ON u.id = v.id JOIN library_artifacts a ON a.id = v.artifact_id
+    WHERE v.id = ? AND a.deleted_at IS NULL`,
+  )
+    .bind(id)
+    .first<VersionRow>();
+  if (!row) throw new HttpError(404, "Not found");
+  return row;
+}
+
+function dashboard(origin: string, id: string): string {
+  return `${origin}/inventory/artifacts/${id}`;
+}
+
+function versionInfo(row: VersionRow, previewUrl: string): ArtifactVersion {
+  const manifest: UploadRequest = JSON.parse(row.manifest);
+  return {
+    id: row.id,
+    number: row.number,
+    createdAt: row.created_at,
+    entryPath: manifest.entryPath,
+    fileCount: manifest.files.length,
+    bytes: manifest.files.reduce((sum, file) => sum + file.size, 0),
+    previewUrl,
+  };
+}
+
+function shareInfo(row: ShareRow, origin: string): ArtifactShare {
+  return {
+    url: `${origin}/s/${row.token}`,
+    versionId: row.version_id,
+    expiresAt: row.expires_at,
+    status:
+      row.expires_at !== null && !(Date.parse(row.expires_at) > Date.now())
+        ? "expired"
+        : "active",
+  };
+}
+
+async function library(
+  env: Env,
+  origin: string,
+  id?: string,
+): Promise<ArtifactLibrary> {
+  // Version number, not request start time, is the authoritative commit order.
+  const rows = await env.DB.prepare(
+    `SELECT v.*, u.manifest, a.project_id, p.name AS project_name, a.deleted_at,
+    s.token, s.version_id, s.expires_at FROM library_versions v
+    JOIN library_uploads u ON u.id = v.id JOIN library_artifacts a ON a.id = v.artifact_id
+    JOIN library_projects p ON p.id = a.project_id LEFT JOIN library_shares s ON s.artifact_id = a.id
+    WHERE a.deleted_at IS NULL AND (? IS NULL OR a.id = ?) ORDER BY v.number DESC`,
+  )
+    .bind(id ?? null, id ?? null)
+    .all<
+      VersionRow & ShareRow & { project_id: string; project_name: string }
+    >();
+  const artifacts = new Map<string, LibraryArtifact>();
+  const projects = new Map<string, { id: string; name: string }>();
+  for (const row of rows.results) {
+    const manifest: UploadRequest = JSON.parse(row.manifest);
+    let artifact = artifacts.get(row.artifact_id);
+    if (!artifact) {
+      artifact = {
+        id: row.artifact_id,
+        projectId: row.project_id,
+        title: manifest.title,
+        updatedAt: row.created_at,
+        versions: [],
+        share: row.token ? shareInfo(row, origin) : null,
+      };
+      artifacts.set(artifact.id, artifact);
+    }
+    artifact.versions.push(
+      versionInfo(
+        row,
+        `${origin}/api/previews/${previewToken(row.id, env)}/files/${encodePath(manifest.entryPath)}`,
+      ),
+    );
+    projects.set(row.project_id, {
+      id: row.project_id,
+      name: row.project_name,
+    });
+  }
+  return {
+    projects: [...projects.values()],
+    artifacts: [...artifacts.values()].sort((a, b) =>
+      b.updatedAt.localeCompare(a.updatedAt),
+    ),
+  };
+}
+
+async function shareArtifact(
+  request: Request,
+  env: Env,
+  id: string,
+): Promise<Response> {
+  const parsed = shareRequestSchema.safeParse(await readJson(request, 4096));
+  if (!parsed.success) throw new HttpError(400, "Invalid share request");
+  const { versionId, expiresInDays } = parsed.data;
+  const expires =
+    expiresInDays === null
+      ? null
+      : new Date(Date.now() + expiresInDays * 86400000).toISOString();
+  const token = Buffer.from(
+    crypto.getRandomValues(new Uint8Array(32)),
+  ).toString("hex");
+  const row = await env.DB.prepare(
+    `INSERT INTO library_shares (artifact_id, token, version_id, expires_at)
+    SELECT a.id, ?, v.id, ? FROM library_artifacts a JOIN library_versions v ON v.artifact_id = a.id
+    WHERE a.id = ? AND v.id = ? AND a.deleted_at IS NULL
+    ON CONFLICT(artifact_id) DO UPDATE SET version_id = excluded.version_id, expires_at = excluded.expires_at,
+      token = CASE WHEN library_shares.expires_at IS NULL OR julianday(library_shares.expires_at) > julianday(?)
+        THEN library_shares.token ELSE excluded.token END
+    RETURNING token, version_id, expires_at`,
+  )
+    .bind(token, expires, id, versionId, new Date().toISOString())
+    .first<ShareRow>();
+  if (!row) throw new HttpError(404, "Not found");
+  return Response.json(shareInfo(row, new URL(request.url).origin));
+}
+
+async function publicVersion(
+  env: Env,
+  token: string,
+): Promise<VersionRow & { expires_at: string | null }> {
+  const row = await env.DB.prepare(
+    `SELECT v.*, u.manifest, a.deleted_at, s.expires_at FROM library_shares s
+    JOIN library_versions v ON v.id = s.version_id AND v.artifact_id = s.artifact_id
+    JOIN library_uploads u ON u.id = v.id JOIN library_artifacts a ON a.id = v.artifact_id
+    WHERE s.token = ? AND a.deleted_at IS NULL AND (s.expires_at IS NULL OR s.expires_at > ?)`,
+  )
+    .bind(token, new Date().toISOString())
+    .first<VersionRow & { expires_at: string | null }>();
+  if (
+    !row ||
+    (row.expires_at !== null && !(Date.parse(row.expires_at) > Date.now()))
+  )
+    throw new HttpError(404, "Not found");
+  return row;
+}
+
+async function serveFile(
+  env: Env,
+  version: VersionRow,
+  path: string,
+  root: string,
+  head: boolean,
+): Promise<Response> {
+  const manifest: UploadRequest = JSON.parse(version.manifest);
+  const file = manifest.files.find((item) => item.path === path);
+  if (!file) throw new HttpError(404, "Not found");
+  const object = await env.PRIVATE_ARTIFACTS.get(objectKey(version, path));
+  if (
+    !object ||
+    object.size !== file.size ||
+    !object.checksums.sha256 ||
+    Buffer.from(object.checksums.sha256).toString("hex") !== file.sha256
+  ) {
+    await object?.body.cancel();
+    throw new HttpError(404, "Not found");
+  }
+  const headers = fileHeaders(path, root);
+  headers.set("Content-Length", String(file.size));
+  if (head) await object.body.cancel();
+  return new Response(head ? null : object.body, { headers });
+}
+
+async function purgeObjects(env: Env, id: string): Promise<void> {
+  let cursor: string | undefined;
+  do {
+    const page = await env.PRIVATE_ARTIFACTS.list({
+      prefix: `library/${id}/`,
+      ...(cursor ? { cursor } : {}),
+    });
+    if (page.objects.length)
+      await env.PRIVATE_ARTIFACTS.delete(
+        page.objects.map((object) => object.key),
+      );
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  // Keep only denial receipts for retries, not deleted version manifests/titles.
+  await env.DB.batch([
+    env.DB.prepare(
+      "DELETE FROM library_versions WHERE artifact_id = ? AND EXISTS (SELECT 1 FROM library_artifacts WHERE id = ? AND deleted_at IS NOT NULL)",
+    ).bind(id, id),
+    env.DB.prepare(
+      "UPDATE library_uploads SET manifest = '{}' WHERE artifact_id = ? AND EXISTS (SELECT 1 FROM library_artifacts WHERE id = ? AND deleted_at IS NOT NULL)",
+    ).bind(id, id),
+  ]);
 }

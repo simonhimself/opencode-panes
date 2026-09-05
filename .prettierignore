@@ -5,3 +5,4 @@ coverage
 package-lock.json
 PROJECT_PLAN.md
 apps/web/worker-configuration.d.ts
+artifacts/

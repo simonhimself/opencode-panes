@@ -5,29 +5,31 @@
   "compatibility_date": "2026-08-18",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
-    // These are production policy values, not credential material. The
-    // matching Access application protects only /inventory and
-    // /api/inventory* on the workers.dev hostname.
+    // These are production policy values, not credential material.
+    // Access must protect /inventory* and /api/library*; the Worker also
+    // verifies every owner request. Keep public and upload routes outside Access.
     "PANES_ACCESS_ALLOWED_EMAIL": "simonhimself@gmail.com",
     "PANES_ACCESS_ISSUER": "https://adsdasd.cloudflareaccess.com",
     "PANES_ACCESS_AUDIENCE": "8defff93e1db0b5ea650b2d7e75f67b6d22a3597a67bada071458ebe8dc48725",
+    "PANES_DEV_MODE": "false",
   },
   // Production admission control. Upload the value as an encrypted Worker secret.
   "secrets": {
-    // Versioned AES-GCM key material. Set with `wrangler secret put`; never
-    // place a value in this file or in source control.
-    "required": ["PANES_CREATE_API_KEY", "PUBLICATION_ENCRYPTION_KEY_V1"],
+    "required": ["PANES_UPLOAD_KEY"],
   },
   "observability": {
-    "enabled": true,
-    "head_sampling_rate": 1,
+    // Invocation logs and traces include URLs containing read capabilities.
+    "enabled": false,
   },
   "triggers": {
+    // Retry private object cleanup for deleted artifact tombstones.
     "crons": ["17 * * * *"],
   },
   "assets": {
+    // The Vite build supplies the assets directory in its generated config.
+    "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"],
+    "run_worker_first": ["/", "/api/*", "/inventory", "/inventory/*", "/s/*"],
   },
   "d1_databases": [
     {

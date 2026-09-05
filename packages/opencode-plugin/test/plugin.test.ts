@@ -1,1138 +1,910 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
+  realpath,
+  rename,
   rm,
   stat,
+  symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
+import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
-
-import { artifactManifestSchema } from "@opencode-panes/contracts";
 import type {
+  PluginInput,
   ToolContext,
   ToolDefinition,
-  ToolResult,
 } from "@opencode-ai/plugin";
+import {
+  MAX_FILE_BYTES,
+  uploadRequestSchema,
+  type UploadRequest,
+} from "@opencode-panes/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import plugin from "../src/index.js";
 
-import { OpenCodePanesPlugin } from "../src/index.js";
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, open: vi.fn(actual.open) };
+});
 
-const execFileAsync = promisify(execFile);
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const { promisify } = await import("node:util");
+  return {
+    ...actual,
+    execFile: Object.assign(vi.fn(actual.execFile), {
+      [promisify.custom]: vi.fn(promisify(actual.execFile)),
+    }),
+  };
+});
 
-let stateHome: string;
-let temporaryDirectory: string;
+const exec = promisify(execFile);
+const key = "test-secret-never-return-this";
+const digest = (value: string | Buffer) =>
+  createHash("sha256").update(value).digest("hex");
+let root: string;
+let api: Awaited<ReturnType<typeof mockApi>>;
+let context: ToolContext;
+let upload: ToolDefinition;
+let dashboard: ToolDefinition;
 
 beforeEach(async () => {
-  stateHome = await mkdtemp(join(tmpdir(), "opencode-panes-test-"));
-  temporaryDirectory = await mkdtemp(join(tmpdir(), "opencode-panes-project-"));
-  vi.stubEnv("XDG_STATE_HOME", stateHome);
+  root = await realpath(await mkdtemp(join(tmpdir(), "panes-upload-")));
+  api = await mockApi();
+  context = {
+    directory: root,
+    worktree: root,
+    sessionID: "test",
+    messageID: "test",
+    agent: "build",
+    abort: new AbortController().signal,
+    metadata: vi.fn(),
+    ask: vi.fn(async () => {}),
+  };
+  const hooks = await plugin({} as PluginInput, {
+    apiBaseUrl: api.origin,
+    uploadKey: key,
+  });
+  expect(Object.keys(hooks.tool!)).toEqual([
+    "artifact_upload",
+    "artifact_dashboard",
+  ]);
+  upload = hooks.tool!.artifact_upload!;
+  dashboard = hooks.tool!.artifact_dashboard!;
+  await put(
+    "site/index.html",
+    "<!doctype html><img src='./assets/picture 1.png'><script src='./app.js'></script>\r\n",
+  );
 });
 
 afterEach(async () => {
-  vi.unstubAllGlobals();
+  api.server.closeAllConnections();
+  await new Promise<void>((resolve) => api.server.close(() => resolve()));
+  await rm(root, { recursive: true, force: true });
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
-  await rm(stateHome, { recursive: true, force: true });
-  await rm(temporaryDirectory, { recursive: true, force: true });
+  vi.mocked(open).mockReset();
+  vi.mocked(exec).mockReset();
 });
 
-describe("Legacy adoption tool", () => {
-  it("adopts a Legacy payload into an unchanged finalized local v1", async () => {
-    const repository = await gitRepository();
-    const source = "\uFEFF<html>\r\n\0café</html>\r\n";
-    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
-      const request = JSON.parse(String(init?.body)) as {
-        apiOrigin: string;
-        localProjectId: string;
-        localArtifactId: string;
-        slug: string;
-      };
-      return jsonResponse({
-        operation: "legacy-adopted",
-        apiOrigin: request.apiOrigin,
-        localProjectId: request.localProjectId,
-        localArtifactId: request.localArtifactId,
-        slug: request.slug,
-        title: "Adopted example",
-        type: "html",
-        source,
-        provenance: {
-          grantId: "adoption-grant-1",
-          localProjectId: request.localProjectId,
-          localArtifactId: request.localArtifactId,
-          localSlug: request.slug,
-          legacyArtifactId: "legacy-artifact-1",
-          legacyRevisionId: "legacy-revision-1",
-          legacyRevisionVersion: 1,
-          legacyTitle: "Adopted example",
-          legacyType: "html",
-        },
-      });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const { context } = toolContext({
-      directory: repository,
-      worktree: repository,
-    });
-    const plugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {},
-    );
-    const definition = plugin.tool?.artifact_adopt_legacy as
-      ToolDefinition | undefined;
-    if (!definition) throw new Error("Legacy adoption tool was not registered");
+async function put(path: string, bytes: string | Buffer) {
+  await mkdir(dirname(join(root, path)), { recursive: true });
+  await writeFile(join(root, path), bytes);
+}
 
-    const result = await definition.execute(
-      {
-        artifactId: "legacy-artifact-1",
-        adoptionCode: "panes-adopt-legacy-" + "a".repeat(32),
-        slug: "adopted-example",
-      },
-      context,
-    );
+async function run(
+  tool: ToolDefinition,
+  args: Record<string, unknown>,
+  ctx = context,
+) {
+  const result = await tool.execute(args, ctx);
+  expect(typeof result).toBe("string");
+  expect(result).not.toContain(key);
+  return JSON.parse(result as string);
+}
 
-    const artifact = JSON.parse(
-      await readFile(
-        join(repository, "artifacts", "adopted-example", "artifact.json"),
-        "utf8",
-      ),
-    ) as ReturnType<typeof artifactManifestSchema.parse>;
-    expect(artifact.revisions).toHaveLength(1);
-    expect(artifact.legacyProvenance?.legacyArtifactId).toBe(
-      "legacy-artifact-1",
-    );
+describe("private snapshot uploads", () => {
+  it("hashes the normalized wire request even when default names contain whitespace", async () => {
+    await put(" spaced /index.html", "<h1>Whitespace</h1>");
     expect(
-      await readFile(
-        join(repository, "artifacts", "adopted-example", "v1", "index.html"),
-        "utf8",
-      ),
-    ).toBe(source);
-    expect(structuredResult(result).metadata).toMatchObject({
-      operation: "finalized",
-      version: 1,
-    });
-    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
-      "http://127.0.0.1:5173/api/adopt/legacy/legacy-artifact-1",
-    );
+      (await run(upload, { sourcePath: " spaced " })).error,
+    ).toBeUndefined();
+    const { idempotencyKey, ...payload } = api.requests[0]!;
+    expect(payload.title).toBe("spaced");
+    expect(payload.artifactKey).toBe(" spaced ");
+    expect(idempotencyKey).toBe(digest(JSON.stringify(payload)));
   });
 
-  it("reuses a digest-only adoption checkpoint after an interrupted redemption", async () => {
-    const repository = await gitRepository();
-    const source = "\uFEFF<html>\r\n\0retry</html>\r\n";
-    const fetchMock = mockConsumedLegacyAdoptionFetch(source, "artifact-retry");
-    vi.stubGlobal("fetch", fetchMock);
-    const { context } = toolContext({
-      directory: repository,
-      worktree: repository,
+  it("uploads exact binary and text bytes with encoded paths, permission, stable identities, and no source writes", async () => {
+    const binary = Buffer.from([0, 255, 128, 13, 10, 1, 0, 200]);
+    await put("site/assets/picture 1.png", binary);
+    await put("site/assets/\u00e9.bin", binary);
+    await put(
+      "site/app.js",
+      "throw new Error('Source must never execute on the server');\r\n",
+    );
+    const before = await tree(root);
+    context.ask = vi.fn(async () => {
+      expect(api.calls).toHaveLength(0);
     });
-    const failureInjector = (phase: string) => {
-      if (phase === "adopt-after-redeem") {
-        throw new Error("simulated interruption");
-      }
-    };
-    const firstPlugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      { failureInjector },
-    );
-    const firstDefinition = firstPlugin.tool?.artifact_adopt_legacy as
-      ToolDefinition | undefined;
-    if (!firstDefinition)
-      throw new Error("Legacy adoption tool was not registered");
-
-    await expect(
-      firstDefinition.execute(
-        {
-          artifactId: "legacy-artifact-retry",
-          adoptionCode: "panes-adopt-legacy-" + "b".repeat(32),
-          slug: "retry-example",
-        },
-        context,
-      ),
-    ).rejects.toThrow("simulated interruption");
-    expect(
-      await stat(join(repository, "artifacts", "retry-example")),
-    ).toBeTruthy();
-
-    const checkpointFiles = await findFiles(join(stateHome, "opencode-panes"));
-    expect(checkpointFiles).toHaveLength(1);
-    const checkpointContents = await readFile(
-      checkpointFiles[0] as string,
-      "utf8",
-    );
-    expect(checkpointContents).not.toContain("panes-adopt-legacy-");
-    expect(JSON.parse(checkpointContents)).toMatchObject({
-      phase: "redeemed",
-      slug: "retry-example",
-    });
-
-    const retryPlugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {},
-    );
-    const retryDefinition = retryPlugin.tool?.artifact_adopt_legacy as
-      ToolDefinition | undefined;
-    if (!retryDefinition)
-      throw new Error("Legacy adoption tool was not registered");
-    await retryDefinition.execute(
-      {
-        artifactId: "legacy-artifact-retry",
-        adoptionCode: "panes-adopt-legacy-" + "b".repeat(32),
-        slug: "retry-example",
-      },
-      context,
-    );
-    const manifest = JSON.parse(
-      await readFile(
-        join(repository, "artifacts", "retry-example", "artifact.json"),
-        "utf8",
-      ),
-    ) as { artifactId: string };
-    expect(manifest.artifactId).toBe(JSON.parse(checkpointContents).artifactId);
-    expect(await findFiles(join(stateHome, "opencode-panes"))).toEqual([]);
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const firstRequest = JSON.parse(
-      String(fetchMock.mock.calls[0]?.[1]?.body),
-    ) as { localArtifactId: string };
-    const secondRequest = JSON.parse(
-      String(fetchMock.mock.calls[1]?.[1]?.body),
-    ) as { localArtifactId: string };
-    expect(secondRequest.localArtifactId).toBe(firstRequest.localArtifactId);
-    expect(
-      await readFile(
-        join(repository, "artifacts", "retry-example", "v1", "index.html"),
-        "utf8",
-      ),
-    ).toBe(source);
-    await expect(
-      retryDefinition.execute(
-        {
-          artifactId: "legacy-artifact-retry",
-          adoptionCode: "panes-adopt-legacy-" + "b".repeat(32),
-          slug: "hijacked-retry",
-        },
-        context,
-      ),
-    ).rejects.toThrow("already bound");
-  });
-
-  it("recovers when redemption succeeds but its response is lost", async () => {
-    const repository = await gitRepository();
-    const source = "<h1>response loss</h1>\r\n";
-    const fetchMock = mockConsumedLegacyAdoptionFetch(source, "response-loss");
-    const context = toolContext({
-      directory: repository,
-      worktree: repository,
-    }).context;
-    const firstPlugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {
-        failureInjector: (phase: string) => {
-          if (phase === "adopt-after-redemption-response")
-            throw new Error("simulated response loss");
-        },
-      },
-    );
-    const firstDefinition = firstPlugin.tool
-      ?.artifact_adopt_legacy as ToolDefinition;
-    const args = {
-      artifactId: "legacy-response-loss",
-      adoptionCode: "panes-adopt-legacy-" + "f".repeat(32),
-      slug: "response-loss",
-    };
-    await expect(firstDefinition.execute(args, context)).rejects.toThrow(
-      "simulated response loss",
-    );
-    const checkpointFiles = await findFiles(join(stateHome, "opencode-panes"));
-    expect(checkpointFiles).toHaveLength(1);
-    const checkpoint = JSON.parse(
-      await readFile(checkpointFiles[0] as string, "utf8"),
-    ) as { artifactId: string; phase: string; slug: string };
-    expect(checkpoint).toMatchObject({
-      phase: "planned",
-      slug: args.slug,
-    });
-
-    const retryPlugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {},
-    );
-    const retryDefinition = retryPlugin.tool
-      ?.artifact_adopt_legacy as ToolDefinition;
-    const result = await retryDefinition.execute(args, context);
-    const manifest = JSON.parse(
-      await readFile(
-        join(repository, "artifacts", args.slug, "artifact.json"),
-        "utf8",
-      ),
-    ) as { artifactId: string; slug: string; revisions: unknown[] };
-    expect(manifest).toMatchObject({
-      artifactId: checkpoint.artifactId,
-      slug: checkpoint.slug,
-    });
-    expect(manifest.revisions).toHaveLength(1);
-    expect(structuredResult(result).metadata?.version).toBe(1);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(await findFiles(join(stateHome, "opencode-panes"))).toEqual([]);
-    expect(
-      (await readdir(join(repository, "artifacts", args.slug))).filter(
-        (entry) => entry.includes("journal") || entry.endsWith(".tmp"),
-      ),
-    ).toEqual([]);
-  });
-
-  it("recovers an orphaned adoption manifest temp file after interruption", async () => {
-    const repository = await gitRepository();
-    const source = "\uFEFF<html>\r\n\0manifest-retryé</html>\r\n";
-    const fetchMock = mockLegacyAdoptionFetch(source, "manifest-retry");
-    let interrupted = true;
-    const context = toolContext({
-      directory: repository,
-      worktree: repository,
-    }).context;
-    const firstPlugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {
-        failureInjector: (phase: string) => {
-          if (phase === "adopt-after-manifest-temp-write" && interrupted) {
-            interrupted = false;
-            throw new Error("simulated manifest interruption");
-          }
-        },
-      },
-    );
-    const firstDefinition = firstPlugin.tool?.artifact_adopt_legacy as
-      ToolDefinition | undefined;
-    if (!firstDefinition)
-      throw new Error("Legacy adoption tool was not registered");
-    const args = {
-      artifactId: "legacy-manifest-retry",
-      adoptionCode: "panes-adopt-legacy-" + "c".repeat(32),
-      slug: "manifest-retry",
-    };
-
-    await expect(firstDefinition.execute(args, context)).rejects.toThrow(
-      "simulated manifest interruption",
-    );
-    const artifactDirectory = join(repository, "artifacts", "manifest-retry");
-    const interruptedEntries = await readdir(artifactDirectory);
-    expect(
-      interruptedEntries.some(
-        (entry) =>
-          entry.startsWith(".artifact.json.adopt-") && entry.endsWith(".tmp"),
-      ),
-    ).toBe(true);
-
-    const retryPlugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {},
-    );
-    const retryDefinition = retryPlugin.tool?.artifact_adopt_legacy as
-      ToolDefinition | undefined;
-    if (!retryDefinition)
-      throw new Error("Legacy adoption tool was not registered");
-    const result = await retryDefinition.execute(args, context);
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(
-      (await readdir(artifactDirectory)).filter(
-        (entry) =>
-          entry.startsWith(".artifact.json.adopt-") ||
-          entry.includes("journal"),
-      ),
-    ).toEqual([]);
-    expect(
-      await readFile(join(artifactDirectory, "v1", "index.html"), "utf8"),
-    ).toBe(source);
-    expect(structuredResult(result).metadata?.version).toBe(1);
-  });
-
-  it("serializes concurrent same-code adoption calls onto one local binding", async () => {
-    const repository = await gitRepository();
-    const fetchMock = mockLegacyAdoptionFetch(
-      "<h1>concurrent</h1>\r\n",
-      "concurrent",
-    );
-    const context = toolContext({
-      directory: repository,
-      worktree: repository,
-    }).context;
-    const plugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {},
-    );
-    const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
-    const args = {
-      artifactId: "legacy-concurrent",
-      adoptionCode: "panes-adopt-legacy-" + "d".repeat(32),
-      slug: "concurrent",
-    };
-
-    const [first, second] = await Promise.all([
-      definition.execute(args, context),
-      definition.execute(args, context),
-    ]);
-    const firstMetadata = structuredResult(first).metadata;
-    const secondMetadata = structuredResult(second).metadata;
-    expect(firstMetadata?.artifactId).toBe(secondMetadata?.artifactId);
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(
-      await readFile(
-        join(repository, "artifacts", "concurrent", "v1", "index.html"),
-        "utf8",
-      ),
-    ).toBe("<h1>concurrent</h1>\r\n");
-  });
-
-  it("serializes the global adoption checkpoint across project roots", async () => {
-    const firstRepository = await gitRepository("git@example.com:first.git");
-    const secondRepository = await gitRepository("git@example.com:second.git");
-    let releaseFirstRedemption!: () => void;
-    let firstRedemptionStarted!: () => void;
-    const firstStarted = new Promise<void>(
-      (resolve) => (firstRedemptionStarted = resolve),
-    );
-    const release = new Promise<void>(
-      (resolve) => (releaseFirstRedemption = resolve),
-    );
-    let requestCount = 0;
-    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
-      const request = JSON.parse(String(init?.body)) as {
-        apiOrigin: string;
-        localProjectId: string;
-        localArtifactId: string;
-        slug: string;
-      };
-      requestCount += 1;
-      if (requestCount === 1) {
-        firstRedemptionStarted();
-        await release;
-      }
-      return jsonResponse({
-        operation: "legacy-adopted",
-        apiOrigin: request.apiOrigin,
-        localProjectId: request.localProjectId,
-        localArtifactId: request.localArtifactId,
-        slug: request.slug,
-        title: "Cross-project adoption",
-        type: "html",
-        source: "<h1>cross-project</h1>",
-        provenance: {
-          grantId: "adoption-grant-cross-project",
-          localProjectId: request.localProjectId,
-          localArtifactId: request.localArtifactId,
-          localSlug: request.slug,
-          legacyArtifactId: "legacy-cross-project",
-          legacyRevisionId: "revision-cross-project",
-          legacyRevisionVersion: 1,
-          legacyTitle: "Cross-project adoption",
-          legacyType: "html",
-        },
-      });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const plugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {},
-    );
-    const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
-    const args = {
-      artifactId: "legacy-cross-project",
-      adoptionCode: "panes-adopt-legacy-" + "9".repeat(32),
-      slug: "cross-project",
-    };
-    const first = definition.execute(
-      args,
-      toolContext({
-        directory: firstRepository,
-        worktree: firstRepository,
-      }).context,
-    );
-    await firstStarted;
-    const second = definition.execute(
-      args,
-      toolContext({
-        directory: secondRepository,
-        worktree: secondRepository,
-      }).context,
-    );
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    releaseFirstRedemption();
-    const results = await Promise.allSettled([first, second]);
-    expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(
-      1,
-    );
-    expect(results.filter(({ status }) => status === "rejected")).toHaveLength(
-      1,
-    );
-    const rejection = results.find(
-      (result): result is PromiseRejectedResult => result.status === "rejected",
-    );
-    expect(rejection?.reason).toMatchObject({
-      message: expect.stringContaining("already bound"),
-    });
-    expect(fetchMock).toHaveBeenCalledOnce();
-    expect(
-      await stat(join(firstRepository, "artifacts", "cross-project", "v1")),
-    ).toMatchObject({ isDirectory: expect.any(Function) });
-    await expect(
-      stat(join(secondRepository, "artifacts", "cross-project")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("sweeps expired completed adoptions and evicts the oldest cache entry", async () => {
-    vi.useFakeTimers();
-    try {
-      const repository = await gitRepository();
-      const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
-        const request = JSON.parse(String(init?.body)) as {
-          apiOrigin: string;
-          localProjectId: string;
-          localArtifactId: string;
-          slug: string;
-        };
-        return jsonResponse({
-          operation: "legacy-adopted",
-          apiOrigin: request.apiOrigin,
-          localProjectId: request.localProjectId,
-          localArtifactId: request.localArtifactId,
-          slug: request.slug,
-          title: request.slug,
-          type: "html",
-          source: `<h1>${request.slug}</h1>`,
-          provenance: {
-            grantId: `adoption-grant-${request.slug}`,
-            localProjectId: request.localProjectId,
-            localArtifactId: request.localArtifactId,
-            localSlug: request.slug,
-            legacyArtifactId: `legacy-${request.slug}`,
-            legacyRevisionId: `revision-${request.slug}`,
-            legacyRevisionVersion: 1,
-            legacyTitle: request.slug,
-            legacyType: "html",
-          },
-        });
-      });
-      vi.stubGlobal("fetch", fetchMock);
-      const plugin = await OpenCodePanesPlugin(
-        {} as Parameters<typeof OpenCodePanesPlugin>[0],
-        {},
-      );
-      const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
-      const argsFor = (index: number) => ({
-        artifactId: `legacy-cache-${index}`,
-        adoptionCode: `panes-adopt-legacy-${index.toString(16).padStart(2, "0")}${"a".repeat(30)}`,
-        slug: `cache-${index}`,
-      });
-      for (let index = 0; index < 17; index += 1) {
-        await definition.execute(
-          argsFor(index),
-          toolContext({ directory: repository, worktree: repository }).context,
-        );
-      }
-      const callsAfterInitialAdoptions = fetchMock.mock.calls.length;
-      await expect(
-        definition.execute(
-          argsFor(0),
-          toolContext({ directory: repository, worktree: repository }).context,
-        ),
-      ).rejects.toThrow("does not match its checkpoint");
-      await definition.execute(
-        argsFor(1),
-        toolContext({ directory: repository, worktree: repository }).context,
-      );
-      expect(fetchMock).toHaveBeenCalledTimes(callsAfterInitialAdoptions);
-
-      vi.setSystemTime(Date.now() + 5 * 60 * 1000 + 1);
-      await expect(
-        definition.execute(
-          argsFor(1),
-          toolContext({ directory: repository, worktree: repository }).context,
-        ),
-      ).rejects.toThrow("does not match its checkpoint");
-    } finally {
-      vi.useRealTimers();
-    }
-  }, 15_000);
-
-  it("maps every Legacy renderer to a finalized exact-byte local v1 preview", async () => {
-    const repository = await gitRepository();
-    const cases = [
-      {
-        type: "html" as const,
-        filename: "index.html",
-        source: "\uFEFF<html>\r\n\0café</html>\r\n",
-        adapter: "browser" as const,
-      },
-      {
-        type: "svg" as const,
-        filename: "index.svg",
-        source: "\uFEFF<svg>\r\n\0café</svg>\r\n",
-        adapter: "browser" as const,
-      },
-      {
-        type: "react" as const,
-        filename: "App.tsx",
-        source: "\uFEFFexport default function App(){return <p>café</p>}\r\n",
-        adapter: "renderer" as const,
-        renderer: "react" as const,
-      },
-      {
-        type: "markdown" as const,
-        filename: "README.md",
-        source: "\uFEFF# café\r\n\0\r\n",
-        adapter: "renderer" as const,
-        renderer: "markdown" as const,
-      },
-      {
-        type: "mermaid" as const,
-        filename: "diagram.mmd",
-        source: "\uFEFFflowchart TD\r\nA[café] --> B\r\n",
-        adapter: "renderer" as const,
-        renderer: "mermaid" as const,
-      },
-      {
-        type: "code" as const,
-        filename: "source.txt",
-        source: "\uFEFFconst café = '\0';\r\n",
-        adapter: "renderer" as const,
-        renderer: "code" as const,
-      },
-    ];
-    const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
-      const request = JSON.parse(String(init?.body)) as {
-        apiOrigin: string;
-        localProjectId: string;
-        localArtifactId: string;
-        slug: string;
-        code: string;
-      };
-      const selected = cases.find(({ type }) => request.slug === `all-${type}`);
-      if (!selected) throw new Error("unknown adoption test case");
-      return jsonResponse({
-        operation: "legacy-adopted",
-        apiOrigin: request.apiOrigin,
-        localProjectId: request.localProjectId,
-        localArtifactId: request.localArtifactId,
-        slug: request.slug,
-        title: `Legacy ${selected.type}`,
-        type: selected.type,
-        source: selected.source,
-        provenance: {
-          grantId: `adoption-grant-all-${selected.type}`,
-          localProjectId: request.localProjectId,
-          localArtifactId: request.localArtifactId,
-          localSlug: request.slug,
-          legacyArtifactId: `legacy-all-${selected.type}`,
-          legacyRevisionId: `revision-all-${selected.type}`,
-          legacyRevisionVersion: 1,
-          legacyTitle: `Legacy ${selected.type}`,
-          legacyType: selected.type,
-        },
-      });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const plugin = await OpenCodePanesPlugin(
-      {} as Parameters<typeof OpenCodePanesPlugin>[0],
-      {},
-    );
-    const definition = plugin.tool?.artifact_adopt_legacy as ToolDefinition;
-    const results: Array<{
-      result: ToolResult;
-      code: string;
-      previewUrl: string;
-    }> = [];
-    for (const [index, selected] of cases.entries()) {
-      const code = `panes-adopt-legacy-${index.toString(16)}${"e".repeat(31)}`;
-      const result = await definition.execute(
-        {
-          artifactId: `legacy-all-${selected.type}`,
-          adoptionCode: code,
-          slug: `all-${selected.type}`,
-        },
-        toolContext({ directory: repository, worktree: repository }).context,
-      );
-      const metadata = structuredResult(result).metadata as {
-        artifactId: string;
-        preview: { adapter: string; renderer?: string };
-        previewUrl: string;
-      };
-      expect(metadata.preview.adapter).toBe(selected.adapter);
-      expect(metadata.preview.renderer).toBe(selected.renderer);
-      results.push({ result, code, previewUrl: metadata.previewUrl });
-
-      const manifest = JSON.parse(
-        await readFile(
-          join(
-            repository,
-            "artifacts",
-            `all-${selected.type}`,
-            "artifact.json",
-          ),
-          "utf8",
-        ),
-      ) as ReturnType<typeof artifactManifestSchema.parse>;
-      expect(manifest.revisions).toHaveLength(1);
-      expect(manifest.revisions[0]?.preview).toEqual({
-        adapter: selected.adapter,
-        entryPath: selected.filename,
-        ...(selected.renderer ? { renderer: selected.renderer } : {}),
-      });
-      expect(
-        await readFile(
-          join(
-            repository,
-            "artifacts",
-            `all-${selected.type}`,
-            "v1",
-            selected.filename,
-          ),
-        ),
-      ).toEqual(Buffer.from(selected.source, "utf8"));
-      const serialized = JSON.stringify({ manifest, result });
-      expect(serialized).not.toContain(code);
-      expect(serialized).not.toContain("owner-secret");
-    }
-    vi.unstubAllGlobals();
-    for (const { previewUrl } of results) {
-      expect((await fetch(previewUrl)).status).toBe(200);
-    }
-    expect(fetchMock).toHaveBeenCalledTimes(cases.length);
-
-    const adoptedArtifactId = structuredResult(results[0]!.result).metadata
-      ?.artifactId as string;
-    const prepared = await (
-      plugin.tool?.artifact_prepare as ToolDefinition
-    ).execute(
-      { artifactId: adoptedArtifactId, requestedOrigins: [] },
-      toolContext({ directory: repository, worktree: repository }).context,
-    );
-    const draftPath = structuredResult(prepared).metadata?.draftPath as string;
-    await writeFile(join(draftPath, "index.html"), "<h1>v2</h1>\r\n");
-    const finalized = await (
-      plugin.tool?.artifact_finalize as ToolDefinition
-    ).execute(
-      {
-        artifactId: adoptedArtifactId,
-        entryPath: "index.html",
-        adapter: "browser",
-      },
-      toolContext({ directory: repository, worktree: repository }).context,
-    );
-    expect(structuredResult(finalized).metadata).toMatchObject({
-      artifactId: adoptedArtifactId,
-      version: 2,
-    });
-    expect(
-      await readFile(
-        join(repository, "artifacts", "all-html", "v2", "index.html"),
-        "utf8",
-      ),
-    ).toBe("<h1>v2</h1>\r\n");
-  }, 10_000);
-});
-
-describe("artifact_prepare tool", () => {
-  it("creates a Git-project artifact manifest and writable draft without fetching", async () => {
-    const repository = await gitRepository(
-      "git@github.com:Example/Prototype.git",
-    );
-    const fetchMock = vi.fn<typeof fetch>();
-    vi.stubGlobal("fetch", fetchMock);
-
-    const result = await executePrepare(
-      { title: "Landing Page", requestedOrigins: [] },
-      toolContext({ directory: repository, worktree: repository }).context,
-    );
-
-    const artifactDirectory = join(repository, "artifacts", "landing-page");
-    const manifest = JSON.parse(
-      await readFile(join(artifactDirectory, "artifact.json"), "utf8"),
-    );
-    const draft = JSON.parse(
-      await readFile(join(artifactDirectory, "draft.json"), "utf8"),
-    );
-
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(artifactManifestSchema.parse(manifest)).toMatchObject({
-      schemaVersion: 1,
-      projectId: "https://github.com/example/prototype",
-      artifactId: manifest.artifactId,
-      slug: "landing-page",
-      title: "Landing Page",
-      revisions: [],
-    });
-    expect(draft).toMatchObject({
-      artifactId: manifest.artifactId,
-      baseRevision: null,
-      requestedOrigins: [],
-    });
-    expect(await stat(join(artifactDirectory, "draft"))).toMatchObject({
-      isDirectory: expect.any(Function),
-    });
-    expect(structuredResult(result).metadata).toMatchObject({
-      operation: "created",
-      artifactId: manifest.artifactId,
-      projectId: "https://github.com/example/prototype",
-      slug: "landing-page",
-      draftPath: join(resolve(artifactDirectory), "draft"),
-      baseRevision: null,
-    });
-  });
-
-  it("uses the session directory for a non-Git session and persists generated project identity", async () => {
-    const session = join(temporaryDirectory, "session");
-    await mkdir(session, { recursive: true });
-    const context = toolContext({
-      directory: session,
-      worktree: join(session, "missing"),
-    });
-
-    const first = await executePrepare({ title: "First" }, context.context);
-    const firstMetadata = structuredResult(first).metadata;
-    const second = await executePrepare({ title: "Second" }, context.context);
-    const secondMetadata = structuredResult(second).metadata;
-
-    expect(firstMetadata?.draftPath).toContain(join(session, "artifacts"));
-    expect(secondMetadata?.projectId).toBe(firstMetadata?.projectId);
-    expect(secondMetadata?.artifactId).not.toBe(firstMetadata?.artifactId);
-    expect(
-      await stat(join(session, "artifacts", ".panes-project.json")),
-    ).toMatchObject({
-      isFile: expect.any(Function),
-    });
-  });
-
-  it("copies the latest finalized revision into a new draft without changing the revision", async () => {
-    const repository = await gitRepository();
-    const artifactDirectory = join(repository, "artifacts", "existing");
-    await mkdir(join(artifactDirectory, "v1", "assets"), { recursive: true });
-    await writeFile(
-      join(artifactDirectory, "v1", "index.html"),
-      "<h1>Original</h1>\n",
-    );
-    await writeFile(
-      join(artifactDirectory, "v1", "assets", "data.bin"),
-      Buffer.from([0, 255, 1]),
-    );
-    await writeFile(
-      join(artifactDirectory, "artifact.json"),
-      `${JSON.stringify({
-        schemaVersion: 1,
-        projectId: "project-1",
-        artifactId: "artifact-1",
-        slug: "existing",
-        title: "Existing",
-        revisions: [
-          {
-            id: "revision-1",
-            version: 1,
-            preview: { adapter: "browser", entryPath: "index.html" },
-            approvedOrigins: [],
-            files: [],
-            createdAt: "2026-08-17T12:00:00.000Z",
-          },
-        ],
-      })}\n`,
-    );
-
-    const result = await executePrepare(
-      {
-        artifactId: "artifact-1",
-        requestedOrigins: ["https://api.example.com/"],
-      },
-      toolContext({ directory: repository, worktree: repository }).context,
-    );
-
-    const draftPath = structuredResult(result).metadata?.draftPath as string;
-    expect(await readFile(join(draftPath, "index.html"), "utf8")).toBe(
-      "<h1>Original</h1>\n",
-    );
-    expect(await readFile(join(draftPath, "assets", "data.bin"))).toEqual(
-      Buffer.from([0, 255, 1]),
-    );
-    expect(
-      await readFile(join(artifactDirectory, "v1", "index.html"), "utf8"),
-    ).toBe("<h1>Original</h1>\n");
-    expect(structuredResult(result).metadata).toMatchObject({
-      operation: "prepared",
+    const result = await run(upload, { sourcePath: "site" });
+    expect(result).toEqual({
       artifactId: "artifact-1",
-      baseRevision: 1,
-      requestedOrigins: ["https://api.example.com"],
+      version: 1,
+      dashboardUrl: `${api.origin}/inventory/artifacts/artifact-1`,
     });
-  });
-
-  it("requires an explicit choice for slug collisions and existing drafts", async () => {
-    const repository = await gitRepository();
-    const context = toolContext({
-      directory: repository,
-      worktree: repository,
-    }).context;
-    const created = await executePrepare({ title: "Collision" }, context);
-
-    await expect(
-      executePrepare(
-        { title: "Collision", idempotencyKey: "different-request" },
-        context,
-      ),
-    ).rejects.toThrow("already exists");
-
-    const artifactId = structuredResult(created).metadata?.artifactId as string;
-    await expect(
-      executePrepare(
-        { artifactId, requestedOrigins: ["https://different.example"] },
-        context,
-      ),
-    ).rejects.toThrow("Draft already exists");
-
-    const resumed = await executePrepare(
-      { artifactId, requestedOrigins: [], draftAction: "resume" },
-      context,
-    );
-    expect(structuredResult(resumed).metadata).toMatchObject({
-      operation: "created",
-      artifactId,
-    });
-
-    const resumedDraftPath = structuredResult(resumed).metadata
-      ?.draftPath as string;
-    await writeFile(join(resumedDraftPath, "discard-me.txt"), "temporary");
-    const discarded = await executePrepare(
-      { artifactId, requestedOrigins: [], draftAction: "discard" },
-      context,
-    );
-    expect(structuredResult(discarded).metadata?.operation).toBe("prepared");
-    await expect(
-      stat(join(resumedDraftPath, "discard-me.txt")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("returns the existing state for a repeated idempotent request", async () => {
-    const repository = await gitRepository();
-    const context = toolContext({
-      directory: repository,
-      worktree: repository,
-    }).context;
-    const request = {
-      title: "Repeatable",
-      requestedOrigins: ["https://api.example.com"],
-      idempotencyKey: "prepare-repeat-1",
-    };
-
-    const first = await executePrepare(request, context);
-    const second = await executePrepare(request, context);
-
-    expect(structuredResult(second).metadata).toEqual(
-      structuredResult(first).metadata,
-    );
-    expect(await readdir(join(repository, "artifacts", "repeatable"))).toEqual(
-      expect.arrayContaining(["artifact.json", "draft", "draft.json"]),
-    );
-  });
-});
-
-describe("plugin options", () => {
-  it.each([99, 120_001, 1.5, "15000", null])(
-    "rejects invalid requestTimeoutMs value %p",
-    async (requestTimeoutMs) => {
-      await expect(
-        OpenCodePanesPlugin({} as Parameters<typeof OpenCodePanesPlugin>[0], {
-          requestTimeoutMs: requestTimeoutMs as never,
+    expect(context.ask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        permission: "artifact_upload",
+        patterns: [api.origin],
+        metadata: expect.objectContaining({
+          sourcePath: join(root, "site"),
+          destination: api.origin,
         }),
-      ).rejects.toThrow(
-        "Panes plugin option requestTimeoutMs must be an integer from 100 to 120000",
+      }),
+    );
+    expect(JSON.stringify(vi.mocked(context.ask).mock.calls)).not.toContain(
+      key,
+    );
+    const request = api.requests[0]!;
+    expect(request.project).toEqual({
+      id: `local:${digest(root)}`,
+      name: root.split("/").at(-1),
+    });
+    expect(request.artifactKey).toBe("site");
+    const { idempotencyKey, ...withoutKey } = request;
+    expect(idempotencyKey).toBe(digest(JSON.stringify(withoutKey)));
+    expect(api.received.get("upload-1/assets/picture 1.png")).toEqual(binary);
+    expect(api.calls.some((call) => call.url.includes("picture%201.png"))).toBe(
+      true,
+    );
+    expect(api.calls.some((call) => call.url.includes("%C3%A9.bin"))).toBe(
+      true,
+    );
+    expect(
+      api.calls.every((call) => call.authorization === `Bearer ${key}`),
+    ).toBe(true);
+    expect(await tree(root)).toEqual(before);
+  });
+
+  it("uses shared exclusions at every depth without copying private metadata or dependencies", async () => {
+    const excluded = [
+      ".env",
+      ".env.local",
+      "nested/.ENV.production",
+      "id.key",
+      "cert.pem",
+      "cert.p12",
+      "cert.pfx",
+      ".git/config",
+      "node_modules/pkg/main.js",
+      ".cache/a",
+      ".next/a",
+      ".nuxt/a",
+      ".turbo/a",
+      ".output/a",
+      ".panes/state",
+      ".panesignore",
+      "artifact.json",
+      "nested/draft.json",
+    ];
+    for (const path of excluded) await put(`site/${path}`, key);
+    const before = await tree(root);
+    await run(upload, { sourcePath: "site" });
+    expect(api.requests[0]!.files.map((file) => file.path)).toEqual([
+      "index.html",
+    ]);
+    expect(JSON.stringify(api.requests)).not.toContain(key);
+    expect(await tree(root)).toEqual(before);
+  });
+
+  it("supports SVG, custom folder entries, session-relative sources and friendly overrides", async () => {
+    await put(
+      "site/nested/image.svg",
+      "<svg xmlns='http://www.w3.org/2000/svg'/>\r\n",
+    );
+    const result = await run(
+      upload,
+      {
+        sourcePath: "nested/image.svg",
+        title: "Picture",
+        projectName: "Friendly",
+      },
+      { ...context, directory: join(root, "site") },
+    );
+    expect(result.error).toBeUndefined();
+    expect(api.requests[0]).toMatchObject({
+      artifactKey: "site/nested/image.svg",
+      title: "Picture",
+      project: { name: "Friendly" },
+      entryPath: "image.svg",
+      files: [{ path: "image.svg", mediaType: "image/svg+xml" }],
+    });
+    await run(upload, { sourcePath: "site", entryPath: "nested/image.svg" });
+    expect(api.requests[1]!.entryPath).toBe("nested/image.svg");
+  });
+
+  it("retries completed uploads deterministically and changes the key for bytes or metadata", async () => {
+    const first = await run(upload, { sourcePath: "site" });
+    const puts = api.calls.filter((call) => call.method === "PUT").length;
+    expect(await run(upload, { sourcePath: join(root, "site") })).toEqual(
+      first,
+    );
+    expect(api.requests[1]).toEqual(api.requests[0]);
+    expect(api.calls.filter((call) => call.method === "PUT")).toHaveLength(
+      puts,
+    );
+    expect(api.versions).toBe(1);
+    await put("site/index.html", "<h1>Changed</h1>");
+    expect((await run(upload, { sourcePath: "site" })).version).toBe(2);
+    await run(upload, { sourcePath: "site", title: "New title" });
+    expect(
+      new Set(api.requests.map((request) => request.idempotencyKey)).size,
+    ).toBe(3);
+    expect(context.ask).toHaveBeenCalledTimes(4);
+  });
+
+  it.each(["fail-put", "fail-commit"])(
+    "resumes safely after %s",
+    async (mode) => {
+      api.mode = mode;
+      expect((await run(upload, { sourcePath: "site" })).error).toContain(
+        "HTTP 503",
       );
+      api.mode = "normal";
+      expect((await run(upload, { sourcePath: "site" })).version).toBe(1);
+      expect(api.requests[0]).toEqual(api.requests[1]);
+      expect(api.versions).toBe(1);
     },
   );
 
-  it("accepts the supported requestTimeoutMs range", async () => {
-    await expect(
-      OpenCodePanesPlugin({} as Parameters<typeof OpenCodePanesPlugin>[0], {
-        requestTimeoutMs: 100,
-      }),
-    ).resolves.toBeDefined();
-    await expect(
-      OpenCodePanesPlugin({} as Parameters<typeof OpenCodePanesPlugin>[0], {
-        requestTimeoutMs: 120_000,
-      }),
-    ).resolves.toBeDefined();
+  it("sends the buffered snapshot even when source changes after upload creation", async () => {
+    const bytes = await readFile(join(root, "site/index.html"));
+    api.onCreate = async () => {
+      await put("site/index.html", "Changed by another editor");
+    };
+    expect((await run(upload, { sourcePath: "site" })).error).toBeUndefined();
+    expect(api.received.get("upload-1/index.html")).toEqual(bytes);
+  });
+
+  it("rejects an earlier asset and later entry changing during collection instead of mixing builds", async () => {
+    await put("site/a.js", "old asset");
+    await utimes(join(root, "site/a.js"), 0, 0);
+    await put("site/middle.bin", Buffer.from([0, 255, 128]));
+    await put("site/z.html", "<h1>Old entry</h1>");
+    const mutate = vi.fn(async () => {
+      await put("site/a.js", "new asset");
+      await put("site/z.html", "<h1>New entry</h1>");
+    });
+    changeDuringRead(mutate);
+
+    expect(
+      (await run(upload, { sourcePath: "site", entryPath: "z.html" })).error,
+    ).toContain("Source changed");
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(api.calls).toHaveLength(0);
+
+    expect(
+      (await run(upload, { sourcePath: "site", entryPath: "z.html" })).version,
+    ).toBe(1);
+    expect(api.received.get("upload-1/a.js")?.toString()).toBe("new asset");
+    expect(api.received.get("upload-1/z.html")?.toString()).toBe(
+      "<h1>New entry</h1>",
+    );
+  });
+
+  it.each(["add", "remove", "rename"])(
+    "rejects directory membership %s during a later file read and recovers safely",
+    async (change) => {
+      await put("site/a/old.js", "asset");
+      await put("site/middle.bin", Buffer.from([0, 255, 128]));
+      const mutate = vi.fn(async () => {
+        if (change === "add") await put("site/a/new.js", "new asset");
+        if (change === "remove") await rm(join(root, "site/a/old.js"));
+        if (change === "rename")
+          await rename(
+            join(root, "site/a/old.js"),
+            join(root, "site/a/new.js"),
+          );
+      });
+      changeDuringRead(mutate);
+
+      expect((await run(upload, { sourcePath: "site" })).error).toContain(
+        "Source changed",
+      );
+      expect(mutate).toHaveBeenCalledTimes(1);
+      expect(api.calls).toHaveLength(0);
+      expect((await run(upload, { sourcePath: "site" })).version).toBe(1);
+      const paths = api.requests[0]!.files.map((file) => file.path);
+      expect(paths.includes("a/old.js")).toBe(change === "add");
+      expect(paths.includes("a/new.js")).toBe(change !== "remove");
+    },
+  );
+
+  it.each([
+    { code: "ETIMEDOUT", killed: true, signal: "SIGTERM" },
+    { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" },
+    { code: "EACCES" },
+    { code: 1, stderr: key },
+    { code: 1, killed: true, signal: "SIGTERM" },
+    { code: "ENOENT" },
+  ])(
+    "does not change identity on git discovery failure $code and resumes the partial upload",
+    async (failure) => {
+      await exec("git", ["init", "--quiet", root]);
+      await exec("git", [
+        "-C",
+        root,
+        "config",
+        "remote.origin.url",
+        "git@example.com:owner/project.git",
+      ]);
+      api.mode = "fail-put";
+      expect((await run(upload, { sourcePath: "site" })).error).toContain(
+        "HTTP 503",
+      );
+      const calls = api.calls.length;
+      const permissions = vi.mocked(context.ask).mock.calls.length;
+      vi.mocked(exec).mockRejectedValueOnce(
+        Object.assign(new Error(key), { stdout: "", stderr: "", ...failure }),
+      );
+
+      const result = await run(upload, { sourcePath: "site" });
+      expect(result.error).toContain(
+        failure.code === "ENOENT"
+          ? "Install Git"
+          : "Retry project identity discovery",
+      );
+      expect(api.calls).toHaveLength(calls);
+      expect(context.ask).toHaveBeenCalledTimes(permissions);
+
+      api.mode = "normal";
+      expect((await run(upload, { sourcePath: "site" })).version).toBe(1);
+      expect(api.requests).toHaveLength(2);
+      expect(api.requests[1]).toEqual(api.requests[0]);
+      expect(api.requests[0]!.project.id).toBe(
+        `git:${digest("example.com/owner/project")}`,
+      );
+      expect(api.versions).toBe(1);
+    },
+  );
+
+  it.each(["absent", "unusable"])(
+    "keeps legitimate local identity fallback for an %s repository remote",
+    async (remote) => {
+      await exec("git", ["init", "--quiet", root]);
+      if (remote === "unusable")
+        await exec("git", [
+          "-C",
+          root,
+          "config",
+          "remote.origin.url",
+          "../local-only-repository",
+        ]);
+      expect((await run(upload, { sourcePath: "site" })).version).toBe(1);
+      expect(api.requests[0]!.project.id).toBe(`local:${digest(root)}`);
+    },
+  );
+
+  it("fails closed on unreadable git configuration rather than treating it as no remotes", async () => {
+    await exec("git", ["init", "--quiet", root]);
+    await put(".git/config", "[invalid configuration");
+    expect((await run(upload, { sourcePath: "site" })).error).toContain(
+      "Retry project identity discovery",
+    );
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it("normalizes HTTPS and SSH remotes without exposing remote credentials", async () => {
+    await exec("git", ["init", "--quiet", root]);
+    await exec("git", [
+      "-C",
+      root,
+      "config",
+      "remote.origin.url",
+      `https://user:${key}@GitHub.com/owner/project.git/`,
+    ]);
+    await run(upload, { sourcePath: "site" });
+    await exec("git", [
+      "-C",
+      root,
+      "config",
+      "remote.origin.url",
+      "git@github.com:owner/project.git",
+    ]);
+    await run(upload, { sourcePath: "site" });
+    expect(api.requests[0]).toEqual(api.requests[1]);
+    expect(api.requests[0]!.project.id).toBe(
+      `git:${digest("github.com/owner/project")}`,
+    );
+    expect(JSON.stringify(api.requests)).not.toContain(key);
+  });
+
+  it("uses another configured remote when origin is absent", async () => {
+    await exec("git", ["init", "--quiet", root]);
+    await exec("git", [
+      "-C",
+      root,
+      "config",
+      "remote.upstream.url",
+      "ssh://git@example.com/owner/project.git",
+    ]);
+    await run(upload, { sourcePath: "site" });
+    expect(api.requests[0]!.project.id).toBe(
+      `git:${digest("example.com/owner/project")}`,
+    );
   });
 });
 
-async function executePrepare(
-  args: {
-    artifactId?: string;
-    title?: string;
-    slug?: string;
-    kind?: string;
-    requestedOrigins?: string[];
-    draftAction?: "resume" | "discard";
-    idempotencyKey?: string;
-  },
-  context: ToolContext,
-) {
-  const plugin = await OpenCodePanesPlugin(
-    {} as Parameters<typeof OpenCodePanesPlugin>[0],
-    {},
-  );
-  const definition = plugin.tool?.artifact_prepare as
-    ToolDefinition | undefined;
-  if (!definition) throw new Error("artifact_prepare tool was not registered");
-  return definition.execute(args, context);
-}
-
-function toolContext(
-  overrides: Partial<Pick<ToolContext, "directory" | "worktree">> = {},
-  ask = vi.fn<ToolContext["ask"]>().mockResolvedValue(),
-) {
-  const context: ToolContext = {
-    sessionID: "session-1",
-    messageID: "message-1",
-    agent: "build",
-    directory: overrides.directory ?? "/project",
-    worktree: overrides.worktree ?? "/project",
-    abort: new AbortController().signal,
-    metadata: vi.fn(),
-    ask,
-  };
-  return { context, ask };
-}
-
-async function gitRepository(remote?: string) {
-  const repository = join(temporaryDirectory, `repo-${randomSuffix()}`);
-  await mkdir(repository, { recursive: true });
-  await execFileAsync("git", ["init", "-q", repository]);
-  if (remote) {
-    await execFileAsync("git", [
-      "-C",
-      repository,
-      "remote",
-      "add",
-      "origin",
-      remote,
-    ]);
-  }
-  return repository;
-}
-
-function randomSuffix() {
-  return Math.random().toString(36).slice(2);
-}
-
-function jsonResponse(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-function mockLegacyAdoptionFetch(source: string, suffix: string) {
-  const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
-    const request = JSON.parse(String(init?.body)) as {
-      apiOrigin: string;
-      localProjectId: string;
-      localArtifactId: string;
-      slug: string;
-    };
-    return jsonResponse({
-      operation: "legacy-adopted",
-      apiOrigin: request.apiOrigin,
-      localProjectId: request.localProjectId,
-      localArtifactId: request.localArtifactId,
-      slug: request.slug,
-      title: suffix,
-      type: "html",
-      source,
-      provenance: {
-        grantId: `adoption-grant-${suffix}`,
-        localProjectId: request.localProjectId,
-        localArtifactId: request.localArtifactId,
-        localSlug: request.slug,
-        legacyArtifactId: `legacy-${suffix}`,
-        legacyRevisionId: `revision-${suffix}`,
-        legacyRevisionVersion: 1,
-        legacyTitle: suffix,
-        legacyType: "html",
-      },
-    });
-  });
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
-}
-
-function mockConsumedLegacyAdoptionFetch(source: string, suffix: string) {
-  let binding:
-    | { localProjectId: string; localArtifactId: string; slug: string }
-    | undefined;
-  const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
-    const request = JSON.parse(String(init?.body)) as {
-      apiOrigin: string;
-      localProjectId: string;
-      localArtifactId: string;
-      slug: string;
-    };
-    const nextBinding = {
-      localProjectId: request.localProjectId,
-      localArtifactId: request.localArtifactId,
-      slug: request.slug,
-    };
-    if (
-      binding &&
-      (binding.localProjectId !== nextBinding.localProjectId ||
-        binding.localArtifactId !== nextBinding.localArtifactId ||
-        binding.slug !== nextBinding.slug)
-    ) {
-      return jsonResponse(
-        {
-          error: { code: "FORBIDDEN", message: "Adoption request is invalid" },
-        },
-        403,
+describe("read and network boundaries", () => {
+  it.each(["file", "directory", "nested", "ancestor"])(
+    "rejects %s symlinks without uploading",
+    async (kind) => {
+      let sourcePath = "site";
+      if (kind === "file") {
+        await symlink(join(root, "site/index.html"), join(root, "link.html"));
+        sourcePath = "link.html";
+      }
+      if (kind === "directory") {
+        await symlink(join(root, "site"), join(root, "linked"));
+        sourcePath = "linked";
+      }
+      if (kind === "nested")
+        await symlink(
+          join(root, "site/index.html"),
+          join(root, "site/link.html"),
+        );
+      if (kind === "ancestor") {
+        await symlink(join(root, "site"), join(root, "linked"));
+        sourcePath = "linked/index.html";
+      }
+      expect((await run(upload, { sourcePath })).error).toContain(
+        "Symbolic links",
       );
-    }
-    binding ??= nextBinding;
-    return jsonResponse({
-      operation: "legacy-adopted",
-      apiOrigin: request.apiOrigin,
-      localProjectId: request.localProjectId,
-      localArtifactId: request.localArtifactId,
-      slug: request.slug,
-      title: suffix,
-      type: "html",
-      source,
-      provenance: {
-        grantId: `adoption-grant-${suffix}`,
-        localProjectId: request.localProjectId,
-        localArtifactId: request.localArtifactId,
-        localSlug: request.slug,
-        legacyArtifactId: `legacy-${suffix}`,
-        legacyRevisionId: `revision-${suffix}`,
-        legacyRevisionVersion: 1,
-        legacyTitle: suffix,
-        legacyType: "html",
-      },
-    });
+      expect(api.calls).toHaveLength(0);
+    },
+  );
+
+  it.each([
+    ".env/index.html",
+    "node_modules/pkg/index.html",
+    ".cache/index.html",
+  ])("rejects explicitly selected excluded source %s", async (sourcePath) => {
+    await put(sourcePath, key);
+    expect((await run(upload, { sourcePath })).error).toContain("excluded");
+    expect(api.calls).toHaveLength(0);
   });
-  vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
+
+  it.each([
+    "../index.html",
+    "bad%20.html",
+    "bad?.html",
+    "bad\\name.html",
+    "bad#name.html",
+    "/index.html",
+  ])("rejects unsafe entry %s", async (entryPath) => {
+    expect(
+      (await run(upload, { sourcePath: "site", entryPath })).error,
+    ).toBeTruthy();
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it("rejects unsafe asset paths and non-browser or absent entries", async () => {
+    expect(
+      (await run(upload, { sourcePath: "site", entryPath: "App.tsx" })).error,
+    ).toContain("HTML or SVG");
+    expect(
+      (await run(upload, { sourcePath: "site", entryPath: "missing.html" }))
+        .error,
+    ).toContain("snapshot");
+    await put("site/unsafe?.png", "x");
+    expect((await run(upload, { sourcePath: "site" })).error).toContain(
+      "unsafe",
+    );
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it("rejects outside-project paths", async () => {
+    expect(
+      (await run(upload, { sourcePath: "../outside.html" })).error,
+    ).toContain("inside the project");
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it.each(["file", "total", "count"])(
+    "enforces the %s snapshot limit before network requests",
+    async (limit) => {
+      if (limit === "count") {
+        for (let i = 0; i < 500; i++) await put(`site/${i}.txt`, "");
+      } else {
+        for (let i = 0; i < (limit === "total" ? 5 : 1); i++) {
+          const handle = await open(join(root, `site/${i}.bin`), "w");
+          await handle.truncate(MAX_FILE_BYTES + (limit === "file" ? 1 : 0));
+          await handle.close();
+        }
+      }
+      expect((await run(upload, { sourcePath: "site" })).error).toContain(
+        limit === "file"
+          ? "25 MiB"
+          : limit === "total"
+            ? "100 MiB"
+            : "500 files",
+      );
+      expect(api.calls).toHaveLength(0);
+    },
+  );
+
+  it("does not send anything when permission is denied and redacts permission exceptions", async () => {
+    context.ask = vi.fn(async () => {
+      throw new Error(key);
+    });
+    const before = await tree(root);
+    expect((await run(upload, { sourcePath: "site" })).error).toContain(
+      "permission denied",
+    );
+    expect(api.calls).toHaveLength(0);
+    expect(await tree(root)).toEqual(before);
+  });
+
+  it("cancels before permission and while permission is pending", async () => {
+    const abort = new AbortController();
+    abort.abort(key);
+    expect(
+      (
+        await run(
+          upload,
+          { sourcePath: "site" },
+          { ...context, abort: abort.signal },
+        )
+      ).error,
+    ).toContain("cancelled");
+    expect(context.ask).not.toHaveBeenCalled();
+    const pending = new AbortController();
+    context.ask = vi.fn(() => {
+      pending.abort(key);
+      return new Promise<void>(() => {});
+    });
+    expect(
+      (
+        await run(
+          upload,
+          { sourcePath: "site" },
+          { ...context, abort: pending.signal },
+        )
+      ).error,
+    ).toContain("cancelled");
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it("does not send later files or commit after cancellation during a file transfer", async () => {
+    await put("site/second.png", Buffer.from([255, 0, 128]));
+    const abort = new AbortController();
+    api.server.on("request", (req) => {
+      if (req.method === "PUT") abort.abort(key);
+    });
+    expect(
+      (
+        await run(
+          upload,
+          { sourcePath: "site" },
+          { ...context, abort: abort.signal },
+        )
+      ).error,
+    ).toContain("cancelled");
+    expect(api.calls.filter((call) => call.method === "PUT")).toHaveLength(1);
+    expect(api.calls.some((call) => call.url.endsWith("/commit"))).toBe(false);
+  });
+
+  it("cancels an in-flight request without committing", async () => {
+    api.mode = "stall";
+    const abort = new AbortController();
+    const started = once(api.server, "request");
+    const result = run(
+      upload,
+      { sourcePath: "site" },
+      { ...context, abort: abort.signal },
+    );
+    await started;
+    abort.abort(key);
+    expect((await result).error).toContain("cancelled");
+    expect(api.calls).toHaveLength(1);
+  });
+
+  it.each(["stall", "stall-body"])(
+    "times out %s without continuing the upload",
+    async (mode) => {
+      api.mode = mode;
+      const hooks = await plugin({} as PluginInput, {
+        apiBaseUrl: api.origin,
+        uploadKey: key,
+        requestTimeoutMs: 50,
+      });
+      expect(
+        (await run(hooks.tool!.artifact_upload!, { sourcePath: "site" })).error,
+      ).toContain("timed out");
+      expect(api.calls).toHaveLength(1);
+    },
+  );
+
+  it.each(["error", "redirect", "bad-session", "large-response"])(
+    "does not reflect credentials in %s responses or follow redirects",
+    async (mode) => {
+      api.mode = mode;
+      const logs = vi.spyOn(console, "error");
+      expect((await run(upload, { sourcePath: "site" })).error).toBeTruthy();
+      expect(api.calls).toHaveLength(1);
+      expect(logs).not.toHaveBeenCalled();
+    },
+  );
+
+  it("ignores server-supplied dashboard URLs containing credentials", async () => {
+    api.mode = "echo-url";
+    expect((await run(upload, { sourcePath: "site" })).dashboardUrl).toBe(
+      `${api.origin}/inventory/artifacts/artifact-1`,
+    );
+  });
+
+  it.each([
+    "http://example.com",
+    "http://127.0.0.1.example.com",
+    "http://localhost",
+    "file:///tmp",
+    `https://${key}@example.com`,
+    `https://example.com/?key=${key}`,
+    `https://example.com/#${key}`,
+    `https://example.com/${key}`,
+  ])("rejects unsafe API setting %s", async (apiBaseUrl) => {
+    const hooks = await plugin({} as PluginInput, {
+      apiBaseUrl,
+      uploadKey: key,
+    });
+    expect(
+      (await run(hooks.tool!.artifact_upload!, { sourcePath: "site" })).error,
+    ).toBeTruthy();
+    expect(context.ask).not.toHaveBeenCalled();
+    expect(api.calls).toHaveLength(0);
+  });
+
+  it("requires endpoint and upload key, and supports environment settings with option precedence", async () => {
+    vi.stubEnv("OPENCODE_PANES_API_URL", "");
+    vi.stubEnv("OPENCODE_PANES_UPLOAD_KEY", "");
+    const hooks = await plugin({} as PluginInput);
+    expect((await run(hooks.tool!.artifact_dashboard!, {})).error).toContain(
+      "OPENCODE_PANES_API_URL",
+    );
+    vi.stubEnv("OPENCODE_PANES_API_URL", api.origin);
+    expect(
+      (await run(hooks.tool!.artifact_upload!, { sourcePath: "site" })).error,
+    ).toContain("OPENCODE_PANES_UPLOAD_KEY");
+    vi.stubEnv("OPENCODE_PANES_UPLOAD_KEY", key);
+    expect(
+      (await run(hooks.tool!.artifact_upload!, { sourcePath: "site" })).version,
+    ).toBe(1);
+    vi.stubEnv("OPENCODE_PANES_API_URL", "https://wrong.example");
+    vi.stubEnv("OPENCODE_PANES_UPLOAD_KEY", "wrong-key");
+    expect((await run(upload, { sourcePath: "site" })).version).toBe(1);
+  });
+
+  it.each(["https://panes.example", "http://[::1]:8080"])(
+    "returns the dashboard for safe origin %s without needing an upload key",
+    async (apiBaseUrl) => {
+      vi.stubEnv("OPENCODE_PANES_UPLOAD_KEY", "");
+      const hooks = await plugin({} as PluginInput, { apiBaseUrl });
+      expect(await run(hooks.tool!.artifact_dashboard!, {})).toEqual({
+        dashboardUrl: `${apiBaseUrl}/inventory`,
+      });
+      expect(api.calls).toHaveLength(0);
+    },
+  );
+
+  it("returns only authenticated dashboard paths, without publishing or making dashboard requests", async () => {
+    expect(await run(dashboard, {})).toEqual({
+      dashboardUrl: `${api.origin}/inventory`,
+    });
+    expect(await run(dashboard, { artifactId: "artifact-1" })).toEqual({
+      dashboardUrl: `${api.origin}/inventory/artifacts/artifact-1`,
+    });
+    expect(
+      (await run(dashboard, { artifactId: "../share?secret" })).error,
+    ).toBeTruthy();
+    expect(api.calls).toHaveLength(0);
+    await run(upload, { sourcePath: "site" });
+    expect(api.calls.every((call) => call.url.startsWith("/api/uploads"))).toBe(
+      true,
+    );
+  });
+});
+
+function changeDuringRead(mutate: () => Promise<void>) {
+  const originalOpen = vi.mocked(open).getMockImplementation()!;
+  let changed = false;
+  vi.mocked(open).mockImplementation(async (...args) => {
+    const handle = await originalOpen(...args);
+    if (!changed && args[0] === join(root, "site/middle.bin")) {
+      const read = handle.read;
+      vi.spyOn(handle, "read").mockImplementationOnce(async (...readArgs) => {
+        changed = true;
+        await mutate();
+        return Reflect.apply(read, handle, readArgs);
+      });
+    }
+    return handle;
+  });
 }
 
-function structuredResult(result: ToolResult) {
-  if (typeof result === "string") throw new Error("expected structured result");
+async function tree(path: string): Promise<unknown[]> {
+  const result: unknown[] = [];
+  for (const entry of (await readdir(path)).sort()) {
+    const child = join(path, entry);
+    const info = await stat(child);
+    result.push({
+      path: relative(root, child),
+      mtime: info.mtimeMs,
+      ctime: info.ctimeMs,
+      data: info.isDirectory()
+        ? await tree(child)
+        : (await readFile(child)).toString("base64"),
+    });
+  }
   return result;
 }
 
-async function findFiles(root: string): Promise<string[]> {
-  const entries = await readdir(root, { withFileTypes: true });
-  const files: string[] = [];
-  for (const entry of entries) {
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) files.push(...(await findFiles(path)));
-    else if (entry.isFile()) files.push(path);
-  }
-  return files;
+async function mockApi() {
+  const state = {
+    mode: "normal",
+    origin: "",
+    versions: 0,
+    calls: [] as {
+      method: string;
+      url: string;
+      authorization: string | undefined;
+    }[],
+    requests: [] as UploadRequest[],
+    received: new Map<string, Buffer>(),
+    onCreate: async () => {},
+  };
+  const sessions = new Map<
+    string,
+    { id: string; request: UploadRequest; version: number }
+  >();
+  const server = createServer(async (req, res) => {
+    const url = req.url!;
+    state.calls.push({
+      method: req.method!,
+      url,
+      authorization: req.headers.authorization,
+    });
+    if (state.mode === "stall") return;
+    if (state.mode === "stall-body") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"uploadId":');
+      return;
+    }
+    if (state.mode === "error") {
+      res.writeHead(500).end(key);
+      return;
+    }
+    if (state.mode === "redirect") {
+      res.writeHead(307, { Location: `${state.origin}/leak?key=${key}` }).end();
+      return;
+    }
+    if (state.mode === "bad-session") {
+      json(res, {
+        uploadId: `../${key}`,
+        artifactId: key,
+        complete: false,
+        dashboardUrl: key,
+      });
+      return;
+    }
+    if (state.mode === "large-response") {
+      res.end(JSON.stringify(key.repeat(10_000)));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(Buffer.from(chunk));
+    const bytes = Buffer.concat(chunks);
+    if (req.headers.authorization !== `Bearer ${key}`) {
+      res.writeHead(401).end(key);
+      return;
+    }
+    if (req.method === "POST" && url === "/api/uploads") {
+      const parsed = uploadRequestSchema.safeParse(
+        JSON.parse(bytes.toString()),
+      );
+      if (!parsed.success) {
+        res.writeHead(400).end("Invalid request");
+        return;
+      }
+      // Keep original property order to check the exact idempotency payload.
+      const request = JSON.parse(bytes.toString()) as UploadRequest;
+      state.requests.push(request);
+      let session = sessions.get(request.idempotencyKey);
+      if (!session) {
+        session = { id: `upload-${sessions.size + 1}`, request, version: 0 };
+        sessions.set(request.idempotencyKey, session);
+      }
+      await state.onCreate();
+      json(res, {
+        uploadId: session.id,
+        artifactId: "artifact-1",
+        complete: session.version > 0,
+        dashboardUrl: `${state.origin}/inventory?key=${key}`,
+      });
+      return;
+    }
+    const match = /^\/api\/uploads\/(upload-\d+)\/(.+)$/u.exec(url);
+    const session = [...sessions.values()].find(
+      (value) => value.id === match?.[1],
+    );
+    if (!match || !session) {
+      res.writeHead(404).end();
+      return;
+    }
+    if (req.method === "PUT" && match[2]!.startsWith("files/")) {
+      if (state.mode === "fail-put") {
+        res.writeHead(503).end(key);
+        return;
+      }
+      const path = decodeURIComponent(match[2]!.slice(6));
+      const file = session.request.files.find((value) => value.path === path);
+      if (
+        !file ||
+        file.size !== bytes.length ||
+        file.sha256 !== digest(bytes)
+      ) {
+        res.writeHead(400).end("Invalid file");
+        return;
+      }
+      state.received.set(`${session.id}/${path}`, bytes);
+      res.writeHead(204).end();
+      return;
+    }
+    if (req.method === "POST" && match[2] === "commit") {
+      if (
+        session.request.files.some(
+          (file) => !state.received.has(`${session.id}/${file.path}`),
+        )
+      ) {
+        res.writeHead(409).end();
+        return;
+      }
+      if (!session.version) session.version = ++state.versions;
+      // Simulate a lost success response after committing: retry must not add a version.
+      if (state.mode === "fail-commit") {
+        res.writeHead(503).end(key);
+        return;
+      }
+      json(res, {
+        artifactId: "artifact-1",
+        version: session.version,
+        dashboardUrl: `${state.origin}/inventory?key=${key}`,
+      });
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string")
+    throw new Error("No test API address");
+  state.origin = `http://127.0.0.1:${address.port}`;
+  return Object.assign(state, { server });
+}
+
+function json(res: ServerResponse, value: unknown) {
+  res
+    .writeHead(200, { "Content-Type": "application/json" })
+    .end(JSON.stringify(value));
 }

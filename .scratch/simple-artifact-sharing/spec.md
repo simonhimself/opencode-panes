@@ -1,6 +1,10 @@
 # Simple Artifact Sharing
 
-Status: ready-for-human
+Status: superseded
+
+Historical specification. Superseded by `PROJECT_PLAN.md` and
+`docs/simple-library-interface.md` on September 5, 2026. Current sharing is managed
+only in the owner dashboard and defaults to no expiry.
 
 ## Problem Statement
 

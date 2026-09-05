@@ -1,224 +1,265 @@
 # OpenCode Panes
 
-OpenCode Panes is a local-first artifact workspace for OpenCode. The project
-filesystem is canonical. Panes adds browser previews, immutable local
-Revisions, and an optional private cloud copy for sharing. It is not a
-deployment platform or a backend host.
+**Make anything locally. Upload it privately. Share it when you are ready.**
 
-## The local model
+Panes is an open-source **OpenCode plugin** with a Cloudflare-hosted visual
+library. Each deployment has one owner. Collaborators view the links you share;
+they do not get access to your dashboard.
 
-Panes uses this layout under the current project:
+## How it works
 
-```text
-<git-worktree>/artifacts/
-  <slug>/
-    artifact.json
-    .panesignore                 # optional
-    draft/
-    draft.json
-    v1/
-    v2/
-```
+1. Ask OpenCode to create an HTML file, SVG, or browser-ready prototype folder.
+2. Ask it to upload that file or folder to Panes.
+3. Open your library to browse your work by project and preview uploaded versions.
+4. Select a version and click **Publish** to get a share link.
 
-When the session is not in a Git worktree, the root is
-`<session-directory>/artifacts/`. A normalized `remote.origin.url` is the
-project identity when it is available. Otherwise Panes creates or reads
-`artifacts/.panes-project.json`; the directory name is only display metadata.
-Panes never merges slug collisions implicitly.
+Uploads are private. Local edits do not change cloud versions, and new uploads
+do not change what collaborators see. **Update shared version** explicitly
+updates an active link without changing its URL. Links have no expiry by default;
+you can instead choose 1, 7, or 30 days. **Unpublish** immediately stops access
+through that link. Sharing again creates a new link.
+Updating with a finite duration restarts that duration at confirmation; the
+confirmation also makes an explicit switch to no expiry visible.
 
-`artifact.json` is the canonical, non-secret local manifest. It records the
-artifact identity, title, kind, every finalized Revision, Preview metadata,
-file paths, hashes, byte sizes, media types, and approved HTTP(S) origins. It
-never contains Owner credentials, Creator or Public tokens, reconnect codes,
-or admission keys.
+Panes never moves your source, creates local revision directories, changes Git,
+or requires a Draft/Finalize workflow.
 
-`artifact_prepare` creates an Artifact and writable Draft without network
-access. A later Draft starts from the latest finalized Revision. OpenCode's
-normal filesystem tools can create or change any Draft files. Existing Drafts
-must be explicitly resumed or discarded. `artifact_finalize` validates one
-Preview entry, probes it locally, and promotes the Draft to the next immutable
-`vN` Revision. A changed finalized Revision blocks preview and Sync instead of
-being silently repaired.
+## Everyday use
 
-## Preview and import
+Once the plugin and your deployment are configured, work through OpenCode in
+plain language. You do not need to call the tools yourself.
 
-Every finalized Revision declares one Preview adapter:
+**Create and upload**
 
-- `browser` serves an HTML, SVG, or browser-built entry directly.
-- `renderer` wraps supported React, Markdown, Mermaid, or code source at
-  request time. Stored source bytes are not rewritten.
+> Create a checkout prototype in `mockups/checkout/` with an HTML entry and
+> relative CSS and JavaScript assets. Then upload that folder to Panes, titled
+> Checkout prototype. Keep it private and give me its dashboard link.
 
-Framework source is fine, but unsupported frameworks must be built locally
-into a browser entry before finalization. Panes does not run framework servers,
-backend code, databases, or containers.
+Select a file for a self-contained HTML or SVG, or select the whole folder when
+the entry depends on neighboring assets. Sources must be inside the current
+project. Folder entries default to `index.html`. Panes asks permission to upload;
+it never builds a framework project or publishes on your behalf.
 
-Finalize and Local preview do not contact Cloudflare. The returned preview is a
-temporary, unguessable `http://127.0.0.1` URL for one Revision. It is
-process-local and is not a durable Creator link. Prepare or reopen can issue a
-new local URL after a restart.
+**Find and review your work**
 
-`artifact_import` copies a file or directory through temporary staging into a
-Draft, preserving raw bytes, nested files, empty directories, and portable
-modes. It rejects unsafe paths and symlinks. Ordinary import does not delete
-the source. A source-path import returns a five-minute verification receipt.
-Only a separate Import call with the same `sourcePath`, the
-`verificationReceipt`, `deleteSource: true`, and `confirmDeletion: true` can
-remove the source. Panes re-hashes the source first and leaves it untouched if
-the receipt expired or the source changed.
+> Give me the link to my Panes dashboard.
 
-## Sync and Publication
+Use the project navigation, search, and sharing-status filters to find an
+artifact. Click its card to open the preview. The version selector lets you
+review earlier uploaded versions. Your dashboard link is for you; it is not the
+link to send to collaborators.
 
-Sync is explicit. Create, import, finalize, Local preview, and revision do not
-upload anything. `artifact_sync` uploads every unsynced finalized Revision in
-order, asks permission before the first cloud upload, and returns the Cloud
-inventory URL plus a Creator URL when one is available. After Owner recovery,
-Creator access stays unavailable until an explicit link rotation. Sync is
-private and never publishes an artifact.
+**Share a version**
 
-`openCreatorAfterSuccess` defaults to `false`. When true, successful Sync asks
-for the separate browser-open permission after Sync completes. It still returns
-the validated Creator URL if opening is denied or fails. A natural-language
-publish request only runs Sync and opens or returns Creator access. The human
-then selects exactly one synced Revision and confirms Share for 1, 7, or 30
-days in the Creator workspace. Seven days is the default. Confirmed Share
-immediately returns Copy link and Open link actions. Permanent Publication is
-not available.
+In the dashboard, choose the version, choose **No expiry** or a duration, click
+**Publish**, and confirm. Use **Copy link** or **Open** on the resulting share.
+Anyone holding that link can view the selected version and access its uploaded
+files. A collaborator does not need your owner login.
 
-Only the selected Revision and its selected files are public. Sharing a newer
-Revision through an active Publication preserves its Public URL and expiry.
-Expired, revoked, or explicitly rotated shares receive a new Public URL.
-Extension and unpublish remain explicit actions. Non-secret Publication records
-remain server-side. Creator exposes the full history, while inventory reports
-the current or latest state. Private synced files remain until explicit cloud
-deletion.
+**Revise without changing the shared version**
 
-## Credentials and access
+> Update `mockups/checkout/` to add an order summary. Upload the same folder
+> again with the same title. Do not change the shared version.
 
-These capabilities are intentionally separate:
+Keep the same project, source path, title, and project-name override throughout
+the workflow. A new snapshot creates another cloud version. Uploading an identical
+snapshot again, including its metadata, reuses its original cloud version instead
+of creating a duplicate. Moving the source to a different path identifies a
+different artifact.
 
-| Capability       | Purpose                                                                     | Lifetime and boundary                                                                                                                                                                  |
-| ---------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Owner credential | Sync and Creator-link rotation for one cloud Artifact                       | Persistent in protected local plugin state. Replaced on recovery or rotation, never put in a URL or repository.                                                                        |
-| Creator link     | View and manage one private synced Artifact, including Publication actions  | One active bearer link, fixed 30-day expiry. It cannot delete cloud data or open inventory.                                                                                            |
-| Publication      | Server-side record granting public access to one selected synced Revision   | 1, 7, or 30 days. One active Publication per Artifact; its selected Revision may update without changing its URL or expiry. Records remain server-side.                                |
-| Public link      | Bearer URL for its active Publication                                       | Expires with the Publication and exposes only its currently selected Revision. Its token is separate from the Publication record.                                                      |
-| Cloud inventory  | List and administer synced cloud Artifacts, including deletion and recovery | Access-protected administrative surface. Access session policy is separate from capability expiry; synced data remains until explicit deletion. It does not list local-only Artifacts. |
+After reviewing the new version, click **Update shared version** and confirm to
+update the active link. A card labeled **Latest v2 / Shared v1** means the latest
+upload is not yet the one collaborators see.
 
-The inventory is protected by Cloudflare Access and its configured approved
-identity. Creator and Public routes use their own scoped capabilities and are
-not Access login routes. The active Public token is stored server-side as a
-one-way lookup hash plus recoverable encrypted ciphertext under a versioned
-Worker-managed key. A Creator-authorized sharing response and the
-Access-protected inventory can reconstruct an active Public URL. Public-token
-plaintext appears only in those authorized active-link results. Encryption keys
-never leave Worker secret storage. Neither value appears in manifests, logs, or
-analytics. Trusted plugin flows separately receive the scoped Owner or Creator
-credential they are designed to persist.
-Revocation clears recoverable Public-token ciphertext immediately; expiry
-clears it when an inventory, Creator, or Public request observes the expired
-record.
+**Stop sharing or remove an artifact**
 
-The first Sync may require `PANES_CREATE_API_KEY`. This is only an admission
-key for creating a new cloud Artifact, not a general artifact credential. The
-plugin sends it only on first Sync and does not store it in local artifact
-state.
+- **Unpublish** disables the current link and keeps all cloud versions private.
+- Publishing again after unpublish creates a new link; the old one stays invalid.
+- **Delete artifact** removes the cloud artifact and all its uploaded versions,
+  with a separate confirmation. It does not delete your local files.
+- Neither action can erase copies someone has already downloaded or content
+  already loaded in their browser. Test revocation by making a fresh request.
 
-## Cloud boundaries and limits
+For a step-by-step trial with copy-ready prompts and expected results, use the
+[manual test guide](docs/manual-testing.md).
 
-The canonical local manifest can contain more than the cloud copy. Before
-Sync, Panes applies `.panesignore` from the Artifact root using ordered
-Gitignore-style rules, including negation. Mandatory exclusions cannot be
-re-included. These include `.panesignore`, `artifact.json`, Draft files and
-directories, Git internals, dependency directories, build caches, environment
-files, and common key or certificate files. Excluded files do not count toward
-remote limits, and neither `.panesignore` nor the canonical manifest is
-uploaded.
+## Supported content
 
-Panes derives a separate non-secret cloud manifest containing only synchronized
-Revisions, approved origins, Preview entries, and the exact selected files.
-Ignored filenames, paths, hashes, and sizes never appear in that manifest. The
-cloud manifest itself cannot be ignored. Exact selected file bytes are stored
-in private R2 and are served only through Worker authorization; the R2 bucket
-is never public.
+- HTML and SVG files.
+- Browser-ready folders containing HTML, CSS, JavaScript, images, fonts, and assets.
+- Locally built output from React or other frontend frameworks.
 
-Initial remote limits are 25 MiB per uploaded file and 100 MiB per uploaded
-Revision, measured from raw bytes after ignore evaluation. These limits do not
-limit local Drafts or local Revision history. The historical Legacy source
-compatibility path retains its separate 1 MiB UTF-8 source limit.
+Framework source must be built locally before upload. Panes does not compile
+React source, render Markdown or Mermaid source, install packages, execute code
+on the server, or host application backends. HTTPS resources are allowed in
+previews; ordinary browser CORS and sandbox restrictions still apply. Use
+relative asset URLs so files resolve within the uploaded version.
 
-HTTPS stylesheets, fonts, images, media, scripts, and API calls work by default
-without origin approval. The advanced compatibility path accepts exact
-normalized plain-HTTP origins and requires the existing approval handshake.
-Approved origins are immutable on that Revision. Panes derives the relevant CSP
-rules from this policy. `ws:`, `wss:`, and all other schemes are unsupported,
-even when the corresponding HTTP origin is approved. WebSockets are not
-available.
+An upload supports up to 500 files, 25 MiB per file and 100 MiB total. Panes
+preserves raw bytes and excludes environment files, common private-key files,
+Git internals, dependencies, and caches. Exclusions are not a secret scanner:
+**only select content you intend to upload, and never embed secrets in a
+browser artifact.** Anyone with a share link can access that version's uploaded
+files, not only its rendered preview.
+Panes does not apply `.panesignore` or `.gitignore` rules. Select a dedicated
+artifact or build-output folder rather than relying on an ignore file to protect
+unrelated project content.
 
-Cloud deletion is an explicit, exact-confirmation action in the Access-protected
-inventory. It revokes Creator and Public access, removes cloud metadata and
-private R2 objects in resumable batches, and never changes local files. A
-temporary interrupted upload can be cleaned up after its grace period without
-touching committed objects.
-
-If protected Owner state is lost, the inventory can issue a short-lived,
-single-use reconnect code after explicit confirmation. Codes are hashed at
-rest, expire after 10 minutes, and a newer code revokes an older unused code.
-`artifact_reconnect` validates the canonical local manifest before redeeming
-the code, replaces only the Owner credential, and leaves Creator and Public
-access unchanged. The replacement is written to protected local state.
-
-## Installation
-
-The installed private plugin is sufficient. No Panes skill, slash command,
-package publication, backend hosting, or automatic Git operation is required.
-Panes does not stage, commit, branch, revert, or rewrite Git state.
+## Install the OpenCode plugin
 
 Requires Node.js 22.12 or newer and npm 11.
 
 ```sh
 npm install
-npm run build:plugin
 npm run install:plugin
 ```
 
-The installer writes `opencode-panes.js` and its `react-compiler.wasm` runtime
-asset to the OpenCode plugin directory (or the directory selected by
-`XDG_CONFIG_HOME`). OpenCode discovers the plugin automatically. A project-local plugin can instead be loaded from
-`.opencode/plugins/`. Restart OpenCode after installation. The optional
-`packages/opencode-plugin/commands/artifact.md` template is not required and
-does not install or configure the plugin.
+The installer builds one standalone `opencode-panes.js` file and installs it
+under your OpenCode plugin directory. It does not change OpenCode configuration
+or install a skill. Set these environment variables when starting OpenCode:
 
-The hosted test service is `https://opencode-panes.simons.workers.dev`; users
-do not need to host a backend. The plugin accepts an API origin override for
-local development, and non-loopback HTTP origins are rejected.
+| Variable                    | Value                                                |
+| --------------------------- | ---------------------------------------------------- |
+| `OPENCODE_PANES_API_URL`    | Your Panes deployment's HTTPS origin                 |
+| `OPENCODE_PANES_UPLOAD_KEY` | The secret matching your Worker's `PANES_UPLOAD_KEY` |
 
-## Legacy migration
+Keep the upload key in your shell's secret management, not a repository or a URL.
+Quit and restart OpenCode after installing the plugin or changing its environment.
+This repository does not provide a shared hosted account or default to someone
+else's deployment.
 
-Existing source-string cloud Artifacts remain readable but read-only during a
-bounded migration window. A stable migration timestamp gives Legacy private
-access 30 days and Legacy public links 7 days. Rerunning migration does not
-extend either deadline. Legacy Artifacts appear separately in Cloud inventory.
+The plugin exposes two tools:
 
-From the authenticated inventory, export the current Legacy Revision and issue
-an adoption code. `artifact_adopt_legacy` writes unchanged source bytes into a
-new project-local finalized `v1` with the appropriate Preview adapter. The code
-is short-lived, bound to one local destination, and safe to retry only for that
-same binding. Adoption stores no Owner credential. The original Legacy
-Artifact and history remain separate and read-only until explicitly deleted.
+- `artifact_upload`: upload a selected local file or browser-ready folder privately.
+- `artifact_dashboard`: return the authenticated library URL; it does not open
+  a browser itself.
 
-The first explicit Sync after adoption creates a new cloud identity and records
-the Legacy provenance. The retired source-string create, revise, and publish
-mutations return `410 LOCAL_FIRST_REQUIRED`; new work must use the local-first
-workflow.
+For example, ask: "Upload `mockups/checkout/` to Panes with `index.html` as the
+entry, titled Checkout prototype." Use the same source path for later uploads
+of the same artifact. There is no plugin tool that publishes content.
 
-## Verification
+## Host your own library
+
+Panes uses a Worker for its UI and HTTP interface, D1 for project/version/share
+metadata, and one private R2 bucket for artifact files. All file delivery goes
+through Worker authorization. Do not make the bucket public.
+
+1. Create your own Cloudflare Worker, D1 database, and private R2 bucket. Configure
+   their names and database ID in `apps/web/wrangler.jsonc` for your deployment.
+2. Configure a Cloudflare Access self-hosted application covering `/inventory`,
+   `/inventory/*`, `/api/library`, and `/api/library/*` on your deployment hostname.
+   Allow only your email address. Configure `PANES_ACCESS_ALLOWED_EMAIL`,
+   `PANES_ACCESS_ISSUER`, and `PANES_ACCESS_AUDIENCE` to match that application.
+3. Do not put the entire Worker behind Access: `/s/*`, `/api/shares/*`,
+   `/api/previews/*`, and `/api/uploads*` use their own narrowly scoped authorization.
+   The Worker independently verifies owner Access JWTs before returning private data.
+4. Set a strong random `PANES_UPLOAD_KEY` Worker secret and use the same value in
+   the plugin. The machine key permits uploads, not dashboard access or sharing.
+5. Apply the D1 migrations to your database, build, and deploy the Worker.
+
+From `apps/web`, the relevant administrative commands are:
 
 ```sh
+npx wrangler secret put PANES_UPLOAD_KEY
+npx wrangler d1 migrations apply opencode-panes --remote
+```
+
+From the repository root:
+
+```sh
+npm run build
+npm run deploy:dry-run:built
+npm run deploy:built
+```
+
+The secret command updates the live Worker secret and deploys a Worker version;
+the remote migration changes D1, and the deploy command uploads the application.
+A build or dry-run does not deploy. Review your
+resource configuration first; replace `opencode-panes` with your database name
+when appropriate.
+
+Cloudflare references: [private R2 through Workers](https://developers.cloudflare.com/r2/get-started/workers-api/)
+and [path-specific Access protection](https://developers.cloudflare.com/workers/configuration/cloudflare-access/#protect-a-specific-hostname-custom-domain-or-path).
+
+## Security model
+
+Owner login, machine uploads, private previews, and public sharing are separate.
+Artifact code never receives an owner or upload credential. Private preview
+URLs are short-lived and read-only for one version. Public file requests are
+bound to the selected shared version and check expiry and revocation.
+
+Executable content runs inside sandboxed browser frames without same-origin
+privileges. File responses also carry sandbox and content-security-policy
+headers, so opening a file directly does not bypass the sandbox. HTTPS network
+access is allowed, so this is isolation from the dashboard, not an offline
+execution environment. Browser sandboxing cannot prevent every malicious page
+or resource-exhaustion loop.
+
+## Development and verification
+
+The checked-in example at `examples/fieldnotes/` exercises a browser entry,
+relative stylesheet, module JavaScript, and SVG. A local-only end-to-end check,
+`npm run test:acceptance`, runs the built plugin against a local Worker and
+leaves one uploaded example available for browser inspection. It requires
+`OPENCODE_PANES_API_URL` (a literal loopback HTTP origin) and
+`OPENCODE_PANES_UPLOAD_KEY` matching that local Worker's test key.
+
+For local owner access, explicitly set the Worker variable `PANES_DEV_MODE` to
+`"true"` through Wrangler's local `--var` override and bind the server to
+`127.0.0.1`. The bypass only applies to loopback hostnames; upload authentication
+is still required. Production configuration keeps it `"false"`. Use a disposable
+local database with the same `--persist-to` path for local migration and dev
+commands. Never point acceptance tests at a hosted deployment.
+
+```sh
+npm run format
 npm run typecheck
 npm test
 npm run build
 npm run smoke:plugin
+npm run deploy:dry-run:built
 ```
 
-See `CONTEXT.md` for the domain vocabulary, `PROJECT_PLAN.md` for the accepted
-scope, and `packages/opencode-plugin/README.md` for plugin details.
+Tests cover the upload and share interface, immutable file bytes, owner and
+machine authorization, read-only preview isolation, expiry/revocation, plugin
+permissions, and dashboard interactions. The plugin smoke check loads the
+standalone bundle outside the repository without installing it globally.
+
+Regenerate binding types after changing Worker configuration with
+`npx wrangler types --strict-vars=false` from `apps/web`.
+
+This version intentionally replaces the v0.1/v0.2 workflows. Old Creator links,
+local manifests, recovery/adoption tools, and source-string APIs are not supported.
+Historical migrations remain in Git; old cloud data is not automatically exposed
+by the new library. Existing remote data is not erased by merely building this
+version.
+
+## Before and now
+
+The goal has not changed: create artifacts in OpenCode and share them through
+Cloudflare. What changed is how much Panes asks you to manage.
+
+| Area                        | Before: v0.2                                          | Now                                                            |
+| --------------------------- | ----------------------------------------------------- | -------------------------------------------------------------- |
+| Local work                  | Managed Drafts and immutable local `vN` folders       | Ordinary editable files in your project                        |
+| Getting work into the cloud | Finalize, then Sync all unsynced local history        | Upload the selected file or folder as one snapshot             |
+| Version history             | A local ledger synchronized to the cloud              | Cloud versions created by uploads; Git remains separate        |
+| Private management          | Inventory plus expiring Creator links                 | One owner dashboard with stable navigation links               |
+| Organization                | Administrative cards with lifecycle metadata          | Light visual library with projects, search, and sharing status |
+| Sharing                     | Creator/Publication terminology and mandatory expiry  | Publish, Copy link, Update shared version, and optional expiry |
+| Source formats              | Built-in React, Markdown, Mermaid, and code renderers | HTML, SVG, and locally built browser-ready output              |
+| Recovery and migration      | Per-artifact reconnect and legacy adoption            | No per-artifact recovery or compatibility workflow             |
+
+v0.1 was simpler than v0.2, but it uploaded a single source string immediately.
+The new version is not a rollback: it keeps multi-file support and explicit
+private uploads while removing the managed local lifecycle.
+
+Security was not removed. Owner authentication, private storage, isolated
+previews, safe paths, secret-file exclusions, checksums, and explicit sharing
+remain. Cloudflare still supplies the Worker, D1, and private R2 storage.
+
+See `CONTEXT.md` for the small product vocabulary, `PROJECT_PLAN.md` for accepted
+scope, and `docs/simple-library-interface.md` for the HTTP interface. MIT licensed.
+See [v0.3 release notes](docs/releases/v0.3.md) for the breaking changes.
+The implementation and browser checks are recorded in
+`docs/simple-library-verification.md`.

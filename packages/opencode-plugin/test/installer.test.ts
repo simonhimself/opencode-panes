@@ -1,189 +1,102 @@
 import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-
-const execFileAsync = promisify(execFile);
+const exec = promisify(execFile);
 const packageDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryDirectory = resolve(packageDirectory, "../..");
-const buildPath = join(packageDirectory, "build.mjs");
 const installerPath = join(repositoryDirectory, "scripts/install-plugin.mjs");
-const builtPluginPath = join(packageDirectory, "dist/global.js");
-const repositoryPath = `${repositoryDirectory}/`;
-
 let temporaryDirectory: string;
 
 beforeAll(async () => {
-  await execFileAsync(process.execPath, [buildPath], {
+  await exec(process.execPath, [join(packageDirectory, "build.mjs")], {
     cwd: packageDirectory,
   });
-  temporaryDirectory = await mkdtemp(join(tmpdir(), "opencode-panes-install-"));
-});
+  temporaryDirectory = await mkdtemp(join(tmpdir(), "panes-installer-"));
+}, 30_000);
 
 afterAll(async () => {
-  await rm(temporaryDirectory, { recursive: true, force: true });
+  if (temporaryDirectory)
+    await rm(temporaryDirectory, { recursive: true, force: true });
 });
 
-describe("global plugin installer", () => {
-  it("installs under XDG_CONFIG_HOME without changing unrelated files", async () => {
-    const xdgConfigHome = join(temporaryDirectory, "xdg");
-    const unrelatedPath = join(xdgConfigHome, "opencode", "settings.json");
-    await mkdirForFile(unrelatedPath, '{"keep":true}\n');
-
-    await runInstaller({
-      XDG_CONFIG_HOME: xdgConfigHome,
-      HOME: join(temporaryDirectory, "home"),
-    });
-
-    const installedPath = join(
-      xdgConfigHome,
-      "opencode/plugins/opencode-panes.js",
+describe("standalone installer", () => {
+  it("installs only JavaScript, atomically replaces it, and preserves unrelated configuration", async () => {
+    const configHome = join(temporaryDirectory, "xdg");
+    const config = join(configHome, "opencode/settings.json");
+    await mkdir(dirname(config), { recursive: true });
+    await writeFile(config, '{"keep":true}\n');
+    const environment = { XDG_CONFIG_HOME: configHome };
+    await install(environment);
+    const plugins = join(configHome, "opencode/plugins");
+    const path = join(plugins, "opencode-panes.js");
+    expect(await readdir(plugins)).toEqual(["opencode-panes.js"]);
+    const source = await readFile(path, "utf8");
+    expect(source).toBe(
+      await readFile(join(packageDirectory, "dist/global.js"), "utf8"),
     );
-    expect(await readFile(installedPath, "utf8")).toContain(
-      "opencode-panes.simons.workers.dev",
-    );
-    expect(await readFile(unrelatedPath, "utf8")).toBe('{"keep":true}\n');
-    expect((await stat(installedPath)).isFile()).toBe(true);
-    expect(
-      (
-        await stat(join(xdgConfigHome, "opencode/plugins/react-compiler.wasm"))
-      ).isFile(),
-    ).toBe(true);
+    expect(source).not.toContain("simons.workers.dev");
+    expect(source).not.toContain("react-compiler.wasm");
+    expect(source).not.toContain(repositoryDirectory);
+    expect((await stat(path)).mode & 0o777).toBe(0o644);
+    await writeFile(path, "old plugin");
+    await install(environment);
+    expect(await readFile(path, "utf8")).toBe(source);
+    expect(await readdir(plugins)).toEqual(["opencode-panes.js"]);
+    expect(await readFile(config, "utf8")).toBe('{"keep":true}\n');
   });
 
-  it("supports an explicit plugin directory override", async () => {
-    const pluginDirectory = join(temporaryDirectory, "custom-plugins");
-    await runInstaller({ OPENCODE_PANES_PLUGIN_DIR: pluginDirectory });
-
-    expect(
-      await stat(join(pluginDirectory, "opencode-panes.js")),
-    ).toMatchObject({ isFile: expect.any(Function) });
+  it.each([
+    "OPENCODE_PANES_PLUGIN_DIR",
+    "OPENCODE_PANES_CONFIG_DIR",
+    "OPENCODE_CONFIG_DIR",
+  ])("supports %s without touching real global paths", async (variable) => {
+    const target = join(temporaryDirectory, variable);
+    await install({ [variable]: target });
+    const plugins =
+      variable === "OPENCODE_PANES_PLUGIN_DIR"
+        ? target
+        : join(target, "plugins");
+    expect(await readdir(plugins)).toEqual(["opencode-panes.js"]);
   });
 
-  it("produces an isolated bundled module with no repository or package imports", async () => {
-    const source = await readFile(builtPluginPath, "utf8");
-    expect(source).not.toContain(repositoryPath);
-    expect(source).not.toMatch(
-      /(?:from|import\s*\()["'](?!node:)[^./][^"']*["']/,
-    );
-    expect(source).not.toContain("sourceMappingURL");
-
-    const isolatedPath = join(temporaryDirectory, "isolated/opencode-panes.js");
-    await mkdirForFile(isolatedPath, source);
-    const inheritedEnvironment = removeEnvironmentVariables([
-      "OPENCODE_PANES_CONFIG_DIR",
-      "OPENCODE_PANES_CREATE_API_KEY",
-      "OPENCODE_PANES_CREATE_API_KEY_FILE",
+  it("builds one JS bundle and passes the isolated no-dependency upload smoke test", async () => {
+    expect((await readdir(join(packageDirectory, "dist"))).sort()).toEqual([
+      "global.js",
+      "index.d.ts",
     ]);
-    vi.stubEnv(
-      "OPENCODE_PANES_CONFIG_DIR",
-      join(temporaryDirectory, "isolated-config"),
+    const result = await exec(
+      process.execPath,
+      [join(repositoryDirectory, "scripts/smoke-plugin.mjs")],
+      { cwd: repositoryDirectory },
     );
-
-    const { module, hooks } = await (async () => {
-      try {
-        const module = await import(
-          `${pathToFileURL(isolatedPath).href}?isolated`
-        );
-        return { module, hooks: await module.default({}) };
-      } finally {
-        vi.unstubAllEnvs();
-        restoreEnvironmentVariables(inheritedEnvironment);
-      }
-    })();
-
-    expect(typeof module.default).toBe("function");
-    expect(typeof hooks.tool?.artifact_prepare?.execute).toBe("function");
-    expect(typeof hooks.tool?.artifact_finalize?.execute).toBe("function");
-    expect(typeof hooks.tool?.artifact_sync?.execute).toBe("function");
-    expect(typeof hooks.tool?.artifact_adopt_legacy?.execute).toBe("function");
-  }, 15_000);
-
-  it("uses the global production defaults for local-first preparation", async () => {
-    const configDirectory = join(temporaryDirectory, "runtime-config");
-    const inheritedEnvironment = removeEnvironmentVariables([
-      "OPENCODE_PANES_API_BASE_URL",
-      "XDG_STATE_HOME",
-    ]);
-    const installedPath = join(configDirectory, "plugins/opencode-panes.js");
-    await runInstaller({ OPENCODE_PANES_CONFIG_DIR: configDirectory });
-
-    const fetchMock = vi.fn<typeof fetch>();
-    vi.stubEnv("OPENCODE_PANES_CONFIG_DIR", configDirectory);
-    vi.stubEnv("XDG_STATE_HOME", join(temporaryDirectory, "runtime-state"));
-    vi.stubGlobal("fetch", fetchMock);
-
-    try {
-      const module = await import(
-        `${pathToFileURL(installedPath).href}?runtime`
-      );
-      const hooks = await module.default({});
-      const result = await hooks.tool?.artifact_prepare?.execute(
-        { title: "Example", requestedOrigins: [] },
-        {
-          sessionID: "session-1",
-          messageID: "message-1",
-          agent: "build",
-          directory: configDirectory,
-          worktree: configDirectory,
-          abort: new AbortController().signal,
-          metadata: () => undefined,
-          ask: vi.fn().mockResolvedValue(undefined),
-        },
-      );
-      expect(result).toBeDefined();
-    } finally {
-      vi.unstubAllEnvs();
-      vi.unstubAllGlobals();
-      restoreEnvironmentVariables(inheritedEnvironment);
-    }
-
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.stdout).toContain("Standalone plugin smoke passed");
   }, 15_000);
 });
 
-async function runInstaller(environment: Record<string, string>) {
-  await execFileAsync(process.execPath, [installerPath], {
+async function install(environment: Record<string, string>) {
+  await exec(process.execPath, [installerPath], {
     cwd: temporaryDirectory,
     env: {
       ...process.env,
+      HOME: join(temporaryDirectory, "home"),
+      XDG_CONFIG_HOME: join(temporaryDirectory, "default-config"),
+      OPENCODE_PANES_PLUGIN_DIR: undefined,
       OPENCODE_PANES_CONFIG_DIR: undefined,
       OPENCODE_CONFIG_DIR: undefined,
       ...environment,
     },
   });
-}
-
-async function mkdirForFile(path: string, contents: string) {
-  await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, contents, "utf8");
-}
-
-function removeEnvironmentVariables(names: string[]) {
-  const inherited: Record<string, string | undefined> = {};
-  for (const name of names) {
-    inherited[name] = process.env[name];
-    delete process.env[name];
-  }
-  return inherited;
-}
-
-function restoreEnvironmentVariables(
-  inherited: Record<string, string | undefined>,
-) {
-  for (const [name, value] of Object.entries(inherited)) {
-    if (value === undefined) delete process.env[name];
-    else process.env[name] = value;
-  }
 }

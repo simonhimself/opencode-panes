@@ -1,6 +1,10 @@
 # Local-First Artifacts
 
-Status: ready-for-agent
+Status: superseded
+
+Historical specification. Superseded by `PROJECT_PLAN.md` and
+`docs/simple-library-interface.md` on September 5, 2026. Do not implement the
+managed local lifecycle or legacy migration tickets below for the current product.
 
 ## Problem Statement
 

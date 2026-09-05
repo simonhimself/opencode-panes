@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fieldnotes prototype</title>
+    <link rel="stylesheet" href="assets/style.css" />
+    <script type="module" src="assets/app.js"></script>
+  </head>
+  <body>
+    <header>
+      <img src="assets/mark.svg" alt="" width="32" height="32" /><strong
+        >Fieldnotes</strong
+      ><span>A little room for ideas.</span>
+    </header>
+    <main>
+      <p class="eyebrow">YOUR NEXT CHAPTER</p>
+      <h1>Good things<br />start with a note.</h1>
+      <p class="intro">
+        Collect the small observations that become your next big idea.
+      </p>
+      <button id="add-note" type="button">
+        Add a note <span aria-hidden="true">+</span>
+      </button>
+      <section aria-label="Your notes" id="notes">
+        <article>
+          <span>DESIGN</span>
+          <h2>Make space for the unexpected.</h2>
+          <p>A quieter interface. A clearer point of view.</p>
+        </article>
+        <article>
+          <span>OUTSIDE</span>
+          <h2>Take the long way home.</h2>
+          <p>There is usually something worth noticing.</p>
+        </article>
+        <article>
+          <span>WORK IN PROGRESS</span>
+          <h2>Small steps count.</h2>
+          <p>One useful thing, made a little better.</p>
+        </article>
+      </section>
+      <p id="status" role="status"></p>
+    </main>
+  </body>
+</html>
