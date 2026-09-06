@@ -176,7 +176,7 @@ function Preview({
         key={version.previewUrl}
         src={version.previewUrl}
         title={`${title}, version ${version.number} preview`}
-        sandbox="allow-scripts"
+        sandbox="allow-scripts allow-forms"
         referrerPolicy="no-referrer"
         loading={thumbnail ? "lazy" : "eager"}
         tabIndex={thumbnail ? -1 : 0}

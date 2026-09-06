@@ -32,6 +32,11 @@ service or a local version-control system.
 - Browser-ready output only; no built-in React compiler or document renderers.
 - Private R2 objects, D1 metadata, and Worker-mediated authorization.
 - Read-only isolated previews with HTTPS dependencies; no HTTP approval handshake.
+- Client-side form handlers and browser validation work; native form submissions
+  from Panes-served artifact documents remain blocked by CSP `form-action 'none'`.
+  Third-party documents embedded or navigated to use their own CSP, while the iframe
+  sandbox still denies parent-origin privileges. HTTPS network access (including
+  fetch), HTTPS embedding, and guest-frame navigation retain existing behavior.
 - Bounded, checksum-verified uploads, safe paths, and mandatory secret exclusions.
 - Safe interrupted-upload retry and an atomic visibility point for completed versions.
 

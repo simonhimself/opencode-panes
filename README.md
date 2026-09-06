@@ -215,10 +215,16 @@ bound to the selected shared version and check expiry and revocation.
 
 Executable content runs inside sandboxed browser frames without same-origin
 privileges. File responses also carry sandbox and content-security-policy
-headers, so opening a file directly does not bypass the sandbox. HTTPS network
-access is allowed, so this is isolation from the dashboard, not an offline
-execution environment. Browser sandboxing cannot prevent every malicious page
-or resource-exhaustion loop.
+headers, so opening a file directly does not bypass the sandbox. Client-side form
+submit handlers and browser validation work in previews. CSP `form-action 'none'`
+blocks native form submissions **from Panes-served artifact documents**. It does
+not govern unrelated third-party documents embedded in a preview or loaded by
+navigating the guest frame: those documents use their own CSP, while the iframe
+sandbox still denies parent-origin privileges. HTTPS network access (including
+programmatic fetch), HTTPS embedding, and guest-frame navigation remain available
+subject to existing browser restrictions. This is isolation from the dashboard,
+not total network blocking or an offline execution environment. Browser sandboxing
+cannot prevent every malicious page or resource-exhaustion loop.
 
 ## Development and verification
 
@@ -249,6 +255,25 @@ Tests cover the upload and share interface, immutable file bytes, owner and
 machine authorization, read-only preview isolation, expiry/revocation, plugin
 permissions, and dashboard interactions. The plugin smoke check loads the
 standalone bundle outside the repository without installing it globally.
+
+For a focused real-Chromium form regression, use an existing Playwright installation
+and installed Google Chrome (no project dependency or hosted content is needed):
+
+```sh
+PLAYWRIGHT_MODULE=/absolute/path/to/playwright/index.mjs npm exec --yes --package=node@22 -- node --experimental-transform-types scripts/verify-sandbox-forms.mjs
+```
+
+This local fixture uses the production file headers and iframe permissions.
+It checks required-field validation, click/Enter/`requestSubmit()` handlers, and
+blocked native GET/POST submissions from Panes-served documents, including
+`HTMLFormElement.prototype.submit.call(form)` bypassing submit handlers. It also
+checks parent DOM isolation, direct file viewing, and negative controls missing
+`allow-forms` at either sandbox layer. A controlled HTTPS child, fulfilled entirely
+by Playwright without external network traffic, demonstrates that sandbox origin
+isolation is inherited but the parent's `form-action` is not. Worker and UI tests
+separately cover the actual private, public, and thumbnail entry paths. The behavior follows the HTML
+[form submission algorithm](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm)
+and CSP [form-action pre-navigation check](https://www.w3.org/TR/CSP3/#directive-form-action).
 
 Regenerate binding types after changing Worker configuration with
 `npx wrangler types --strict-vars=false` from `apps/web`.
@@ -286,5 +311,6 @@ remain. Cloudflare still supplies the Worker, D1, and private R2 storage.
 See `CONTEXT.md` for the small product vocabulary, `PROJECT_PLAN.md` for accepted
 scope, and `docs/simple-library-interface.md` for the HTTP interface. MIT licensed.
 See [v0.3 release notes](docs/releases/v0.3.md) for the breaking changes.
+The [v0.3.1 patch](docs/releases/v0.3.1.md) fixes client-side form handling.
 The implementation and browser checks are recorded in
 `docs/simple-library-verification.md`.

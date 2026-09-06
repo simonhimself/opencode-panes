@@ -54,11 +54,12 @@ describe("read-only previews and publication", () => {
       expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
       expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
       const csp = response.headers.get("Content-Security-Policy")!;
-      expect(csp).toContain("sandbox allow-scripts;");
+      expect(csp.split(";")[0]).toBe("sandbox allow-scripts allow-forms");
       expect(csp).not.toContain("allow-same-origin");
       expect(csp).not.toContain("allow-top-navigation");
       expect(csp).toContain("https:");
       expect(csp).toContain("base-uri 'none'");
+      expect(csp.split("; ")).toContain("form-action 'none'");
     }
     expect(
       (await api(new URL("../assets/main.js", url).href)).headers.get(
@@ -137,11 +138,14 @@ describe("read-only previews and publication", () => {
       `/versions/${one.session.uploadId}/files/`,
     );
     expect(selected.version.previewUrl).not.toContain("/previews/");
-    expect(
-      new Uint8Array(
-        await (await api(selected.version.previewUrl)).arrayBuffer(),
-      ),
-    ).toEqual(new TextEncoder().encode(SOURCES["pages/index.html"]));
+    const preview = await api(selected.version.previewUrl);
+    const csp = preview.headers.get("Content-Security-Policy")!;
+    expect(csp.split(";")[0]).toBe("sandbox allow-scripts allow-forms");
+    expect(csp.split("; ")).toContain("form-action 'none'");
+    expect(csp).not.toContain("allow-same-origin");
+    expect(new Uint8Array(await preview.arrayBuffer())).toEqual(
+      new TextEncoder().encode(SOURCES["pages/index.html"]),
+    );
     const two = await uploaded(manifest({ title: "New" }));
     expect(
       (await (await api(one.publicPath)).json<PublicArtifact>()).version.id,

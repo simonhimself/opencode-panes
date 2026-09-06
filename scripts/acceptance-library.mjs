@@ -130,8 +130,15 @@ try {
     ?.split(/\s+/);
   assert.deepEqual(
     sandbox,
-    ["sandbox", "allow-scripts"],
+    ["sandbox", "allow-scripts", "allow-forms"],
     "Preview must not grant same-origin privileges",
+  );
+  assert.ok(
+    preview.headers
+      .get("Content-Security-Policy")
+      .split("; ")
+      .includes("form-action 'none'"),
+    "Native form submissions from Panes-served artifact documents must remain blocked",
   );
   assert.equal(preview.headers.get("Referrer-Policy"), "no-referrer");
   const moduleResponse = await exactFile(

@@ -174,6 +174,8 @@ export function fileHeaders(path: string, root: string): Headers {
     // Opaque sandbox origins need anonymous CORS for local modules/fonts/fetch.
     // This header is only set on capability-scoped files, never owner APIs.
     "Access-Control-Allow-Origin": "*",
-    "Content-Security-Policy": `sandbox allow-scripts; default-src https: ${root} data: blob:; script-src https: ${root} 'unsafe-inline' 'unsafe-eval' blob:; style-src https: ${root} 'unsafe-inline'; connect-src https: ${root}; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'`,
+    // allow-forms enables validation/submit handlers; form-action blocks native submissions
+    // from this Panes-served document, not third-party documents with their own CSP.
+    "Content-Security-Policy": `sandbox allow-scripts allow-forms; default-src https: ${root} data: blob:; script-src https: ${root} 'unsafe-inline' 'unsafe-eval' blob:; style-src https: ${root} 'unsafe-inline'; connect-src https: ${root}; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'`,
   });
 }

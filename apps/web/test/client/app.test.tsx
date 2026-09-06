@@ -215,7 +215,7 @@ describe("artifact library", () => {
     const frames = [...container.querySelectorAll("iframe")];
     expect(frames).toHaveLength(3);
     for (const frame of frames) {
-      expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+      expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-forms");
       expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
       expect(frame.getAttribute("loading")).toBe("lazy");
       expect(frame.tabIndex).toBe(-1);
@@ -374,7 +374,7 @@ describe("artifact detail and sharing", () => {
     ]);
     expect(select.value).toBe("version-2");
     const frame = container.querySelector("iframe")!;
-    expect(frame.getAttribute("sandbox")).toBe("allow-scripts");
+    expect(frame.getAttribute("sandbox")).toBe("allow-scripts allow-forms");
     expect(frame.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(frame.getAttribute("src")).toBe(version(2).previewUrl);
     expect(frame.getAttribute("srcdoc")).toBeNull();
@@ -632,7 +632,7 @@ describe("public viewer", () => {
     );
     expect(container.textContent).toContain("Read-only");
     expect(container.querySelector("iframe")?.getAttribute("sandbox")).toBe(
-      "allow-scripts",
+      "allow-scripts allow-forms",
     );
     expect(container.querySelector("iframe")?.getAttribute("src")).toBe(
       version(2).previewUrl,
