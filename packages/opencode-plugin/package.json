@@ -1,6 +1,6 @@
 {
   "name": "@opencode-panes/plugin",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Upload ordinary browser-ready files to a private Panes artifact library",
   "private": true,
   "license": "MIT",
@@ -37,7 +37,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@opencode-panes/contracts": "0.3.1",
+    "@opencode-panes/contracts": "0.4.0",
     "@opencode/plugin": "^2.0.18",
     "@types/node": "^24.3.0",
     "esbuild": "^0.25.9",

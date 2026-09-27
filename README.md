@@ -185,7 +185,8 @@ regression are described in [development and verification](docs/DEVELOPMENT.md).
 - [Manual test guide](docs/manual-testing.md): copy-ready prompts and expected results.
 - [HTTP interface](docs/simple-library-interface.md) and [storage cleanup](docs/storage-cleanup.md).
 - [Upgrading from v0.1/v0.2](docs/upgrading-from-v0.2.md): what changed and what is no longer supported.
-- Releases: [v0.3](docs/releases/v0.3.md) and [v0.3.1](docs/releases/v0.3.1.md).
+- Releases: [v0.3](docs/releases/v0.3.md), [v0.3.1](docs/releases/v0.3.1.md),
+  and [v0.4](docs/releases/v0.4.md).
 - [`CONTEXT.md`](CONTEXT.md) for product vocabulary and [`PROJECT_PLAN.md`](PROJECT_PLAN.md) for accepted scope.
 
 ## License
