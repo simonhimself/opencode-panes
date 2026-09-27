@@ -489,7 +489,7 @@ describe("cloud deletion", () => {
       ).status,
     ).toBe(204);
     release();
-    expect((await pending).status).toBe(404);
+    expect((await pending).status).toBe(410);
     expect(
       await env.DB.prepare(
         "SELECT COUNT(*) AS count FROM library_versions",

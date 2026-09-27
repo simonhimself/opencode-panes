@@ -39,6 +39,13 @@ service or a local version-control system.
   fetch), HTTPS embedding, and guest-frame navigation retain existing behavior.
 - Bounded, checksum-verified uploads, safe paths, and mandatory secret exclusions.
 - Safe interrupted-upload retry and an atomic visibility point for completed versions.
+- A fixed seven-day retry window from upload creation, not file activity. Expired
+  upload IDs return 410; repeating the same upload request starts a fresh session
+  on the same artifact. Only successful commits allocate version numbers.
+- Bounded abandoned-upload housekeeping on the existing hourly cron: at most 20
+  exact upload prefixes and one page of at most 100 R2 objects per prefix per run.
+  Persistent denial receipts rotate through retries and late-write orphan sweeps;
+  expired manifests are discarded. Committed private/shared versions never qualify.
 
 ## Explicit removals
 

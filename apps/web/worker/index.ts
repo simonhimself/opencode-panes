@@ -42,6 +42,8 @@ interface ShareRow {
   expires_at: string | null;
 }
 
+const UPLOAD_RETRY_MS = 7 * 86400000;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     let response: Response;
@@ -66,12 +68,16 @@ export default {
     return new Response(response.body, { status: response.status, headers });
   },
   async scheduled(_event: ScheduledController, env: Env): Promise<void> {
-    // Tombstones are retained to deny stale uploads and retry interrupted cleanup.
-    const deleted = await env.DB.prepare(
-      "SELECT id FROM library_artifacts WHERE deleted_at IS NOT NULL",
-    ).all<{ id: string }>();
-    for (const artifact of deleted.results)
-      await purgeObjects(env, artifact.id);
+    try {
+      await purgeAbandonedUploads(env);
+    } finally {
+      // Artifact deletion still runs if an abandoned-prefix cleanup fails.
+      const deleted = await env.DB.prepare(
+        "SELECT id FROM library_artifacts WHERE deleted_at IS NOT NULL",
+      ).all<{ id: string }>();
+      for (const artifact of deleted.results)
+        await purgeObjects(env, artifact.id);
+    }
   },
 } satisfies ExportedHandler<Env>;
 
@@ -218,15 +224,36 @@ function decodeFilePath(encoded: string): string {
   return path;
 }
 
+function expireUpload(env: Env, id: string): D1PreparedStatement {
+  // This claim and the guarded version INSERT serialize in D1. Never release
+  // deleted-artifact keys or expire a committed version, even during a race.
+  return env.DB.prepare(
+    `UPDATE library_uploads SET expired_at = ?, idempotency_key = 'expired:' || id, manifest = '{}'
+    WHERE id = ? AND expired_at IS NULL AND created_at <= ?
+    AND NOT EXISTS (SELECT 1 FROM library_versions WHERE id = library_uploads.id)
+    AND EXISTS (SELECT 1 FROM library_artifacts WHERE id = library_uploads.artifact_id AND deleted_at IS NULL)`,
+  ).bind(
+    new Date(Date.now()).toISOString(),
+    id,
+    new Date(Date.now() - UPLOAD_RETRY_MS).toISOString(),
+  );
+}
+
 async function getUpload(env: Env, id: string): Promise<UploadRow> {
-  const row = await env.DB.prepare(
-    `SELECT u.*, a.deleted_at FROM library_uploads u
-    JOIN library_artifacts a ON a.id = u.artifact_id WHERE u.id = ?`,
-  )
-    .bind(id)
-    .first<UploadRow>();
+  const [, selected] = await env.DB.batch<
+    UploadRow & { expired_at: string | null }
+  >([
+    expireUpload(env, id),
+    env.DB.prepare(
+      `SELECT u.*, a.deleted_at FROM library_uploads u
+      JOIN library_artifacts a ON a.id = u.artifact_id WHERE u.id = ?`,
+    ).bind(id),
+  ]);
+  const row = selected!.results[0];
   if (!row) throw new HttpError(404, "Not found");
   if (row.deleted_at) throw new HttpError(410, "Artifact deleted");
+  if (row.expired_at)
+    throw new HttpError(410, "Upload expired; start a new upload");
   return row;
 }
 
@@ -242,32 +269,42 @@ async function startUpload(request: Request, env: Env): Promise<Response> {
   );
   const serialized = JSON.stringify(manifest);
   const existing = await env.DB.prepare(
-    "SELECT id, manifest FROM library_uploads WHERE idempotency_key = ?",
+    "SELECT id FROM library_uploads WHERE idempotency_key = ?",
   )
     .bind(manifest.idempotencyKey)
-    .first<{ id: string; manifest: string }>();
-  if (!existing) {
-    await env.DB.batch([
-      env.DB.prepare(
-        "INSERT INTO library_projects (id, name) VALUES (?, ?) ON CONFLICT(id) DO NOTHING",
-      ).bind(manifest.project.id, manifest.project.name),
-      env.DB.prepare(
-        "INSERT INTO library_artifacts (id, project_id, artifact_key) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
-      ).bind(crypto.randomUUID(), manifest.project.id, manifest.artifactKey),
-      env.DB.prepare(
-        `INSERT INTO library_uploads (id, artifact_id, idempotency_key, manifest, created_at)
+    .first<{ id: string }>();
+  // Always attempt the insert: another request may have released this key
+  // since the lookup. The UNIQUE key still coalesces concurrent fresh starts.
+  await env.DB.batch([
+    ...(existing ? [expireUpload(env, existing.id)] : []),
+    env.DB.prepare(
+      `INSERT INTO library_projects (id, name) SELECT ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM library_uploads WHERE idempotency_key = ?)
+        ON CONFLICT(id) DO NOTHING`,
+    ).bind(manifest.project.id, manifest.project.name, manifest.idempotencyKey),
+    env.DB.prepare(
+      `INSERT INTO library_artifacts (id, project_id, artifact_key) SELECT ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM library_uploads WHERE idempotency_key = ?)
+        ON CONFLICT DO NOTHING`,
+    ).bind(
+      crypto.randomUUID(),
+      manifest.project.id,
+      manifest.artifactKey,
+      manifest.idempotencyKey,
+    ),
+    env.DB.prepare(
+      `INSERT INTO library_uploads (id, artifact_id, idempotency_key, manifest, created_at)
         SELECT ?, id, ?, ?, ? FROM library_artifacts WHERE project_id = ? AND artifact_key = ? AND deleted_at IS NULL
         ON CONFLICT(idempotency_key) DO NOTHING`,
-      ).bind(
-        crypto.randomUUID(),
-        manifest.idempotencyKey,
-        serialized,
-        new Date().toISOString(),
-        manifest.project.id,
-        manifest.artifactKey,
-      ),
-    ]);
-  }
+    ).bind(
+      crypto.randomUUID(),
+      manifest.idempotencyKey,
+      serialized,
+      new Date(Date.now()).toISOString(),
+      manifest.project.id,
+      manifest.artifactKey,
+    ),
+  ]);
   const session = await env.DB.prepare(
     "SELECT id, manifest FROM library_uploads WHERE idempotency_key = ?",
   )
@@ -325,8 +362,11 @@ async function putFile(
       current.size !== file.size ||
       !current.checksums.sha256 ||
       Buffer.from(current.checksums.sha256).toString("hex") !== file.sha256
-    )
+    ) {
+      // Cleanup may have removed a conditional-write target while PUT waited.
+      await getUpload(env, id);
       throw new HttpError(409, "Stored file integrity mismatch");
+    }
   }
   try {
     await getUpload(env, id);
@@ -358,27 +398,42 @@ async function commitUpload(
       );
       if (!object || object.size !== file.size) {
         await object?.body.cancel();
+        await getUpload(env, id);
         throw new HttpError(409, "Upload is incomplete or corrupt");
       }
-      if (sha256(new Uint8Array(await object.arrayBuffer())) !== file.sha256)
+      if (sha256(new Uint8Array(await object.arrayBuffer())) !== file.sha256) {
+        await getUpload(env, id);
         throw new HttpError(409, "Upload is incomplete or corrupt");
+      }
     }
     // The allocation and insertion are one SQL statement. Concurrent commits
     // either create one version or observe it, never allocate duplicate numbers.
-    await env.DB.batch([
+    const [inserted] = await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO library_versions (id, artifact_id, number, created_at)
         SELECT ?, a.id, COALESCE((SELECT MAX(number) FROM library_versions WHERE artifact_id = a.id), 0) + 1, ?
         FROM library_artifacts a WHERE a.id = ? AND a.deleted_at IS NULL
+        AND EXISTS (SELECT 1 FROM library_uploads u WHERE u.id = ? AND u.artifact_id = a.id
+          AND u.expired_at IS NULL AND u.created_at > ?)
         AND NOT EXISTS (SELECT 1 FROM library_versions WHERE id = ?)
         ON CONFLICT(id) DO NOTHING`,
-      ).bind(id, new Date().toISOString(), upload.artifact_id, id),
+      ).bind(
+        id,
+        new Date(Date.now()).toISOString(),
+        upload.artifact_id,
+        id,
+        new Date(Date.now() - UPLOAD_RETRY_MS).toISOString(),
+        id,
+      ),
       env.DB.prepare(
         `UPDATE library_projects SET name = ? WHERE id = ? AND EXISTS (
         SELECT 1 FROM library_versions v JOIN library_artifacts a ON a.id = v.artifact_id
         WHERE v.id = ? AND a.deleted_at IS NULL AND v.number = (SELECT MAX(number) FROM library_versions WHERE artifact_id = a.id))`,
       ).bind(manifest.project.name, manifest.project.id, id),
     ]);
+    // Verification may have crossed the deadline or lost to cleanup. Report
+    // the denial receipt instead of returning a misleading missing version.
+    if (!inserted!.meta.changes) await getUpload(env, id);
   }
   const version = await getVersion(env, id);
   const result: UploadResult = {
@@ -556,6 +611,52 @@ async function serveFile(
   headers.set("Content-Length", String(file.size));
   if (head) await object.body.cancel();
   return new Response(head ? null : object.body, { headers });
+}
+
+async function purgeAbandonedUploads(env: Env): Promise<void> {
+  const candidates = await env.DB.prepare(
+    `SELECT u.id FROM library_uploads u
+    WHERE (u.expired_at IS NOT NULL OR u.created_at <= ?)
+    AND NOT EXISTS (SELECT 1 FROM library_versions WHERE id = u.id)
+    AND EXISTS (SELECT 1 FROM library_artifacts WHERE id = u.artifact_id AND deleted_at IS NULL)
+    ORDER BY COALESCE(u.cleanup_checked_at, u.created_at), u.id LIMIT 20`,
+  )
+    .bind(new Date(Date.now() - UPLOAD_RETRY_MS).toISOString())
+    .all<{ id: string }>();
+  let failed = false;
+  for (const candidate of candidates.results) {
+    try {
+      const [, checked] = await env.DB.batch<UploadRow>([
+        expireUpload(env, candidate.id),
+        // Record attempts before R2, including failures/crashes. Rotate old
+        // receipts with new candidates rather than starving either group.
+        env.DB.prepare(
+          `UPDATE library_uploads SET cleanup_checked_at = ?
+          WHERE id = ? AND expired_at IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM library_versions WHERE id = library_uploads.id)
+          RETURNING id, artifact_id`,
+        ).bind(new Date(Date.now()).toISOString(), candidate.id),
+      ]);
+      const upload = checked!.results[0];
+      if (!upload) continue; // Commit won after candidate selection.
+      // One page per prefix per run. Deleting the first page makes progress
+      // without persisted cursors; retained receipts also sweep late PUTs.
+      const page = await env.PRIVATE_ARTIFACTS.list({
+        prefix: objectKey(upload, ""),
+        limit: 100,
+      });
+      if (page.objects.length)
+        await env.PRIVATE_ARTIFACTS.delete(
+          page.objects.map((object) => object.key),
+        );
+    } catch {
+      failed = true;
+    }
+  }
+  // Do not expose object paths or capabilities in scheduled errors. Persistent
+  // receipts ensure retry; one failed prefix must not block the rest of a batch.
+  if (failed)
+    throw new Error("Abandoned upload cleanup incomplete; retry scheduled");
 }
 
 async function purgeObjects(env: Env, id: string): Promise<void> {
