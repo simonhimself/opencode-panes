@@ -9,3 +9,7 @@ coverage/
 .DS_Store
 # Local artifact content is not part of the Panes application release.
 /artifacts/
+
+# Local session artifacts
+.openchamber/
+panes-tests/
