@@ -13,7 +13,7 @@ new plugin and environment, not just a new chat tab.
 
 The new plugin and the target backend must both use the simplified interface.
 Building and testing the repository does not install the plugin globally or deploy
-the backend; both are separate setup steps. See [installation and hosting](../README.md#install-the-opencode-plugin).
+the backend; both are separate setup steps. See [plugin installation](../README.md#install-the-plugin) and [hosting](OPERATIONS.md).
 
 Choose one test target and keep it consistent:
 
