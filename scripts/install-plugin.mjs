@@ -19,21 +19,47 @@ const defaultSourcePath = join(
 );
 const pluginFileName = "opencode-panes.js";
 
+const packageManifest = `${JSON.stringify(
+  {
+    name: "opencode-panes",
+    private: true,
+    type: "module",
+    exports: "./index.js",
+  },
+  null,
+  2,
+)}\n`;
+
 export async function installPlugin(environment = process.env) {
+  const source = await readFile(defaultSourcePath);
+  // Configured plugin entries (with options) must be package directories;
+  // auto-discovered plugins/ entries can be a single file.
+  const packageDirectory = environment.OPENCODE_PANES_PACKAGE_DIR;
+  if (packageDirectory) {
+    if (environment.OPENCODE_PANES_PLUGIN_DIR)
+      throw new Error(
+        "Set OPENCODE_PANES_PACKAGE_DIR or OPENCODE_PANES_PLUGIN_DIR, not both.",
+      );
+    const destination = resolve(packageDirectory);
+    await writeAtomically(destination, "package.json", packageManifest);
+    await writeAtomically(destination, "index.js", source);
+    return destination;
+  }
+
   const configDirectory = opencodeConfigDirectory(environment);
   const pluginDirectory = resolve(
     environment.OPENCODE_PANES_PLUGIN_DIR ?? join(configDirectory, "plugins"),
   );
-  const destinationPath = join(pluginDirectory, pluginFileName);
-  const source = await readFile(defaultSourcePath);
+  await writeAtomically(pluginDirectory, pluginFileName, source);
+  return join(pluginDirectory, pluginFileName);
+}
 
-  await mkdir(pluginDirectory, { recursive: true, mode: 0o700 });
-  const temporaryPath = join(
-    pluginDirectory,
-    `.${pluginFileName}.${randomUUID()}.tmp`,
-  );
+async function writeAtomically(directory, fileName, contents) {
+  const destinationPath = join(directory, fileName);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporaryPath = join(directory, `.${fileName}.${randomUUID()}.tmp`);
   try {
-    await writeFile(temporaryPath, source, {
+    await writeFile(temporaryPath, contents, {
       encoding: "utf8",
       flag: "wx",
       mode: 0o644,
@@ -44,8 +70,6 @@ export async function installPlugin(environment = process.env) {
     await unlink(temporaryPath).catch(() => undefined);
     throw error;
   }
-
-  return destinationPath;
 }
 
 function opencodeConfigDirectory(environment) {

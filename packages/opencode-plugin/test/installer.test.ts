@@ -72,6 +72,40 @@ describe("standalone installer", () => {
     expect(await readdir(plugins)).toEqual(["opencode-panes.js"]);
   });
 
+  it("installs a package directory for configured plugin entries and replaces it atomically", async () => {
+    const target = join(temporaryDirectory, "package/opencode-panes");
+    await install({ OPENCODE_PANES_PACKAGE_DIR: target });
+    expect((await readdir(target)).sort()).toEqual([
+      "index.js",
+      "package.json",
+    ]);
+    expect(
+      JSON.parse(await readFile(join(target, "package.json"), "utf8")),
+    ).toEqual({
+      name: "opencode-panes",
+      private: true,
+      type: "module",
+      exports: "./index.js",
+    });
+    const bundle = await readFile(join(packageDirectory, "dist/global.js"));
+    await writeFile(join(target, "index.js"), "old plugin");
+    await install({ OPENCODE_PANES_PACKAGE_DIR: target });
+    expect(await readFile(join(target, "index.js"))).toEqual(bundle);
+    expect((await stat(join(target, "index.js"))).mode & 0o777).toBe(0o644);
+    expect(await readdir(target)).toHaveLength(2);
+  });
+
+  it("rejects ambiguous package and plugin directory targets", async () => {
+    const target = join(temporaryDirectory, "ambiguous");
+    await expect(
+      install({
+        OPENCODE_PANES_PACKAGE_DIR: join(target, "package"),
+        OPENCODE_PANES_PLUGIN_DIR: join(target, "plugins"),
+      }),
+    ).rejects.toThrow("not both");
+    await expect(readdir(target)).rejects.toThrow();
+  });
+
   it("builds one JS bundle and passes the isolated no-dependency upload smoke test", async () => {
     expect((await readdir(join(packageDirectory, "dist"))).sort()).toEqual([
       "global.js",
@@ -94,6 +128,7 @@ async function install(environment: Record<string, string>) {
       HOME: join(temporaryDirectory, "home"),
       XDG_CONFIG_HOME: join(temporaryDirectory, "default-config"),
       OPENCODE_PANES_PLUGIN_DIR: undefined,
+      OPENCODE_PANES_PACKAGE_DIR: undefined,
       OPENCODE_PANES_CONFIG_DIR: undefined,
       OPENCODE_CONFIG_DIR: undefined,
       ...environment,

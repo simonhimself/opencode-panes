@@ -1,10 +1,8 @@
 # Third-Party Notices
 
-The bundled plugin includes Zod and the OpenCode plugin tool helper, licensed under the MIT License.
+The bundled plugin includes Zod, licensed under the MIT License.
 
 Zod: Copyright (c) 2025 Colin McDonnell
-
-OpenCode: Copyright (c) 2025 opencode
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

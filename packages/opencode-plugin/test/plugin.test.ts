@@ -19,11 +19,12 @@ import { createServer, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
+import type { Plugin } from "@opencode/plugin";
 import type {
-  PluginInput,
+  Info as ToolDefinition,
   ToolContext,
-  ToolDefinition,
-} from "@opencode-ai/plugin";
+  ToolEditor,
+} from "@opencode/plugin/promise/tool";
 import {
   MAX_FILE_BYTES,
   uploadRequestSchema,
@@ -62,25 +63,17 @@ beforeEach(async () => {
   root = await realpath(await mkdtemp(join(tmpdir(), "panes-upload-")));
   api = await mockApi();
   context = {
-    directory: root,
-    worktree: root,
     sessionID: "test",
     messageID: "test",
     agent: "build",
-    abort: new AbortController().signal,
-    metadata: vi.fn(),
-    ask: vi.fn(async () => {}),
-  };
-  const hooks = await plugin({} as PluginInput, {
-    apiBaseUrl: api.origin,
-    uploadKey: key,
-  });
-  expect(Object.keys(hooks.tool!)).toEqual([
-    "artifact_upload",
-    "artifact_dashboard",
-  ]);
-  upload = hooks.tool!.artifact_upload!;
-  dashboard = hooks.tool!.artifact_dashboard!;
+    id: "call",
+    signal: new AbortController().signal,
+    progress: vi.fn(async () => {}),
+  } as unknown as ToolContext;
+  const tools = await load();
+  expect(Object.keys(tools)).toEqual(["artifact_upload", "artifact_dashboard"]);
+  upload = tools.artifact_upload!;
+  dashboard = tools.artifact_dashboard!;
   await put(
     "site/index.html",
     "<!doctype html><img src='./assets/picture 1.png'><script src='./app.js'></script>\r\n",
@@ -102,15 +95,37 @@ async function put(path: string, bytes: string | Buffer) {
   await writeFile(join(root, path), bytes);
 }
 
+async function load(
+  options: Record<string, unknown> = { apiBaseUrl: api.origin, uploadKey: key },
+  directory = root,
+) {
+  const tools: Record<string, ToolDefinition> = {};
+  const editor = {
+    add(tool: ToolDefinition) {
+      tools[tool.name] = tool;
+    },
+  } as unknown as ToolEditor;
+  await plugin.setup({
+    options,
+    location: { directory, project: { directory: root } },
+    tool: {
+      async transform(edit: (editor: ToolEditor) => void) {
+        edit(editor);
+      },
+    },
+  } as unknown as Plugin.Context);
+  return tools;
+}
+
 async function run(
   tool: ToolDefinition,
   args: Record<string, unknown>,
   ctx = context,
 ) {
-  const result = await tool.execute(args, ctx);
-  expect(typeof result).toBe("string");
-  expect(result).not.toContain(key);
-  return JSON.parse(result as string);
+  const { content } = await tool.execute(args, ctx);
+  expect(typeof content).toBe("string");
+  expect(content).not.toContain(key);
+  return JSON.parse(content as string);
 }
 
 describe("private snapshot uploads", () => {
@@ -125,7 +140,7 @@ describe("private snapshot uploads", () => {
     expect(idempotencyKey).toBe(digest(JSON.stringify(payload)));
   });
 
-  it("uploads exact binary and text bytes with encoded paths, permission, stable identities, and no source writes", async () => {
+  it("uploads exact binary and text bytes with encoded paths, stable identities, and no source writes", async () => {
     const binary = Buffer.from([0, 255, 128, 13, 10, 1, 0, 200]);
     await put("site/assets/picture 1.png", binary);
     await put("site/assets/\u00e9.bin", binary);
@@ -134,28 +149,12 @@ describe("private snapshot uploads", () => {
       "throw new Error('Source must never execute on the server');\r\n",
     );
     const before = await tree(root);
-    context.ask = vi.fn(async () => {
-      expect(api.calls).toHaveLength(0);
-    });
     const result = await run(upload, { sourcePath: "site" });
     expect(result).toEqual({
       artifactId: "artifact-1",
       version: 1,
       dashboardUrl: `${api.origin}/inventory/artifacts/artifact-1`,
     });
-    expect(context.ask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        permission: "artifact_upload",
-        patterns: [api.origin],
-        metadata: expect.objectContaining({
-          sourcePath: join(root, "site"),
-          destination: api.origin,
-        }),
-      }),
-    );
-    expect(JSON.stringify(vi.mocked(context.ask).mock.calls)).not.toContain(
-      key,
-    );
     const request = api.requests[0]!;
     expect(request.project).toEqual({
       id: `local:${digest(root)}`,
@@ -214,13 +213,12 @@ describe("private snapshot uploads", () => {
       "<svg xmlns='http://www.w3.org/2000/svg'/>\r\n",
     );
     const result = await run(
-      upload,
+      (await load(undefined, join(root, "site"))).artifact_upload!,
       {
         sourcePath: "nested/image.svg",
         title: "Picture",
         projectName: "Friendly",
       },
-      { ...context, directory: join(root, "site") },
     );
     expect(result.error).toBeUndefined();
     expect(api.requests[0]).toMatchObject({
@@ -251,7 +249,6 @@ describe("private snapshot uploads", () => {
     expect(
       new Set(api.requests.map((request) => request.idempotencyKey)).size,
     ).toBe(3);
-    expect(context.ask).toHaveBeenCalledTimes(4);
   });
 
   it.each(["fail-put", "fail-commit"])(
@@ -354,7 +351,6 @@ describe("private snapshot uploads", () => {
         "HTTP 503",
       );
       const calls = api.calls.length;
-      const permissions = vi.mocked(context.ask).mock.calls.length;
       vi.mocked(exec).mockRejectedValueOnce(
         Object.assign(new Error(key), { stdout: "", stderr: "", ...failure }),
       );
@@ -366,7 +362,6 @@ describe("private snapshot uploads", () => {
           : "Retry project identity discovery",
       );
       expect(api.calls).toHaveLength(calls);
-      expect(context.ask).toHaveBeenCalledTimes(permissions);
 
       api.mode = "normal";
       expect((await run(upload, { sourcePath: "site" })).version).toBe(1);
@@ -544,19 +539,23 @@ describe("read and network boundaries", () => {
     },
   );
 
-  it("does not send anything when permission is denied and redacts permission exceptions", async () => {
-    context.ask = vi.fn(async () => {
-      throw new Error(key);
+  it("gates uploads behind the artifact_upload permission and publishes strict JSON Schema inputs", () => {
+    expect(upload.options).toEqual({ permission: "artifact_upload" });
+    expect(dashboard.options).toBeUndefined();
+    expect(upload.input).toMatchObject({
+      type: "object",
+      required: ["sourcePath"],
+      additionalProperties: false,
     });
-    const before = await tree(root);
-    expect((await run(upload, { sourcePath: "site" })).error).toContain(
-      "permission denied",
-    );
-    expect(api.calls).toHaveLength(0);
-    expect(await tree(root)).toEqual(before);
+    expect(Object.keys(upload.input as object)).not.toContain("$schema");
+    expect(dashboard.input).toMatchObject({
+      type: "object",
+      properties: { artifactId: { pattern: "^[a-zA-Z0-9_-]{1,200}$" } },
+      additionalProperties: false,
+    });
   });
 
-  it("cancels before permission and while permission is pending", async () => {
+  it("cancels before reading or sending anything", async () => {
     const abort = new AbortController();
     abort.abort(key);
     expect(
@@ -564,22 +563,7 @@ describe("read and network boundaries", () => {
         await run(
           upload,
           { sourcePath: "site" },
-          { ...context, abort: abort.signal },
-        )
-      ).error,
-    ).toContain("cancelled");
-    expect(context.ask).not.toHaveBeenCalled();
-    const pending = new AbortController();
-    context.ask = vi.fn(() => {
-      pending.abort(key);
-      return new Promise<void>(() => {});
-    });
-    expect(
-      (
-        await run(
-          upload,
-          { sourcePath: "site" },
-          { ...context, abort: pending.signal },
+          { ...context, signal: abort.signal },
         )
       ).error,
     ).toContain("cancelled");
@@ -597,7 +581,7 @@ describe("read and network boundaries", () => {
         await run(
           upload,
           { sourcePath: "site" },
-          { ...context, abort: abort.signal },
+          { ...context, signal: abort.signal },
         )
       ).error,
     ).toContain("cancelled");
@@ -612,7 +596,7 @@ describe("read and network boundaries", () => {
     const result = run(
       upload,
       { sourcePath: "site" },
-      { ...context, abort: abort.signal },
+      { ...context, signal: abort.signal },
     );
     await started;
     abort.abort(key);
@@ -624,13 +608,13 @@ describe("read and network boundaries", () => {
     "times out %s without continuing the upload",
     async (mode) => {
       api.mode = mode;
-      const hooks = await plugin({} as PluginInput, {
+      const hooks = await load({
         apiBaseUrl: api.origin,
         uploadKey: key,
         requestTimeoutMs: 50,
       });
       expect(
-        (await run(hooks.tool!.artifact_upload!, { sourcePath: "site" })).error,
+        (await run(hooks.artifact_upload!, { sourcePath: "site" })).error,
       ).toContain("timed out");
       expect(api.calls).toHaveLength(1);
     },
@@ -664,31 +648,27 @@ describe("read and network boundaries", () => {
     `https://example.com/#${key}`,
     `https://example.com/${key}`,
   ])("rejects unsafe API setting %s", async (apiBaseUrl) => {
-    const hooks = await plugin({} as PluginInput, {
-      apiBaseUrl,
-      uploadKey: key,
-    });
+    const hooks = await load({ apiBaseUrl, uploadKey: key });
     expect(
-      (await run(hooks.tool!.artifact_upload!, { sourcePath: "site" })).error,
+      (await run(hooks.artifact_upload!, { sourcePath: "site" })).error,
     ).toBeTruthy();
-    expect(context.ask).not.toHaveBeenCalled();
     expect(api.calls).toHaveLength(0);
   });
 
   it("requires endpoint and upload key, and supports environment settings with option precedence", async () => {
     vi.stubEnv("OPENCODE_PANES_API_URL", "");
     vi.stubEnv("OPENCODE_PANES_UPLOAD_KEY", "");
-    const hooks = await plugin({} as PluginInput);
-    expect((await run(hooks.tool!.artifact_dashboard!, {})).error).toContain(
+    const hooks = await load({});
+    expect((await run(hooks.artifact_dashboard!, {})).error).toContain(
       "OPENCODE_PANES_API_URL",
     );
     vi.stubEnv("OPENCODE_PANES_API_URL", api.origin);
     expect(
-      (await run(hooks.tool!.artifact_upload!, { sourcePath: "site" })).error,
+      (await run(hooks.artifact_upload!, { sourcePath: "site" })).error,
     ).toContain("OPENCODE_PANES_UPLOAD_KEY");
     vi.stubEnv("OPENCODE_PANES_UPLOAD_KEY", key);
     expect(
-      (await run(hooks.tool!.artifact_upload!, { sourcePath: "site" })).version,
+      (await run(hooks.artifact_upload!, { sourcePath: "site" })).version,
     ).toBe(1);
     vi.stubEnv("OPENCODE_PANES_API_URL", "https://wrong.example");
     vi.stubEnv("OPENCODE_PANES_UPLOAD_KEY", "wrong-key");
@@ -699,8 +679,8 @@ describe("read and network boundaries", () => {
     "returns the dashboard for safe origin %s without needing an upload key",
     async (apiBaseUrl) => {
       vi.stubEnv("OPENCODE_PANES_UPLOAD_KEY", "");
-      const hooks = await plugin({} as PluginInput, { apiBaseUrl });
-      expect(await run(hooks.tool!.artifact_dashboard!, {})).toEqual({
+      const hooks = await load({ apiBaseUrl });
+      expect(await run(hooks.artifact_dashboard!, {})).toEqual({
         dashboardUrl: `${apiBaseUrl}/inventory`,
       });
       expect(api.calls).toHaveLength(0);

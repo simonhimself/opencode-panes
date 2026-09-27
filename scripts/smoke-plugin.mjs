@@ -103,18 +103,23 @@ try {
       `
     import assert from 'node:assert/strict';
     const { default: plugin } = await import(${JSON.stringify(pathToFileURL(bundle).href)});
-    const hooks = await plugin({}, { apiBaseUrl: ${JSON.stringify(origin)}, uploadKey: process.env.SMOKE_UPLOAD_KEY });
-    assert.deepEqual(Object.keys(hooks.tool), ['artifact_upload', 'artifact_dashboard']);
-    let permissions = 0;
-    const context = { directory: process.cwd(), worktree: process.cwd(), sessionID: 'smoke', messageID: 'smoke', agent: 'build', abort: new AbortController().signal, metadata() {}, async ask() { permissions++; } };
+    assert.equal(plugin.id, 'opencode-panes');
+    const tools = {};
+    await plugin.setup({
+      options: { apiBaseUrl: ${JSON.stringify(origin)}, uploadKey: process.env.SMOKE_UPLOAD_KEY },
+      location: { directory: process.cwd(), project: { directory: process.cwd() } },
+      tool: { async transform(edit) { edit({ add(tool) { tools[tool.name] = tool; } }); } },
+    });
+    assert.deepEqual(Object.keys(tools), ['artifact_upload', 'artifact_dashboard']);
+    assert.deepEqual(tools.artifact_upload.options, { permission: 'artifact_upload' });
+    const context = { sessionID: 'smoke', messageID: 'smoke', agent: 'build', id: 'smoke', signal: new AbortController().signal, async progress() {} };
     for (let i = 0; i < 2; i++) {
-      const output = await hooks.tool.artifact_upload.execute({ sourcePath: 'site' }, context);
-      assert.equal(typeof output, 'string');
-      assert.ok(!output.includes(process.env.SMOKE_UPLOAD_KEY));
-      assert.deepEqual(JSON.parse(output), { artifactId: 'smoke-artifact', version: 1, dashboardUrl: ${JSON.stringify(`${origin}/inventory/artifacts/smoke-artifact`)} });
+      const { content } = await tools.artifact_upload.execute({ sourcePath: 'site' }, context);
+      assert.equal(typeof content, 'string');
+      assert.ok(!content.includes(process.env.SMOKE_UPLOAD_KEY));
+      assert.deepEqual(JSON.parse(content), { artifactId: 'smoke-artifact', version: 1, dashboardUrl: ${JSON.stringify(`${origin}/inventory/artifacts/smoke-artifact`)} });
     }
-    assert.equal(permissions, 2);
-    assert.deepEqual(JSON.parse(await hooks.tool.artifact_dashboard.execute({}, context)), { dashboardUrl: ${JSON.stringify(`${origin}/inventory`)} });
+    assert.deepEqual(JSON.parse((await tools.artifact_dashboard.execute({}, context)).content), { dashboardUrl: ${JSON.stringify(`${origin}/inventory`)} });
   `,
     ],
     {

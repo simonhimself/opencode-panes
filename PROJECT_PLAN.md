@@ -25,6 +25,7 @@ service or a local version-control system.
 
 - Ordinary editable local files; no Panes Draft, Finalize, or local version ledger.
 - Direct upload and dashboard tools only. No plugin publishing action.
+- OpenCode 2 plugin API only; OpenCode 1 plugin hosts are not supported.
 - Independent immutable cloud versions; no full-history synchronization.
 - Friendly projects, visual artifact library, search and sharing-state filters.
 - Preview-first artifact detail with version selection and clear share controls.

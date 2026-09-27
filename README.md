@@ -92,6 +92,7 @@ For a step-by-step trial with copy-ready prompts and expected results, use the
 ## Install the plugin
 
 You need your own Panes deployment first; see [operations](docs/OPERATIONS.md).
+The plugin targets the OpenCode 2 plugin API (OpenCode 2.0.18 or newer).
 Then, with Node.js 22.12 or newer and npm 11:
 
 ```sh

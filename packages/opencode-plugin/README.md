@@ -9,7 +9,9 @@ Two tools upload ordinary browser-ready files to your private Panes library:
 
 Set `OPENCODE_PANES_API_URL` to your deployment's HTTPS origin and `OPENCODE_PANES_UPLOAD_KEY` to its upload key in the OpenCode process environment. Plugin options `apiBaseUrl` and `uploadKey` take precedence. There is no default hosted endpoint or key-file lookup. `requestTimeoutMs` defaults to 30000 per HTTP request, including response reads. Plain HTTP is accepted only with a literal loopback IP (`127.0.0.1` or `[::1]`), not a DNS hostname.
 
-The dashboard requires owner authentication. The upload key never appears in returned URLs, permission metadata, or error responses, and is never stored by the plugin. Upload permission uses `artifact_upload`, scoped to the configured API origin.
+The plugin uses the OpenCode 2 plugin API (`id` and `setup()`), requires OpenCode 2.0.18 or newer, and registers its tools through `ctx.tool.transform`.
+
+The dashboard requires owner authentication. The upload key never appears in returned URLs or error responses, and is never stored by the plugin. OpenCode evaluates the `artifact_upload` permission before each upload runs; configure it with OpenCode permission rules.
 
 ## Source And Retries
 
@@ -32,4 +34,4 @@ npm run test --workspace @opencode-panes/plugin
 node scripts/smoke-plugin.mjs
 ```
 
-The build emits one standalone JavaScript bundle, `dist/global.js`, plus TypeScript declarations. No runtime dependency directory, React runtime, or compiler WASM is needed. The installer copies only the bundle, atomically, and does not modify OpenCode JSON configuration. Installer tests use temporary directories, not a real global installation. Installing or updating the plugin requires quitting and restarting OpenCode; running sessions keep their loaded plugin.
+The build emits one standalone JavaScript bundle, `dist/global.js`, plus TypeScript declarations. No runtime dependency directory, React runtime, or compiler WASM is needed. The installer copies only the bundle, atomically, and does not modify OpenCode JSON configuration. By default it writes `plugins/opencode-panes.js` for auto-discovery; with `OPENCODE_PANES_PACKAGE_DIR` it writes a package directory (`index.js` and `package.json`) for a configured `plugins` entry with options. Installer tests use temporary directories, not a real global installation. Installing or updating the plugin requires quitting and restarting OpenCode; running sessions keep their loaded plugin.

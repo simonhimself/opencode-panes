@@ -14,7 +14,10 @@ import {
 } from "node:path";
 import { promisify } from "node:util";
 
-import { tool, type Plugin, type ToolContext } from "@opencode-ai/plugin";
+// Type-only: Plugin.define() is an identity function, and importing the SDK at
+// runtime would add its dependencies to the standalone bundle.
+import type { Plugin } from "@opencode/plugin";
+import { z } from "zod";
 import {
   MAX_FILE_BYTES,
   MAX_FILES,
@@ -37,110 +40,125 @@ export interface PanesPluginOptions {
 }
 
 const execFileAsync = promisify(execFile);
-const artifactIdSchema = tool.schema.string().regex(/^[a-zA-Z0-9_-]{1,200}$/u);
-const uploadArgs = {
-  sourcePath: tool.schema
-    .string()
-    .min(1)
-    .describe(
-      "Existing HTML/SVG file or built browser folder inside the project. Source is read only.",
-    ),
-  entryPath: tool.schema
-    .string()
-    .refine(
-      (value) => filePathSchema.safeParse(value).success,
-      "Use a safe relative entry path",
-    )
-    .optional()
-    .describe(
-      "Entry relative to the selected folder; defaults to index.html. For one file, use its filename.",
-    ),
-  title: tool.schema.string().trim().min(1).max(200).optional(),
-  projectName: tool.schema.string().trim().min(1).max(100).optional(),
-};
+const artifactIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,200}$/u);
+const uploadArgs = z
+  .object({
+    sourcePath: z
+      .string()
+      .min(1)
+      .describe(
+        "Existing HTML/SVG file or built browser folder inside the project. Source is read only.",
+      ),
+    entryPath: z
+      .string()
+      .refine(
+        (value) => filePathSchema.safeParse(value).success,
+        "Use a safe relative entry path",
+      )
+      .optional()
+      .describe(
+        "Entry relative to the selected folder; defaults to index.html. For one file, use its filename.",
+      ),
+    title: z.string().trim().min(1).max(200).optional(),
+    projectName: z.string().trim().min(1).max(100).optional(),
+  })
+  .strict();
+const dashboardArgs = z
+  .object({ artifactId: artifactIdSchema.optional() })
+  .strict();
 
 class SafeError extends Error {}
 
-export const OpenCodePanesPlugin: Plugin = async (input, options = {}) => {
-  // Resolve at execution time so an unconfigured plugin cannot prevent OpenCode startup.
-  function configuration() {
-    const value = options.apiBaseUrl ?? process.env.OPENCODE_PANES_API_URL;
-    const key = options.uploadKey ?? process.env.OPENCODE_PANES_UPLOAD_KEY;
-    const timeout = options.requestTimeoutMs ?? 30_000;
-    if (typeof value !== "string" || !value)
-      throw new SafeError(
-        "Set apiBaseUrl or OPENCODE_PANES_API_URL to your Panes API origin.",
-      );
-    let url: URL;
-    try {
-      url = new URL(value);
-    } catch {
-      throw new SafeError("Invalid Panes API origin.");
-    }
-    const hostname = url.hostname.replace(/^\[|\]$/gu, "");
-    const loopback =
-      hostname === "::1" ||
-      (isIP(hostname) === 4 && hostname.startsWith("127."));
-    if (
-      (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
-      url.username ||
-      url.password ||
-      url.search ||
-      url.hash ||
-      url.pathname !== "/"
-    ) {
-      throw new SafeError(
-        "Use an HTTPS API origin without credentials, path, query, or fragment; HTTP is allowed only for literal loopback IPs.",
-      );
-    }
-    if (
-      typeof timeout !== "number" ||
-      !Number.isSafeInteger(timeout) ||
-      timeout < 1 ||
-      timeout > 2_147_483_647
-    )
-      throw new SafeError(
-        "requestTimeoutMs must be a positive timer-safe integer.",
-      );
-    if (typeof key === "string" && key && url.origin.includes(key))
-      throw new SafeError(
-        "The API origin must not contain an upload credential.",
-      );
-    return { origin: url.origin, key, timeout };
-  }
+const plugin: Plugin.Plugin = {
+  id: "opencode-panes",
+  async setup(ctx) {
+    const options: PanesPluginOptions = ctx.options;
+    const { directory, project } = ctx.location;
 
-  async function execute(
-    context: ToolContext,
-    action: () => Promise<unknown>,
-  ): Promise<string> {
-    try {
-      context.abort.throwIfAborted();
-      return JSON.stringify(await action());
-    } catch (error) {
-      // Never forward OS, git, fetch, permission, schema, or server error text.
-      const message = context.abort.aborted
-        ? "Operation cancelled."
-        : error instanceof SafeError
-          ? error.message
-          : "Panes operation failed. Check the source and API configuration, then retry.";
+    // Resolve at execution time so an unconfigured plugin cannot prevent OpenCode startup.
+    function configuration() {
+      const value = options.apiBaseUrl ?? process.env.OPENCODE_PANES_API_URL;
       const key = options.uploadKey ?? process.env.OPENCODE_PANES_UPLOAD_KEY;
-      return JSON.stringify({
-        error:
-          typeof key === "string" && key
-            ? message.split(key).join("[redacted]")
-            : message,
-      });
+      const timeout = options.requestTimeoutMs ?? 30_000;
+      if (typeof value !== "string" || !value)
+        throw new SafeError(
+          "Set apiBaseUrl or OPENCODE_PANES_API_URL to your Panes API origin.",
+        );
+      let url: URL;
+      try {
+        url = new URL(value);
+      } catch {
+        throw new SafeError("Invalid Panes API origin.");
+      }
+      const hostname = url.hostname.replace(/^\[|\]$/gu, "");
+      const loopback =
+        hostname === "::1" ||
+        (isIP(hostname) === 4 && hostname.startsWith("127."));
+      if (
+        (url.protocol !== "https:" &&
+          !(url.protocol === "http:" && loopback)) ||
+        url.username ||
+        url.password ||
+        url.search ||
+        url.hash ||
+        url.pathname !== "/"
+      ) {
+        throw new SafeError(
+          "Use an HTTPS API origin without credentials, path, query, or fragment; HTTP is allowed only for literal loopback IPs.",
+        );
+      }
+      if (
+        typeof timeout !== "number" ||
+        !Number.isSafeInteger(timeout) ||
+        timeout < 1 ||
+        timeout > 2_147_483_647
+      )
+        throw new SafeError(
+          "requestTimeoutMs must be a positive timer-safe integer.",
+        );
+      if (typeof key === "string" && key && url.origin.includes(key))
+        throw new SafeError(
+          "The API origin must not contain an upload credential.",
+        );
+      return { origin: url.origin, key, timeout };
     }
-  }
 
-  return {
-    tool: {
-      artifact_upload: tool({
+    async function execute(
+      signal: AbortSignal,
+      action: () => Promise<unknown>,
+    ): Promise<{ content: string }> {
+      try {
+        signal.throwIfAborted();
+        return { content: JSON.stringify(await action()) };
+      } catch (error) {
+        // Never forward OS, git, fetch, permission, schema, or server error text.
+        const message = signal.aborted
+          ? "Operation cancelled."
+          : error instanceof SafeError
+            ? error.message
+            : "Panes operation failed. Check the source and API configuration, then retry.";
+        const key = options.uploadKey ?? process.env.OPENCODE_PANES_UPLOAD_KEY;
+        return {
+          content: JSON.stringify({
+            error:
+              typeof key === "string" && key
+                ? message.split(key).join("[redacted]")
+                : message,
+          }),
+        };
+      }
+    }
+
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "artifact_upload",
         description:
           "Upload a read-only snapshot of an ordinary HTML/SVG file or locally built browser folder to your private Panes library. Asks upload permission; never builds, executes, edits, deletes, previews locally, or shares source. Identical retries resume safely.",
-        args: uploadArgs,
-        async execute(args, context) {
-          return execute(context, async () => {
+        input: jsonSchema(uploadArgs),
+        // OpenCode evaluates this permission before execute() runs.
+        options: { permission: "artifact_upload" },
+        async execute(args, { signal }) {
+          return execute(signal, async () => {
             const config = configuration();
             if (
               typeof config.key !== "string" ||
@@ -150,23 +168,18 @@ export const OpenCodePanesPlugin: Plugin = async (input, options = {}) => {
               throw new SafeError(
                 "Set uploadKey or OPENCODE_PANES_UPLOAD_KEY before uploading.",
               );
-            const parsed = tool.schema
-              .object(uploadArgs)
-              .strict()
-              .safeParse(args);
+            const parsed = uploadArgs.safeParse(args);
             if (!parsed.success)
               throw new SafeError(
                 "Invalid upload arguments. Select an existing browser-ready source and a safe relative entry path.",
               );
             const root = await realpath(
-              context.worktree && context.worktree !== sep
-                ? context.worktree
-                : input.worktree && input.worktree !== sep
-                  ? input.worktree
-                  : context.directory,
+              project.directory !== sep ? project.directory : directory,
             );
-            const directory = await realpath(context.directory);
-            const source = resolve(directory, parsed.data.sourcePath);
+            const source = resolve(
+              await realpath(directory),
+              parsed.data.sourcePath,
+            );
             const sourceKey =
               relative(root, source).split(sep).join("/") || ".";
             if (
@@ -198,40 +211,18 @@ export const OpenCodePanesPlugin: Plugin = async (input, options = {}) => {
               throw new SafeError(
                 "Choose an HTML or SVG entry; build framework source locally first.",
               );
-            const project = {
-              id: await projectIdentity(root, context.abort),
+            const artifactProject = {
+              id: await projectIdentity(root, signal),
               name: parsed.data.projectName ?? basename(root),
             };
-            context.abort.throwIfAborted();
-            try {
-              await cancellable(
-                context.ask({
-                  permission: "artifact_upload",
-                  patterns: [config.origin],
-                  always: [config.origin],
-                  metadata: {
-                    sourcePath: source.split(config.key).join("[redacted]"),
-                    destination: config.origin,
-                    projectName: project.name
-                      .split(config.key)
-                      .join("[redacted]"),
-                    entryPath: entryPath.split(config.key).join("[redacted]"),
-                  },
-                }),
-                context.abort,
-              );
-            } catch {
-              throw new SafeError(
-                "Upload permission denied or cancelled. No upload was sent.",
-              );
-            }
+            signal.throwIfAborted();
             const snapshot = await readSnapshot(
               source,
               sourceStat.isDirectory(),
-              context.abort,
+              signal,
             );
             const requestBody = {
-              project,
+              project: artifactProject,
               artifactKey: sourceKey,
               title: parsed.data.title ?? basename(source),
               entryPath,
@@ -255,12 +246,12 @@ export const OpenCodePanesPlugin: Plugin = async (input, options = {}) => {
               body?: string | Buffer,
             ) {
               const timeout = AbortSignal.timeout(config.timeout);
-              const signal = AbortSignal.any([context.abort, timeout]);
+              const requestSignal = AbortSignal.any([signal, timeout]);
               try {
                 const response = await fetch(`${config.origin}${path}`, {
                   method,
                   redirect: "error",
-                  signal,
+                  signal: requestSignal,
                   headers: {
                     Authorization: `Bearer ${uploadKey}`,
                     "Content-Type":
@@ -302,7 +293,7 @@ export const OpenCodePanesPlugin: Plugin = async (input, options = {}) => {
                   await reader.cancel().catch(() => undefined);
                 }
               } catch (error) {
-                if (timeout.aborted && !context.abort.aborted)
+                if (timeout.aborted && !signal.aborted)
                   throw new SafeError(
                     "Panes API request timed out. Retry the same upload safely.",
                   );
@@ -354,31 +345,36 @@ export const OpenCodePanesPlugin: Plugin = async (input, options = {}) => {
             };
           });
         },
-      }),
-      artifact_dashboard: tool({
+      });
+      editor.add({
+        name: "artifact_dashboard",
         description:
           "Return the authenticated owner dashboard URL, optionally for a cloud artifact ID. Does not upload, open a browser, or create a share link.",
-        args: { artifactId: artifactIdSchema.optional() },
-        async execute(args, context) {
-          return execute(context, async () => {
+        input: jsonSchema(dashboardArgs),
+        async execute(args, { signal }) {
+          return execute(signal, async () => {
             const { origin, key } = configuration();
-            if (
-              args.artifactId !== undefined &&
-              !artifactIdSchema.safeParse(args.artifactId).success
-            )
+            const parsed = dashboardArgs.safeParse(args);
+            if (!parsed.success)
               throw new SafeError("Invalid cloud artifact ID.");
-            const dashboardUrl = `${origin}/inventory${args.artifactId ? `/artifacts/${args.artifactId}` : ""}`;
+            const { artifactId } = parsed.data;
+            const dashboardUrl = `${origin}/inventory${artifactId ? `/artifacts/${artifactId}` : ""}`;
             if (typeof key === "string" && key && dashboardUrl.includes(key))
               throw new SafeError("Unsafe Panes dashboard URL.");
             return { dashboardUrl };
           });
         },
-      }),
-    },
-  };
+      });
+    });
+  },
 };
 
-export default OpenCodePanesPlugin;
+export default plugin;
+
+function jsonSchema(schema: z.ZodType) {
+  const { $schema: _, ...json } = z.toJSONSchema(schema, { io: "input" });
+  return json;
+}
 
 function sha256(value: string | Buffer) {
   return createHash("sha256").update(value).digest("hex");
@@ -605,15 +601,4 @@ function mediaType(path: string) {
     ".pdf": "application/pdf",
   };
   return types[extname(path).toLowerCase()] ?? "application/octet-stream";
-}
-
-function cancellable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(new SafeError("Operation cancelled."));
-    signal.addEventListener("abort", abort, { once: true });
-    if (signal.aborted) abort();
-    promise
-      .then(resolve, reject)
-      .finally(() => signal.removeEventListener("abort", abort));
-  });
 }

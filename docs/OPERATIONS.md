@@ -78,24 +78,25 @@ Keep the upload key in your shell's secret management, not a repository or a URL
 Quit and restart OpenCode after installing the plugin or changing its environment.
 
 Alternatively, configure plugin options with a protected secret-file reference.
-Install outside the auto-discovered `plugins/` directory so auto-discovery does
-not override the explicit options:
+OpenCode 2 loads configured plugin paths only as package directories; single
+files work only through `plugins/` auto-discovery, which cannot pass options.
+Install a package directory outside the auto-discovered `plugins/` directory:
 
 ```sh
-OPENCODE_PANES_PLUGIN_DIR="$HOME/.config/opencode/panes" npm run install:plugin
+OPENCODE_PANES_PACKAGE_DIR="$HOME/.config/opencode/panes/opencode-panes" npm run install:plugin
 ```
 
-Add an entry to your existing OpenCode `plugin` array, using your actual absolute
-bundle path and an existing protected upload-key file:
+Add an entry to your existing OpenCode `plugins` array, using your actual absolute
+package directory and an existing protected upload-key file:
 
 ```json
-[
-  "file:///absolute/path/to/opencode/panes/opencode-panes.js",
-  {
+{
+  "package": "/absolute/path/to/opencode/panes/opencode-panes",
+  "options": {
     "apiBaseUrl": "https://your-panes-deployment.example",
     "uploadKey": "{file:~/.config/opencode/secrets/panes-upload-key}"
   }
-]
+}
 ```
 
 Use one installation method, not two copies of the plugin. On upgrades, use the
