@@ -9,7 +9,7 @@
     // Access must protect /inventory* and /api/library*; the Worker also
     // verifies every owner request. Keep public and upload routes outside Access.
     "PANES_ACCESS_ALLOWED_EMAIL": "simonhimself@gmail.com",
-    "PANES_ACCESS_ISSUER": "https://adsdasd.cloudflareaccess.com",
+    "PANES_ACCESS_ISSUER": "https://simonhimself.cloudflareaccess.com",
     "PANES_ACCESS_AUDIENCE": "8defff93e1db0b5ea650b2d7e75f67b6d22a3597a67bada071458ebe8dc48725",
     "PANES_DEV_MODE": "false",
   },
